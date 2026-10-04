@@ -12,6 +12,12 @@ export interface PermissionCheckInput {
   operation: PermissionOperation;
 }
 
+export interface MovePermissionCheckInput {
+  mode: PermissionMode;
+  sourceLocation: PermissionLocation;
+  destinationLocation: PermissionLocation;
+}
+
 type PolicyMatrix = Record<
   PermissionMode,
   Record<PermissionLocation, Record<PermissionOperation, boolean>>
@@ -48,4 +54,18 @@ export function checkPermission(input: PermissionCheckInput): boolean {
   if (!isPermissionLocation(input.location)) return false;
   if (!isPermissionOperation(input.operation)) return false;
   return PERMISSION_POLICY[input.mode][input.location][input.operation];
+}
+
+/** Moves are allowed only between workspace locations in writable modes. */
+export function checkMovePermission(input: MovePermissionCheckInput): boolean {
+  if (!input || typeof input !== "object") return false;
+  if (!isPermissionMode(input.mode)) return false;
+  if (!isPermissionLocation(input.sourceLocation)) return false;
+  if (!isPermissionLocation(input.destinationLocation)) return false;
+
+  return (
+    input.mode !== "readonly" &&
+    input.sourceLocation === "workspace" &&
+    input.destinationLocation === "workspace"
+  );
 }

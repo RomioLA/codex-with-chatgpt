@@ -1,6 +1,7 @@
 export { PERMISSION_MODES, isPermissionMode, type PermissionMode } from "./mode.js";
-export { checkPermission } from "./policy.js";
+export { checkMovePermission, checkPermission } from "./policy.js";
 export type {
+  MovePermissionCheckInput,
   PermissionCheckInput,
   PermissionLocation,
   PermissionOperation,
