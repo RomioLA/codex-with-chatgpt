@@ -59,6 +59,7 @@ import {
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { importMediaAsset } from "../media/import.js";
+import { isPermissionMode, readPermission, setPermission, type PermissionMode } from "../permission/index.js";
 
 const program = new Command();
 
@@ -190,6 +191,7 @@ interface AdminInfo {
   pairingActive: boolean;
   pid: number;
   startedAt: string;
+  permissionMode: PermissionMode;
 }
 
 async function ensureBridgeAndTunnel(
@@ -390,18 +392,23 @@ program
   .action(async (opts: { workspace?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
+    const permissionMode = readPermission(workspace.id);
     const observation = await findBridgeObservation(workspace.id);
     if (observation.state === "unknown") {
       if (opts.json) {
-        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason }));
+        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason, permissionMode }));
       } else {
         cross(`Bridge 状态无法确认（${observation.reason}），未将其视为未运行。`);
+        say(`Permission: ${permissionMode}`);
       }
       return;
     }
     if (observation.state === "stopped") {
-      if (opts.json) say(JSON.stringify({ ok: false, running: false }));
-      else say("Bridge 未运行。使用 `c2c start` 启动。");
+      if (opts.json) say(JSON.stringify({ ok: false, running: false, permissionMode }));
+      else {
+        say("Bridge 未运行。使用 `c2c start` 启动。");
+        say(`Permission: ${permissionMode}`);
+      }
       return;
     }
     const runtime = observation.runtime;
@@ -414,9 +421,49 @@ program
     say("");
     check(`Workspace：${info.workspaceName}`);
     check(`Bridge：运行中（端口 ${info.port}）`);
+    say(`Permission: ${info.permissionMode}`);
     if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
     else say("· 安全连接：未启用（本地模式）");
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+  });
+
+// ---------------------------------------------------------------- permission
+
+const permissionCmd = program
+  .command("permission")
+  .description("Inspect or change this workspace's local permission mode");
+
+permissionCmd
+  .argument("<mode>", "status, readonly, 1, or 2")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((rawMode: string, opts: { workspace?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const mode = rawMode.trim().toLowerCase();
+      let actualMode: PermissionMode;
+      if (mode === "status") {
+        actualMode = readPermission(workspace.id);
+      } else {
+        const requestedMode = mode === "1" ? "level1" : mode === "2" ? "level2" : mode;
+        if (!isPermissionMode(requestedMode)) {
+          throw new Error(`Invalid permission mode: ${rawMode}. Use status, readonly, 1, or 2.`);
+        }
+        // This is a user-local control-plane mutation. Any future remote process runner
+        // must not be able to invoke this elevation path on the user's behalf.
+        actualMode = setPermission(workspace.id, requestedMode);
+      }
+      const payload = {
+        ok: true,
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        mode: actualMode,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`Permission: ${actualMode}（${workspace.name}）`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
   });
 
 // ---------------------------------------------------------------- doctor
