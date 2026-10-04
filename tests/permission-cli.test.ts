@@ -82,9 +82,19 @@ describe("local permission CLI", () => {
     makeGitRepo(root);
 
     const result = runCli(["status", "--json", "-w", root], stateDir);
-    expect(JSON.parse(result.stdout)).toMatchObject({ permissionMode: "readonly" });
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      permissionMode: "readonly",
+      autostart: { enabled: false, backend: "none", backendInstalled: false },
+    });
     const textResult = runCli(["status", "-w", root], stateDir);
     expect(textResult.stdout).toContain("Permission: readonly");
+
+    const doctor = runCli(["doctor", "--json", "-w", root], stateDir);
+    expect(JSON.parse(doctor.stdout).autostart).toMatchObject({
+      enabled: false,
+      backend: "none",
+      backendInstalled: false,
+    });
   });
 
   it("serves the persisted mode dynamically from protected admin info only", async () => {

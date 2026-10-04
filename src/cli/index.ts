@@ -66,6 +66,7 @@ import {
   AutostartUnsupportedError,
   type AutostartStatus,
 } from "../autostart/registration.js";
+import { restoreRegisteredWorkspace } from "../autostart/restore.js";
 import { WindowsAutostartAdapter, WindowsRunKeyAutostart, WindowsTaskScheduler } from "../autostart/windows-task.js";
 
 const program = new Command();
@@ -201,13 +202,51 @@ interface AdminInfo {
   permissionMode: PermissionMode;
 }
 
-function printRuntimeDiagnostics(diagnostics: Awaited<ReturnType<typeof collectRuntimeDiagnostics>>): void {
+type AutostartDiagnostics = {
+  enabled: boolean;
+  backend: "task-scheduler" | "hkcu-run" | "none";
+  registrationState: string;
+  backendInstalled: boolean;
+  reason?: string;
+};
+
+function collectAutostartDiagnostics(workspaceRoot: string): AutostartDiagnostics {
+  if (process.platform !== "win32") {
+    return { enabled: false, backend: "none", registrationState: "unsupported", backendInstalled: false };
+  }
+  try {
+    const status = createAutostartService().status(workspaceRoot);
+    return {
+      enabled: status.enabled,
+      backend: status.backend === "task_scheduler" ? "task-scheduler" : status.backend === "registry_run" ? "hkcu-run" : "none",
+      registrationState: status.registrationState,
+      backendInstalled: status.backendInstalled,
+    };
+  } catch (error) {
+    return {
+      enabled: false,
+      backend: "none",
+      registrationState: "unknown",
+      backendInstalled: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function printRuntimeDiagnostics(
+  diagnostics: Awaited<ReturnType<typeof collectRuntimeDiagnostics>>,
+  autostart?: AutostartDiagnostics
+): void {
   const recovery = diagnostics.recovery.reason
     ? `${diagnostics.recovery.status} (${diagnostics.recovery.reason})`
     : diagnostics.recovery.status;
   say(`Workspace: ${diagnostics.workspace.path} (${diagnostics.workspace.id})`);
   say(`Bridge: ${diagnostics.bridge.status}${diagnostics.bridge.reason ? ` (${diagnostics.bridge.reason})` : ""}`);
   say(`Permission: ${diagnostics.permission}`);
+  if (autostart) {
+    say(`Autostart: ${autostart.enabled ? "enabled" : "disabled"}`);
+    say(`Autostart backend: ${autostart.backend}${autostart.reason ? ` (${autostart.reason})` : ""}`);
+  }
   say(`Tunnel preference: ${diagnostics.tunnelPreference}`);
   say(`Tunnel: ${diagnostics.tunnel.status}${diagnostics.tunnel.provider ? ` (${diagnostics.tunnel.provider})` : ""}`);
   say(`Configured hostname: ${diagnostics.configuredHostname ?? "none"}`);
@@ -412,32 +451,8 @@ autostartCmd
     const workspaceRoot = path.resolve(opts.workspace);
     try {
       const service = createAutostartService();
-      const registration = service.getRegistrationById(opts.workspaceId);
-      if (!registration || path.resolve(registration.workspaceRoot).toLowerCase() !== workspaceRoot.toLowerCase()) return;
-
-      if (!fs.existsSync(workspaceRoot) || !fs.statSync(workspaceRoot).isDirectory()) {
-        service.recordRun(opts.workspaceId, registration.workspaceRoot, {
-          status: "workspace_missing",
-          message: `Registered workspace no longer exists: ${registration.workspaceRoot}`,
-        });
-        process.exitCode = 1;
-        return;
-      }
-      const workspace = new Workspace(workspaceRoot);
-      if (workspace.id !== opts.workspaceId) {
-        service.recordRun(opts.workspaceId, registration.workspaceRoot, {
-          status: "workspace_missing",
-          message: "Registered workspace path now resolves to a different workspace.",
-        });
-        process.exitCode = 1;
-        return;
-      }
-
-      const { info, mcpUrl } = await startWorkspace(workspace.root, { tunnel: true });
-      service.recordRun(opts.workspaceId, registration.workspaceRoot, {
-        status: "started",
-        message: `Bridge restored${mcpUrl ? " with tunnel" : ""} for ${info.workspaceName}.`,
-      });
+      const outcome = await restoreRegisteredWorkspace(service, opts.workspaceId, workspaceRoot);
+      if (outcome.status === "failed" || outcome.status === "workspace_missing") process.exitCode = 1;
     } catch (error) {
       const service = createAutostartService();
       service.recordRun(opts.workspaceId, workspaceRoot, {
@@ -557,12 +572,14 @@ program
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; json: boolean }) => {
     try {
-      const result = await restoreWorkspace(resolveWorkspace(opts.workspace));
-      if (opts.json) say(JSON.stringify(result));
+      const root = resolveWorkspace(opts.workspace);
+      const result = await restoreWorkspace(root);
+      const autostart = collectAutostartDiagnostics(root);
+      if (opts.json) say(JSON.stringify({ ...result, autostart }));
       else {
         say(`Bridge: ${result.bridgeAction}`);
         say(`Tunnel: ${result.tunnelAction}`);
-        printRuntimeDiagnostics(result.diagnostics);
+        printRuntimeDiagnostics(result.diagnostics, autostart);
         if (result.detail) say(`Detail: ${result.detail}`);
       }
       if (!result.ok) process.exitCode = 1;
@@ -580,23 +597,24 @@ program
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
     const permissionMode = readPermission(workspace.id);
+    const autostart = collectAutostartDiagnostics(root);
     const observation = await findBridgeObservation(workspace.id);
     if (observation.state === "unknown") {
       const diagnostics = await collectRuntimeDiagnostics(root, { observation });
       if (opts.json) {
-        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason, permissionMode, diagnostics }));
+        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason, permissionMode, diagnostics, autostart }));
       } else {
         cross(`Bridge 状态无法确认（${observation.reason}），未将其视为未运行。`);
-        printRuntimeDiagnostics(diagnostics);
+        printRuntimeDiagnostics(diagnostics, autostart);
       }
       return;
     }
     if (observation.state === "stopped") {
       const diagnostics = await collectRuntimeDiagnostics(root, { observation });
-      if (opts.json) say(JSON.stringify({ ok: false, running: false, permissionMode, diagnostics }));
+      if (opts.json) say(JSON.stringify({ ok: false, running: false, permissionMode, diagnostics, autostart }));
       else {
         say("Bridge 未运行。使用 `c2c start` 启动。");
-        printRuntimeDiagnostics(diagnostics);
+        printRuntimeDiagnostics(diagnostics, autostart);
       }
       return;
     }
@@ -604,7 +622,7 @@ program
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     const diagnostics = await collectRuntimeDiagnostics(root, { observation, info });
     if (opts.json) {
-      say(JSON.stringify({ ok: diagnostics.recovery.status === "healthy", running: true, ...info, diagnostics }));
+      say(JSON.stringify({ ok: diagnostics.recovery.status === "healthy", running: true, ...info, diagnostics, autostart }));
       return;
     }
     say(PRODUCT_NAME);
@@ -616,7 +634,7 @@ program
     else if (diagnostics.tunnelPreference === "unset") say("· 安全连接：未启用（本地模式）");
     else say(`· 安全连接：${diagnostics.tunnel.status}（已配置 ${diagnostics.tunnelPreference} Tunnel）`);
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
-    printRuntimeDiagnostics(diagnostics);
+    printRuntimeDiagnostics(diagnostics, autostart);
   });
 
 // ---------------------------------------------------------------- permission
@@ -915,8 +933,9 @@ program
     }
 
     const diagnostics = workspace ? await collectRuntimeDiagnostics(root) : null;
+    const autostart = collectAutostartDiagnostics(root);
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, diagnostics }));
+      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, diagnostics, autostart }));
       const hasFailures =
         Object.values(report).some((value) => !value.ok) ||
         chatgptRepair.needed ||
@@ -928,7 +947,7 @@ program
     say(`${PRODUCT_NAME} Doctor`);
     say("");
     if (diagnostics) {
-      printRuntimeDiagnostics(diagnostics);
+      printRuntimeDiagnostics(diagnostics, autostart);
       say("");
     }
     const labels: Record<string, string> = {

@@ -392,7 +392,14 @@ export interface RunKeyAutostartAdapter {
   isInstalled(registration: AutostartRegistration): boolean;
 }
 
-/** Prefer a current-user Scheduled Task; use HKCU Run only when Windows denies task creation. */
+function isTaskSchedulerFallbackError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const denied = /(access is denied|access denied|拒绝访问|访问被拒绝|0x80070005)/i.test(message);
+  const unavailable = /(?:task scheduler|scheduled task|windows logon task).{0,100}(?:unavailable|not available|service (?:is )?not running|service has not been started|could not connect|cannot connect)|(?:unavailable|not available|service (?:is )?not running|service has not been started).{0,100}(?:task scheduler|scheduled task|windows logon task)|0x80041315|0x80070426|ERROR_SERVICE_NOT_ACTIVE/i.test(message);
+  return denied || unavailable;
+}
+
+/** Prefer a current-user Scheduled Task; use HKCU Run when the scheduler denies or cannot accept registration. */
 export class WindowsAutostartAdapter implements AutostartTaskAdapter {
   constructor(
     private readonly taskScheduler: AutostartTaskAdapter,
@@ -404,8 +411,7 @@ export class WindowsAutostartAdapter implements AutostartTaskAdapter {
     try {
       return this.taskScheduler.install(registration);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/(access is denied|access denied|拒绝访问|访问被拒绝|0x80070005)/i.test(message)) throw error;
+      if (!isTaskSchedulerFallbackError(error)) throw error;
       const result = this.runKey.install(registration);
       try { this.taskScheduler.remove(registration); } catch { /* the denied task may not be removable either */ }
       return result;

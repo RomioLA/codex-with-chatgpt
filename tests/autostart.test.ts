@@ -174,9 +174,13 @@ describe("Windows workspace autostart registration", () => {
     expect(tasks.installCalls).toEqual([]);
   });
 
-  it("uses HKCU Run only when Task Scheduler reports access denied", () => {
+  it.each([
+    "Could not install the Windows logon task: Access is denied.",
+    "The Task Scheduler service is not available.",
+    "Could not install the Windows logon task: 0x80041315",
+  ])("uses HKCU Run when Task Scheduler denies creation or is unavailable (%s)", (message) => {
     const taskScheduler = new FakeTaskScheduler();
-    taskScheduler.install = () => { throw new Error("Could not install the Windows logon task: Access is denied."); };
+    taskScheduler.install = () => { throw new Error(message); };
     const runKey = new FakeRunKey();
     const adapter = new WindowsAutostartAdapter(taskScheduler, runKey);
     const registration: AutostartRegistration = {
@@ -192,6 +196,22 @@ describe("Windows workspace autostart registration", () => {
     expect(runKey.installed.has(registration.taskName)).toBe(true);
     expect(adapter.isInstalled({ ...registration, backend: "registry_run" })).toBe(true);
     adapter.remove({ ...registration, ...installed });
+    expect(runKey.installed.size).toBe(0);
+  });
+
+  it("does not use HKCU Run for unrelated Task Scheduler failures", () => {
+    const taskScheduler = new FakeTaskScheduler();
+    taskScheduler.install = () => { throw new Error("The supplied task XML is invalid."); };
+    const runKey = new FakeRunKey();
+    const adapter = new WindowsAutostartAdapter(taskScheduler, runKey);
+    const registration: AutostartRegistration = {
+      workspaceId: "aabbccddeeff",
+      workspaceRoot: "C:\\workspace",
+      taskName: taskNameForWorkspace("aabbccddeeff"),
+      updatedAt: new Date().toISOString(),
+    };
+
+    expect(() => adapter.install(registration)).toThrow(/XML is invalid/i);
     expect(runKey.installed.size).toBe(0);
   });
 });
@@ -224,9 +244,18 @@ describe("Windows Task Scheduler command construction", () => {
   });
 
   it("keeps Node executable, CLI entry, and workspace paths in the encoded hidden action", () => {
+    const nodeArguments = [
+      "C:\\C2C Install\\dist\\cli\\index.js",
+      "autostart",
+      "restore",
+      "--workspace",
+      "C:\\Users\\A B\\Project\\",
+      "--workspace-id",
+      "aabbccddeeff; Remove-Item test-marker",
+    ];
     const action = buildHiddenPowerShellAction({
       nodePath: "C:\\Program Files\\nodejs\\node.exe",
-      nodeArguments: ["C:\\C2C Install\\dist\\cli\\index.js", "autostart", "restore", "--workspace", "C:\\Users\\A B\\Project"],
+      nodeArguments,
       workingDirectory: "C:\\C2C Install",
       environment: { C2C_STATE_DIR: "C:\\Users\\A B\\State" },
       powershellPath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
@@ -240,6 +269,19 @@ describe("Windows Task Scheduler command construction", () => {
     const encodedScript = action.arguments.split("-EncodedCommand ")[1];
     const script = Buffer.from(encodedScript, "base64").toString("utf16le");
     expect(script).toContain("Start-Process -FilePath $payload.nodePath");
+    expect(script).not.toContain("C:\\Users\\A B\\Project");
+    const payloadBase64 = script.match(/FromBase64String\('([^']+)'\)/)?.[1];
+    expect(payloadBase64).toBeDefined();
+    const payload = JSON.parse(Buffer.from(payloadBase64!, "base64").toString("utf8")) as {
+      nodePath: string;
+      arguments: string;
+      workingDirectory: string;
+      environment: Record<string, string>;
+    };
+    expect(payload.nodePath).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expect(payload.arguments).toBe(quoteWindowsCommandLine(nodeArguments));
+    expect(payload.workingDirectory).toBe("C:\\C2C Install");
+    expect(payload.environment).toEqual({ C2C_STATE_DIR: "C:\\Users\\A B\\State" });
     expect(script).not.toContain(" -Wait");
     expect(script).toContain("exit 0");
   });

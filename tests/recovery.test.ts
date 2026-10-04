@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "../src/tunnel/provider.js";
 import { startBridge } from "../src/bridge/server.js";
 import { findBridgeObservation, writeRuntimeState } from "../src/bridge/runtime.js";
-import { ensureBridge, stopBridge } from "../src/process/daemon.js";
+import { stopBridge } from "../src/process/daemon.js";
 import { collectRuntimeDiagnostics, restoreWorkspace } from "../src/process/recovery.js";
 import { readLastEndpoint, writeLastEndpoint } from "../src/config/endpoint.js";
 import { AuthStore } from "../src/auth/store.js";
@@ -135,6 +135,50 @@ describe("workspace runtime recovery", () => {
     }
   });
 
+  it("restores a stopped bridge and its persisted Named Tunnel without duplicating either", async () => {
+    dirs.push(isolateStateDir());
+    const { root, workspace } = makeWorkspace("restore-stopped-named");
+    setNamedPreference(workspace.id);
+    setValidCredentialFiles(root);
+    setConnector(workspace.id, NAMED_URL);
+    setPermission(workspace.id, "readonly");
+    const auth = new AuthStore(workspace.id);
+    const client = auth.registerClient({ redirectUris: ["http://127.0.0.1/callback"] });
+    const issued = auth.issueTokens({ clientId: client.clientId, scopes: ["workspace.read", "offline_access"] });
+    const provider = new FakeTunnel("cloudflare-named", NAMED_URL);
+    const bridges: Awaited<ReturnType<typeof startBridge>>[] = [];
+    const ensureBridgeImpl = async (workspaceRoot: string) => {
+      const current = await findBridgeObservation(workspace.id);
+      if (current.state === "healthy") return { runtime: current.runtime, spawned: false };
+      if (current.state === "unknown") throw new Error(current.reason);
+      const bridge = await startBridge({ workspaceRoot, port: 0, tunnelProvider: provider });
+      bridges.push(bridge);
+      const started = await findBridgeObservation(workspace.id);
+      if (started.state !== "healthy") throw new Error("Test Bridge did not become healthy.");
+      return { runtime: started.runtime, spawned: true };
+    };
+
+    try {
+      const first = await restoreWorkspace(root, { ensureBridgeImpl, fetchImpl: healthyFetch });
+      const second = await restoreWorkspace(root, { ensureBridgeImpl, fetchImpl: healthyFetch });
+
+      expect(first).toMatchObject({ ok: true, bridgeAction: "started", tunnelAction: "started" });
+      expect(second).toMatchObject({ ok: true, bridgeAction: "reused", tunnelAction: "reused" });
+      expect(provider.starts).toBe(1);
+      expect(bridges).toHaveLength(1);
+      expect(first.diagnostics.configuredHostname).toBe("c2c-demo.example.com");
+      expect(first.diagnostics.currentPublicUrl).toBe(NAMED_URL);
+      expect(first.diagnostics.connectorEndpointMatchesCurrent).toBe(true);
+      expect(first.diagnostics.endpointStable).toBe(true);
+      expect(readPermission(workspace.id)).toBe("readonly");
+      expect(new AuthStore(workspace.id).verifyAccessToken(issued.accessToken).ok).toBe(true);
+      expect(new AuthStore(workspace.id).tokenCount()).toBe(2);
+      expect(bridges[0].pairing.hasActiveSession()).toBe(false);
+    } finally {
+      for (const bridge of bridges) await bridge.close();
+    }
+  });
+
   it("stops before spawning the named tunnel when its credential file is missing", async () => {
     dirs.push(isolateStateDir());
     const { root, workspace } = makeWorkspace("restore-no-credential");
@@ -148,6 +192,25 @@ describe("workspace runtime recovery", () => {
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("credentialsMissing");
       expect(result.diagnostics.tunnel.namedCredentialStatus).toBe("missing_credentials");
+      expect(provider.starts).toBe(0);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("reports invalid named credentials without falling back to Quick Tunnel", async () => {
+    dirs.push(isolateStateDir());
+    const { root, workspace } = makeWorkspace("restore-invalid-credential");
+    setNamedPreference(workspace.id);
+    process.env.TUNNEL_ORIGIN_CERT = write(root, "cert.pem", "fake certificate marker");
+    process.env.TUNNEL_CRED_FILE = write(root, "tunnel.json", "not json");
+    const provider = new FakeTunnel("cloudflare-named", NAMED_URL);
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, tunnelProvider: provider });
+    try {
+      const result = await restoreWorkspace(root, { fetchImpl: healthyFetch });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("namedCredentialsInvalid");
+      expect(result.diagnostics.tunnel.provider).toBe("cloudflare-named");
       expect(provider.starts).toBe(0);
     } finally {
       await bridge.close();
@@ -169,6 +232,27 @@ describe("workspace runtime recovery", () => {
       expect(result.diagnostics.tunnel.provider).toBe("cloudflare-named");
       expect(result.diagnostics.currentPublicUrl).toBeNull();
       expect(provider.starts).toBe(1);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("reports an unavailable configured named hostname as action needed", async () => {
+    dirs.push(isolateStateDir());
+    const { root, workspace } = makeWorkspace("restore-hostname-unavailable");
+    setNamedPreference(workspace.id);
+    setValidCredentialFiles(root);
+    setConnector(workspace.id, NAMED_URL);
+    const provider = new FakeTunnel("cloudflare-named", NAMED_URL);
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, tunnelProvider: provider });
+    try {
+      const unavailable: typeof fetch = async () => new Response("unavailable", { status: 503 });
+      const result = await restoreWorkspace(root, { fetchImpl: unavailable });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("hostnameUnavailable");
+      expect(result.diagnostics.configuredHostname).toBe("c2c-demo.example.com");
+      expect(provider.starts).toBe(1);
+      expect(provider.name).toBe("cloudflare-named");
     } finally {
       await bridge.close();
     }
@@ -208,11 +292,13 @@ describe("workspace runtime recovery", () => {
       startedAt: new Date(0).toISOString(),
     });
 
-    const first = await ensureBridge(root, { port: 0 });
-    const second = await ensureBridge(root, { port: 0 });
+    const first = await restoreWorkspace(root);
+    const second = await restoreWorkspace(root);
     try {
-      expect(first.spawned).toBe(true);
-      expect(second.spawned).toBe(false);
+      expect(first.ok).toBe(true);
+      expect(first.bridgeAction).toBe("started");
+      expect(second.ok).toBe(true);
+      expect(second.bridgeAction).toBe("reused");
     } finally {
       await stopBridge(root);
       const deadline = Date.now() + 3000;
