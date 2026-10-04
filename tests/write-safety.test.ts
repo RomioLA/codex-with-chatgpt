@@ -5,6 +5,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import {
   createFile,
+  createDirectory,
+  deleteFile,
   editText,
   getWriteAuditPath,
   hashFile,
@@ -52,6 +54,39 @@ afterEach(() => {
 });
 
 describe("write safety primitives", () => {
+  it("deletes one matching regular file and audits both its old hash and absence", () => {
+    const target = writeFixture("delete.txt", "delete fixture");
+    const expectedHash = hashFile(target);
+    expect(deleteFile(target, expectedHash, { workspaceId })).toEqual({
+      path: target, oldHash: expectedHash, newHash: null,
+    });
+    expect(fs.existsSync(target)).toBe(false);
+    const audit = JSON.parse(fs.readFileSync(getWriteAuditPath(workspaceId), "utf8").trim());
+    expect(audit).toMatchObject({ operation: "delete", oldHash: expectedHash, newHash: null, success: true });
+  });
+
+  it("refuses stale deletion, missing files, directories and missing hashes", () => {
+    const target = writeFixture("stale-delete.txt", "original");
+    const expectedHash = hashFile(target);
+    fs.writeFileSync(target, "newer");
+    expectCode(() => deleteFile(target, expectedHash, { workspaceId }), "STALE_FILE");
+    expect(fs.readFileSync(target, "utf8")).toBe("newer");
+    expectCode(() => deleteFile(root, expectedHash, { workspaceId }), "NOT_A_FILE");
+    expectCode(() => deleteFile(testPath("missing.txt"), expectedHash, { workspaceId }), "FILE_NOT_FOUND");
+    expectCode(() => deleteFile(target, undefined as unknown as string), "INVALID_ARGUMENT");
+  });
+
+  it("creates and audits one directory, rejecting existing targets and missing parents", () => {
+    const target = testPath("explicit-dir");
+    expect(createDirectory(target, { workspaceId })).toEqual({ path: target, oldHash: null, newHash: null });
+    expect(fs.statSync(target).isDirectory()).toBe(true);
+    expectCode(() => createDirectory(target, { workspaceId }), "FILE_ALREADY_EXISTS");
+    expectCode(() => createDirectory(testPath("absent/child"), { workspaceId }), "WRITE_FAILED");
+    const audits = fs.readFileSync(getWriteAuditPath(workspaceId), "utf8").trim().split("\n").map(JSON.parse);
+    expect(audits[0]).toMatchObject({ operation: "create_directory", success: true });
+    expect(audits[1]).toMatchObject({ success: false, errorCode: "FILE_ALREADY_EXISTS" });
+  });
+
   it("produces a stable SHA-256 content hash", () => {
     const filePath = writeFixture("stable.txt", "stable bytes\n");
     const expected = createHash("sha256").update("stable bytes\n").digest("hex");

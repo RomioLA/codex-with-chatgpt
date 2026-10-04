@@ -57,6 +57,18 @@ export interface MoveResult {
   newHash: string;
 }
 
+export interface DeleteResult {
+  path: string;
+  oldHash: string;
+  newHash: null;
+}
+
+export interface DirectoryResult {
+  path: string;
+  oldHash: null;
+  newHash: null;
+}
+
 interface AuditRecord {
   timestamp: string;
   operation: string;
@@ -177,7 +189,7 @@ function logFailure(record: AuditRecord, error: unknown): void {
   }
 }
 
-function audited<T extends WriteResult | MoveResult>(
+function audited<T extends WriteResult | MoveResult | DeleteResult | DirectoryResult>(
   operation: string,
   filePath: string,
   context: WriteContext,
@@ -464,4 +476,42 @@ export function moveFile(sourcePath: string, destinationPath: string, context: W
     }
     return { source, destination, oldHash, newHash: oldHash };
   }, { source, destination });
+}
+
+/** Delete exactly one authorized regular file, only if its bytes still match the snapshot. */
+export function deleteFile(filePath: string, expectedHash: string, context: WriteContext = {}): DeleteResult {
+  const absolutePath = asAbsolutePath(filePath);
+  validateExpectedHash(expectedHash);
+  return audited("delete", absolutePath, context, () => {
+    const oldHash = hashBytes(readRegularFile(absolutePath).bytes);
+    if (oldHash !== expectedHash.toLowerCase()) {
+      throw new WriteSafetyError("STALE_FILE", `File changed since it was read: ${absolutePath}`, {
+        expectedHash: expectedHash.toLowerCase(), currentHash: oldHash,
+      });
+    }
+    try {
+      fs.unlinkSync(absolutePath);
+    } catch (error) {
+      throw new WriteSafetyError("WRITE_FAILED", `Could not delete file: ${absolutePath}`, {
+        oldHash, systemCode: (error as NodeJS.ErrnoException).code,
+      });
+    }
+    return { path: absolutePath, oldHash, newHash: null };
+  });
+}
+
+/** Create exactly one authorized directory. Its parent must already exist; no implicit recursion. */
+export function createDirectory(directoryPath: string, context: WriteContext = {}): DirectoryResult {
+  const absolutePath = asAbsolutePath(directoryPath);
+  return audited("create_directory", absolutePath, context, () => {
+    assertDestinationAbsent(absolutePath, "FILE_ALREADY_EXISTS");
+    try {
+      fs.mkdirSync(absolutePath);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      throw new WriteSafetyError(code === "EEXIST" ? "FILE_ALREADY_EXISTS" : "WRITE_FAILED",
+        `Could not create directory: ${absolutePath}`, { systemCode: code });
+    }
+    return { path: absolutePath, oldHash: null, newHash: null };
+  });
 }

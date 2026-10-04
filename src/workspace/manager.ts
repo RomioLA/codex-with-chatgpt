@@ -38,6 +38,8 @@ export interface ReadFileResult {
   remainingLines: number;
   nextStartLine: number | null;
   content: string;
+  /** SHA-256 of the exact bytes consumed by this read, before line pagination. */
+  contentHash: string;
 }
 
 export interface DirEntry {
@@ -214,7 +216,9 @@ export class Workspace {
     let byteTruncated = false;
     let actualEnd = startLine - 1;
 
-    const stream = fs.createReadStream(abs, { encoding: "utf8" });
+    const contentHash = createHash("sha256");
+    const stream = fs.createReadStream(abs);
+    stream.on("data", (chunk) => contentHash.update(chunk));
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
     for await (const line of rl) {
       totalLines++;
@@ -242,6 +246,7 @@ export class Workspace {
       remainingLines: remaining,
       nextStartLine: remaining > 0 ? actualEnd + 1 : null,
       content: lines.join("\n"),
+      contentHash: contentHash.digest("hex"),
     };
   }
 

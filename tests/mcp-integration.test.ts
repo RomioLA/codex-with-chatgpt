@@ -6,7 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
-import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
+import { makeTmpDir, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
 let root: string;
 let bridge: Bridge;
@@ -73,33 +73,43 @@ beforeAll(async () => {
 afterAll(async () => {
   await client.close();
   await bridge.close();
-  cleanup(root);
+  // Retain temporary fixtures; no recursive deletion.
 });
 
 describe("MCP tools over Streamable HTTP", () => {
-  it("lists all ten read-only tools", async () => {
+  it("lists read-only tools and explicitly separated permission-gated file tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
+      "create_directory",
+      "create_external_file",
+      "create_file",
+      "delete_file",
+      "edit_external_file",
+      "edit_file",
       "execution_output",
       "execution_summary",
       "git_diff",
       "git_status",
       "list_directory",
+      "move_file",
+      "permission_status",
+      "read_external_file",
       "read_file",
       "read_image",
+      "replace_external_file",
+      "replace_file",
       "search_workspace",
       "test_status",
       "workspace_info",
     ]);
-    // no write tools in V1
-    for (const forbidden of ["write_file", "delete_file", "execute_shell", "git_commit", "install_package"]) {
+    for (const forbidden of ["write_file", "move_external_file", "delete_external_file", "delete_directory", "execute_shell", "git_commit", "install_package"]) {
       expect(names).not.toContain(forbidden);
     }
 
     expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
-    expectToolOutputSchema(tools, "read_file", ["path", "content", "startLine", "endLine", "nextStartLine"]);
+    expectToolOutputSchema(tools, "read_file", ["path", "content", "contentHash", "startLine", "endLine", "nextStartLine"]);
     expectToolOutputSchema(tools, "read_image", ["path", "sizeBytes", "mimeType"]);
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
     expectToolOutputSchema(tools, "git_status", ["isRepo", "branch", "staged", "unstaged", "untracked", "hidden"]);
