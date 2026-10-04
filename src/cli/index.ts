@@ -61,6 +61,12 @@ import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { importMediaAsset } from "../media/import.js";
 import { isPermissionMode, readPermission, setPermission, type PermissionMode } from "../permission/index.js";
+import {
+  AutostartService,
+  AutostartUnsupportedError,
+  type AutostartStatus,
+} from "../autostart/registration.js";
+import { WindowsAutostartAdapter, WindowsRunKeyAutostart, WindowsTaskScheduler } from "../autostart/windows-task.js";
 
 const program = new Command();
 
@@ -237,6 +243,43 @@ async function ensureBridgeAndTunnel(
   return { runtime, info, mcpUrl };
 }
 
+async function startWorkspace(
+  workspaceRoot: string,
+  opts: { tunnel: boolean }
+): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null; connectorName?: string }> {
+  const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(workspaceRoot, opts);
+  const connectorName = mcpUrl
+    ? persistWorkspaceEndpoint({
+        workspaceId: info.workspaceId,
+        workspaceName: info.workspaceName,
+        port: runtime.port,
+        publicUrl: info.publicUrl,
+        mcpUrl,
+      })
+    : readLastEndpoint(info.workspaceId)?.connectorName;
+  return { runtime, info, mcpUrl, connectorName };
+}
+
+function createAutostartService(): AutostartService {
+  if (process.platform !== "win32") throw new AutostartUnsupportedError();
+  const cliPath = fileURLToPath(import.meta.url);
+  return new AutostartService(new WindowsAutostartAdapter(
+    new WindowsTaskScheduler(cliPath),
+    new WindowsRunKeyAutostart(cliPath)
+  ));
+}
+
+function printAutostartStatus(status: AutostartStatus): void {
+  say(`Autostart: ${status.enabled ? "enabled" : "disabled"}`);
+  say(`Workspace: ${status.workspace}`);
+  say(`Workspace exists: ${status.workspaceExists ? "yes" : "no"}`);
+  say(`Task installed: ${status.taskInstalled ? "yes" : "no"}`);
+  say(`Autostart backend: ${status.backend ?? "none"}${status.backendInstalled ? " (installed)" : ""}`);
+  say(`Registration state: ${status.registrationState}`);
+  if (status.lastRunAt) say(`Last startup: ${status.lastRunAt} (${status.lastRunStatus ?? "unknown"})`);
+  if (status.lastRunMessage) say(`Last startup message: ${status.lastRunMessage}`);
+}
+
 program
   .name("c2c")
   .description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)
@@ -281,16 +324,7 @@ program
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
-      const connectorName = mcpUrl
-        ? persistWorkspaceEndpoint({
-            workspaceId: info.workspaceId,
-            workspaceName: info.workspaceName,
-            port: runtime.port,
-            publicUrl: info.publicUrl,
-            mcpUrl,
-          })
-        : readLastEndpoint(info.workspaceId)?.connectorName;
+      const { runtime, info, mcpUrl, connectorName } = await startWorkspace(root, { tunnel: opts.tunnel });
       if (opts.json) {
         say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: info.workspaceId, mcpUrl, connectorName }));
         return;
@@ -300,6 +334,117 @@ program
       if (mcpUrl) check("安全连接已建立");
     } catch (error) {
       handleCliError(error, opts.json);
+    }
+  });
+
+// ---------------------------------------------------------------- Windows workspace autostart
+
+const autostartCmd = program.command("autostart").description("Manage Windows logon startup for workspaces");
+
+autostartCmd
+  .command("enable")
+  .description("Start this workspace automatically when the current Windows user logs in")
+  .requiredOption("-w, --workspace <path>", "workspace root")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace: string; json: boolean }) => {
+    try {
+      const status = createAutostartService().enable(opts.workspace);
+      if (opts.json) say(JSON.stringify({ ok: true, ...status }));
+      else printAutostartStatus(status);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+autostartCmd
+  .command("disable")
+  .description("Remove this workspace from Windows logon startup")
+  .requiredOption("-w, --workspace <path>", "workspace root")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace: string; json: boolean }) => {
+    try {
+      const status = createAutostartService().disable(opts.workspace);
+      if (opts.json) say(JSON.stringify({ ok: true, ...status }));
+      else printAutostartStatus(status);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+autostartCmd
+  .command("status")
+  .description("Show this workspace's Windows logon startup state")
+  .requiredOption("-w, --workspace <path>", "workspace root")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace: string; json: boolean }) => {
+    try {
+      const status = createAutostartService().status(opts.workspace);
+      if (opts.json) say(JSON.stringify({ ok: true, ...status }));
+      else printAutostartStatus(status);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+autostartCmd
+  .command("list")
+  .description("List registered Windows autostart workspaces")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    try {
+      const workspaces = createAutostartService().list();
+      if (opts.json) say(JSON.stringify({ ok: true, workspaces }));
+      else if (workspaces.length === 0) say("No workspaces are registered for autostart.");
+      else workspaces.forEach((status) => { printAutostartStatus(status); say(""); });
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+// Hidden task entrypoint. It only acts on an existing registration, never creates a missing workspace,
+// and stores the last outcome in the same user state directory as that registration.
+autostartCmd
+  .command("restore", { hidden: true })
+  .requiredOption("--workspace-id <id>")
+  .requiredOption("--workspace <path>")
+  .action(async (opts: { workspaceId: string; workspace: string }) => {
+    if (process.platform !== "win32") return;
+    const workspaceRoot = path.resolve(opts.workspace);
+    try {
+      const service = createAutostartService();
+      const registration = service.getRegistrationById(opts.workspaceId);
+      if (!registration || path.resolve(registration.workspaceRoot).toLowerCase() !== workspaceRoot.toLowerCase()) return;
+
+      if (!fs.existsSync(workspaceRoot) || !fs.statSync(workspaceRoot).isDirectory()) {
+        service.recordRun(opts.workspaceId, registration.workspaceRoot, {
+          status: "workspace_missing",
+          message: `Registered workspace no longer exists: ${registration.workspaceRoot}`,
+        });
+        process.exitCode = 1;
+        return;
+      }
+      const workspace = new Workspace(workspaceRoot);
+      if (workspace.id !== opts.workspaceId) {
+        service.recordRun(opts.workspaceId, registration.workspaceRoot, {
+          status: "workspace_missing",
+          message: "Registered workspace path now resolves to a different workspace.",
+        });
+        process.exitCode = 1;
+        return;
+      }
+
+      const { info, mcpUrl } = await startWorkspace(workspace.root, { tunnel: true });
+      service.recordRun(opts.workspaceId, registration.workspaceRoot, {
+        status: "started",
+        message: `Bridge restored${mcpUrl ? " with tunnel" : ""} for ${info.workspaceName}.`,
+      });
+    } catch (error) {
+      const service = createAutostartService();
+      service.recordRun(opts.workspaceId, workspaceRoot, {
+        status: "failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      process.exitCode = 1;
     }
   });
 
