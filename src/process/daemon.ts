@@ -52,7 +52,7 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
   const { cmd, args } = cliEntry();
   const child = spawn(
     cmd,
-    [...args, "serve", "--workspace", workspace.root, ...(opts.port ? ["--port", String(opts.port)] : [])],
+    [...args, "serve", "--workspace", workspace.root, ...(opts.port !== undefined ? ["--port", String(opts.port)] : [])],
     {
       detached: true,
       stdio: ["ignore", out, out],

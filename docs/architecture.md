@@ -75,6 +75,11 @@ before the first public URL exists; `cloudflared tunnel login` is the only extra
 user step. Tunnel name, hostname and preference live under the OS state dir
 (`tunnels/<workspaceId>.json`), never in the project. Named starts use
 `cloudflared tunnel --url … run <name>` so the public URL stays stable. If named
-provisioning fails, C2C falls back to Quick Tunnel. If a named tunnel later
-drops, doctor asks for a Cloudflare re-login (`namedRepair`) instead of
-rotating the ChatGPT connector.
+provisioning fails during initial setup, C2C may fall back to Quick Tunnel. Once
+the named preference is saved, runtime recovery never silently switches to a
+Quick URL. `c2c restore -w <workspace> --json` reuses or starts the Bridge,
+restores the configured tunnel, checks the public health endpoint, and reports
+whether the saved connector endpoint still matches. It does not pair again,
+change ChatGPT settings, revoke tokens, or recreate AuthStore. A missing or
+invalid named credential is reported as an action needed. Quick URLs are marked
+unstable and are not restart-safe for an existing connector.

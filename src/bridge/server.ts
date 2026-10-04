@@ -191,6 +191,20 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       });
   });
 
+  app.post("/admin/tunnel/restart", adminGuard, (_req, res) => {
+    tunnel
+      .restart(port)
+      .then((url) => {
+        publicBaseUrl = url;
+        persistRuntime();
+        res.json({ url });
+      })
+      .catch((error: Error) => {
+        logger.error(`Tunnel restart failed: ${error.message}`);
+        res.status(500).json({ error: "tunnel_failed", message: error.message });
+      });
+  });
+
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
     void tunnel.stop().then(() => {
       publicBaseUrl = null;

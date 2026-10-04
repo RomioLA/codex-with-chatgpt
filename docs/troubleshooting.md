@@ -1,13 +1,15 @@
 # Troubleshooting
 
-First move, always:
+For startup recovery, use the explicit local recovery command:
 
 ```
-c2c doctor
+c2c restore -w <workspace> --json
 ```
 
-It checks Node, workspace, bridge, MCP, OAuth and tunnel — and repairs what it
-can (restarts the bridge, restarts the tunnel) without asking.
+It reuses or starts the workspace Bridge, restores the saved tunnel preference,
+and checks the public health endpoint. It never generates a pairing code,
+revokes OAuth tokens, or changes ChatGPT connector settings. `c2c doctor` remains
+the broader diagnostic command; `c2c status --json` is read-only.
 
 ## Common situations
 
@@ -51,18 +53,22 @@ the saved route as a workaround: the launcher owns its route backup and is
 expected to restore it when its Bridge is turned off.
 
 ### Everything was quit and ChatGPT can no longer connect
-Quitting Codex / the terminal stops the public address. The next `c2c doctor`
-starts a new address and sets `chatgptRepair.needed`. The Skill should tell the
-user that the old address expired, then **Delete** THIS workspace's
-connector (`chatgptRepair.connectorName`) and create it again with the new
-address (never click Reconnect — the old URL is dead). Other workspaces keep
-their own connectors so two projects can stay connected at once.
+Run `c2c restore -w <workspace> --json` and inspect `diagnostics`.
 
-Mint the pairing code only when the ChatGPT Authorize form is on screen
-(`c2c pair`). After the connector is recreated, doctor being green is not
-enough: the saved ChatGPT conversation must pass `workspace_info` again. If
-that old chat still cannot read the workspace, open a new chat in the same
-Project (or switch long-chat) and continue there.
+- With a configured Named Tunnel, the hostname stays the same across restarts.
+  A healthy restore keeps the saved connector endpoint and OAuth state, so no
+  pairing or connector change is needed.
+- With a Quick Tunnel, a restart can produce a different URL. The report marks
+  `endpointStable: false`, `restartSafeConnector: false`, and reports
+  `connectorEndpointChanged` when the active URL no longer matches the saved
+  connector endpoint. The user must update that connector manually; C2C does
+  not edit ChatGPT settings.
+
+Use `c2c status --json -w <workspace>` to inspect Bridge, permission, tunnel
+preference, active public URL, locally saved connector endpoint, OAuth token
+count, and recovery reason without triggering a repair. C2C cannot read the
+ChatGPT account's connector settings; endpoint matching compares local state
+with the currently reachable tunnel.
 
 Fixed ChatGPT pages for first-time setup and later repair (do not hunt the UI):
 
@@ -72,12 +78,13 @@ Fixed ChatGPT pages for first-time setup and later repair (do not hunt the UI):
   https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins
 
 ### Tunnel URL unreachable / ChatGPT says the connector is broken
-Same as above: `c2c doctor`, then Delete + recreate THIS workspace's
-connector if `chatgptRepair.needed`. Mint a pairing code with `c2c pair` only
-when the Authorize form is on screen.
-If this workspace uses a stable hostname, doctor sets `namedRepair` instead —
-re-login to Cloudflare (`c2c tunnel login`) and doctor again. Do not Delete
-the connector; the address did not change.
+Run `c2c restore -w <workspace> --json` or `c2c doctor --json -w <workspace>`.
+For a configured Named Tunnel, credential and hostname failures are reported
+explicitly. Restore does not fall back to a Quick URL or change the connector.
+If the fixed hostname remains unavailable after its credentials are restored,
+check the reported `hostnameUnavailable` reason. For a Quick Tunnel, compare
+the active public URL with `connectorEndpoint`; update the ChatGPT connector
+manually if they differ. Do not generate a pairing code during runtime recovery.
 
 ### I have a Cloudflare domain and want a stable hostname
 During first-time setup (or the next coding session, once), say you have a
@@ -85,6 +92,8 @@ Cloudflare account and give the domain. Codex opens a browser for Cloudflare
 login, then keeps `c2c-<project>.your-domain.com`. To stay on the temporary
 address, say you do not have a domain. Switching later: tell Codex you want
 the stable hostname; it runs `c2c tunnel choose --mode named --zone <domain>`.
+Autostart recovery should use Named mode; Quick Tunnel is temporary and is not
+restart-safe for an existing connector.
 
 ### "配对码无效/过期"
 Pairing codes are one-time and expire after ~5 minutes. Generate one only

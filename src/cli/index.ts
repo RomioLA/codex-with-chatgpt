@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
+import { collectRuntimeDiagnostics, restoreWorkspace } from "../process/recovery.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -192,6 +193,26 @@ interface AdminInfo {
   pid: number;
   startedAt: string;
   permissionMode: PermissionMode;
+}
+
+function printRuntimeDiagnostics(diagnostics: Awaited<ReturnType<typeof collectRuntimeDiagnostics>>): void {
+  const recovery = diagnostics.recovery.reason
+    ? `${diagnostics.recovery.status} (${diagnostics.recovery.reason})`
+    : diagnostics.recovery.status;
+  say(`Workspace: ${diagnostics.workspace.path} (${diagnostics.workspace.id})`);
+  say(`Bridge: ${diagnostics.bridge.status}${diagnostics.bridge.reason ? ` (${diagnostics.bridge.reason})` : ""}`);
+  say(`Permission: ${diagnostics.permission}`);
+  say(`Tunnel preference: ${diagnostics.tunnelPreference}`);
+  say(`Tunnel: ${diagnostics.tunnel.status}${diagnostics.tunnel.provider ? ` (${diagnostics.tunnel.provider})` : ""}`);
+  say(`Configured hostname: ${diagnostics.configuredHostname ?? "none"}`);
+  say(`Current public URL: ${diagnostics.currentPublicUrl ?? "none"}`);
+  say(`Connector endpoint (saved locally): ${diagnostics.connectorEndpoint ?? "none"}`);
+  say(`Connector endpoint matches current: ${diagnostics.connectorEndpointMatchesCurrent === null ? "unknown" : diagnostics.connectorEndpointMatchesCurrent ? "yes" : "no"}`);
+  say(`Connector endpoint healthy: ${diagnostics.connectorEndpointHealthy === null ? "unknown" : diagnostics.connectorEndpointHealthy ? "yes" : "no"}`);
+  say(`Endpoint stable: ${diagnostics.endpointStable ? "yes" : "no"}`);
+  say(`Restart-safe connector: ${diagnostics.restartSafeConnector ? "yes" : "no"}`);
+  say(`OAuth token count: ${diagnostics.oauth.tokenCount}`);
+  say(`Recovery: ${recovery}`);
 }
 
 async function ensureBridgeAndTunnel(
@@ -385,6 +406,27 @@ program
 // ---------------------------------------------------------------- status
 
 program
+  .command("restore")
+  .description("Restore this workspace's Bridge and configured tunnel without pairing")
+  .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
+    try {
+      const result = await restoreWorkspace(resolveWorkspace(opts.workspace));
+      if (opts.json) say(JSON.stringify(result));
+      else {
+        say(`Bridge: ${result.bridgeAction}`);
+        say(`Tunnel: ${result.tunnelAction}`);
+        printRuntimeDiagnostics(result.diagnostics);
+        if (result.detail) say(`Detail: ${result.detail}`);
+      }
+      if (!result.ok) process.exitCode = 1;
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+program
   .command("status")
   .description("Show bridge status for this workspace")
   .option("-w, --workspace <path>")
@@ -395,26 +437,29 @@ program
     const permissionMode = readPermission(workspace.id);
     const observation = await findBridgeObservation(workspace.id);
     if (observation.state === "unknown") {
+      const diagnostics = await collectRuntimeDiagnostics(root, { observation });
       if (opts.json) {
-        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason, permissionMode }));
+        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason, permissionMode, diagnostics }));
       } else {
         cross(`Bridge 状态无法确认（${observation.reason}），未将其视为未运行。`);
-        say(`Permission: ${permissionMode}`);
+        printRuntimeDiagnostics(diagnostics);
       }
       return;
     }
     if (observation.state === "stopped") {
-      if (opts.json) say(JSON.stringify({ ok: false, running: false, permissionMode }));
+      const diagnostics = await collectRuntimeDiagnostics(root, { observation });
+      if (opts.json) say(JSON.stringify({ ok: false, running: false, permissionMode, diagnostics }));
       else {
         say("Bridge 未运行。使用 `c2c start` 启动。");
-        say(`Permission: ${permissionMode}`);
+        printRuntimeDiagnostics(diagnostics);
       }
       return;
     }
     const runtime = observation.runtime;
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+    const diagnostics = await collectRuntimeDiagnostics(root, { observation, info });
     if (opts.json) {
-      say(JSON.stringify({ ok: true, running: true, ...info }));
+      say(JSON.stringify({ ok: diagnostics.recovery.status === "healthy", running: true, ...info, diagnostics }));
       return;
     }
     say(PRODUCT_NAME);
@@ -423,8 +468,10 @@ program
     check(`Bridge：运行中（端口 ${info.port}）`);
     say(`Permission: ${info.permissionMode}`);
     if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
-    else say("· 安全连接：未启用（本地模式）");
+    else if (diagnostics.tunnelPreference === "unset") say("· 安全连接：未启用（本地模式）");
+    else say(`· 安全连接：${diagnostics.tunnel.status}（已配置 ${diagnostics.tunnelPreference} Tunnel）`);
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+    printRuntimeDiagnostics(diagnostics);
   });
 
 // ---------------------------------------------------------------- permission
@@ -654,7 +701,7 @@ program
         report.tunnel = { ok: true, detail: currentUrl };
         const nextMcp = mcpUrlFromPublic(currentUrl);
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
-        const boundName = nextMcp
+        const boundName = nextMcp && action !== "update"
           ? persistWorkspaceEndpoint({
               workspaceId: info.workspaceId,
               workspaceName: info.workspaceName,
@@ -722,15 +769,23 @@ program
       };
     }
 
+    const diagnostics = workspace ? await collectRuntimeDiagnostics(root) : null;
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair }));
+      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, diagnostics }));
       const hasFailures =
-        Object.values(report).some((value) => !value.ok) || chatgptRepair.needed || namedRepair.needed;
+        Object.values(report).some((value) => !value.ok) ||
+        chatgptRepair.needed ||
+        namedRepair.needed ||
+        diagnostics?.recovery.status === "actionNeeded";
       if (hasFailures) process.exitCode = 1;
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);
     say("");
+    if (diagnostics) {
+      printRuntimeDiagnostics(diagnostics);
+      say("");
+    }
     const labels: Record<string, string> = {
       node: "Node.js",
       sandbox: "Sandbox",
@@ -749,6 +804,7 @@ program
         allOk = false;
       }
     }
+    if (diagnostics?.recovery.status === "actionNeeded") allOk = false;
     for (const repair of results) say(`· ${repair}`);
     say("");
     if (namedRepair.needed && namedRepair.userMessage) {

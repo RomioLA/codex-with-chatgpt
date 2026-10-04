@@ -144,7 +144,7 @@ describe("CloudflaredQuickTunnel", () => {
     await expect(starting).resolves.toBe(QUICK_URL);
     expect(spawnImpl).toHaveBeenCalledWith(
       "cloudflared",
-      ["tunnel", "--url", "http://127.0.0.1:3333", "--no-autoupdate"],
+      ["tunnel", "--url", "http://127.0.0.1:3333", "--no-autoupdate", ...tunnelProtocolArgs()],
       { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
     );
     expect(fetchImpl).toHaveBeenCalledWith(`${QUICK_URL}/health`, {
