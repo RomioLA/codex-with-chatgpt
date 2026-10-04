@@ -3,12 +3,21 @@ import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 
-export const SUPPORTED_SCOPES = [
+// Default connections keep the V1 read-only grant, regardless of new capabilities.
+export const DEFAULT_SCOPES = [
   "workspace.read",
   "workspace.search",
   "git.read",
   "execution.read",
   "offline_access",
+] as const;
+
+export const SUPPORTED_SCOPES = [
+  ...DEFAULT_SCOPES,
+  "workspace.write",
+  "workspace.delete",
+  "filesystem.external.read",
+  "filesystem.external.write",
 ] as const;
 
 export type Scope = (typeof SUPPORTED_SCOPES)[number];
@@ -270,9 +279,11 @@ export class AuthStore {
   }
 }
 
-export function filterScopes(requested: string | undefined): string[] {
-  if (!requested || requested.trim() === "") return [...SUPPORTED_SCOPES];
+export function filterScopes(requested: unknown): string[] {
+  if (requested === undefined) return [...DEFAULT_SCOPES];
+  if (typeof requested !== "string") return [];
+  if (requested.trim() === "") return [...DEFAULT_SCOPES];
   const asked = requested.split(/[\s+]+/).filter(Boolean);
-  const granted = asked.filter((scope) => (SUPPORTED_SCOPES as readonly string[]).includes(scope));
-  return granted.length > 0 ? granted : [...SUPPORTED_SCOPES];
+  // Explicit requests never fall back to defaults or gain unrequested capabilities.
+  return [...new Set(asked.filter((scope) => (SUPPORTED_SCOPES as readonly string[]).includes(scope)))];
 }

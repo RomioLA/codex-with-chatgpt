@@ -77,7 +77,15 @@ function pairingPage(opts: {
     "git.read": "Read git status and diffs",
     "execution.read": "Read Codex execution summaries",
     offline_access: "Stay connected between sessions",
+    "workspace.write": "Create and modify files in this workspace",
+    "workspace.delete": "Delete files in this workspace",
+    "filesystem.external.read": "Read permitted files outside this workspace",
+    "filesystem.external.write": "Create and modify permitted files outside this workspace",
   };
+  const hasMutationScope = opts.scopes.some((scope) =>
+    ["workspace.write", "workspace.delete", "filesystem.external.write"].includes(scope)
+  );
+  const accessLabel = hasMutationScope ? "" : " (read-only)";
   const scopeList = opts.scopes
     .map((scope) => `<li>${escapeHtml(scopeLabels[scope] ?? scope)}</li>`)
     .join("");
@@ -119,7 +127,7 @@ function pairingPage(opts: {
 <body>
 <div class="card">
   <h1>${escapedProductName}</h1>
-  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (read-only):</p>
+  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong>${accessLabel}:</p>
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">
@@ -222,6 +230,10 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       return;
     }
     const scopes = filterScopes(query.scope);
+    if (scopes.length === 0) {
+      fail("invalid_scope", "No supported scopes were requested");
+      return;
+    }
     const request: PendingAuthRequest = {
       id: randomBytes(16).toString("hex"),
       clientId: client.clientId,

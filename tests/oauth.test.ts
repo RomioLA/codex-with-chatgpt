@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
+import { DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
 
 let root: string;
@@ -9,7 +10,7 @@ let base: string;
 
 const REDIRECT_URI = "http://127.0.0.1:19999/callback";
 
-beforeAll(async () => {
+beforeEach(async () => {
   isolateStateDir();
   root = makeTmpDir("oauth-ws");
   write(root, "hello.txt", "hello oauth\n");
@@ -22,7 +23,7 @@ beforeAll(async () => {
   base = bridge.localBaseUrl();
 });
 
-afterAll(async () => {
+afterEach(async () => {
   await bridge.close();
   cleanup(root);
 });
@@ -42,7 +43,8 @@ async function authorizeWithPairing(
   clientId: string,
   challenge: string,
   pairingCode: string,
-  state = "st-123"
+  state = "st-123",
+  scope: string | string[] | null = DEFAULT_SCOPES.join(" ")
 ): Promise<{ code: string | null; location: string | null; page?: string; status?: number }> {
   const authorizeUrl = new URL(`${base}/oauth/authorize`);
   authorizeUrl.searchParams.set("client_id", clientId);
@@ -51,12 +53,16 @@ async function authorizeWithPairing(
   authorizeUrl.searchParams.set("state", state);
   authorizeUrl.searchParams.set("code_challenge", challenge);
   authorizeUrl.searchParams.set("code_challenge_method", "S256");
-  authorizeUrl.searchParams.set("scope", "workspace.read workspace.search git.read execution.read offline_access");
+  if (Array.isArray(scope)) {
+    for (const value of scope) authorizeUrl.searchParams.append("scope", value);
+  } else if (scope !== null) {
+    authorizeUrl.searchParams.set("scope", scope);
+  }
 
   const pageResponse = await fetch(authorizeUrl, { redirect: "manual" });
   const html = await pageResponse.text();
   const requestId = html.match(/name="request_id" value="([a-f0-9]+)"/)?.[1];
-  if (!requestId) return { code: null, location: null, page: html, status: pageResponse.status };
+  if (!requestId) return { code: null, location: pageResponse.headers.get("location"), page: html, status: pageResponse.status };
 
   const postResponse = await fetch(`${base}/oauth/authorize`, {
     method: "POST",
@@ -69,13 +75,14 @@ async function authorizeWithPairing(
   }
   const location = postResponse.headers.get("location");
   const code = location ? new URL(location).searchParams.get("code") : null;
-  return { code, location, status: postResponse.status };
+  return { code, location, page: html, status: postResponse.status };
 }
 
 async function exchangeToken(
   clientId: string,
   code: string,
-  verifier: string
+  verifier: string,
+  scope?: string
 ): Promise<{ status: number; body: Record<string, string> }> {
   const response = await fetch(`${base}/oauth/token`, {
     method: "POST",
@@ -86,6 +93,7 @@ async function exchangeToken(
       code_verifier: verifier,
       client_id: clientId,
       redirect_uri: REDIRECT_URI,
+      ...(scope === undefined ? {} : { scope }),
     }),
   });
   return { status: response.status, body: (await response.json()) as Record<string, string> };
@@ -106,6 +114,91 @@ describe("discovery metadata", () => {
     expect(body.code_challenge_methods_supported).toEqual(["S256"]);
     expect(body.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
     expect(body.registration_endpoint).toContain("/oauth/register");
+  });
+
+  it.each([
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-authorization-server/mcp",
+    "/.well-known/openid-configuration",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp",
+  ])("advertises all supported capabilities at %s", async (endpoint) => {
+    const response = await fetch(`${base}${endpoint}`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { scopes_supported: string[] };
+    expect(body.scopes_supported).toEqual([...SUPPORTED_SCOPES]);
+  });
+});
+
+describe("explicit OAuth capabilities", () => {
+  const newCapabilities = [
+    { scope: "workspace.write", label: "Create and modify files in this workspace", mutation: true },
+    { scope: "workspace.delete", label: "Delete files in this workspace", mutation: true },
+    { scope: "filesystem.external.read", label: "Read permitted files outside this workspace", mutation: false },
+    { scope: "filesystem.external.write", label: "Create and modify permitted files outside this workspace", mutation: true },
+  ];
+
+  it.each([
+    { scope: null, expected: [...DEFAULT_SCOPES], mutation: false },
+    { scope: "", expected: [...DEFAULT_SCOPES], mutation: false },
+    { scope: " \t ", expected: [...DEFAULT_SCOPES], mutation: false },
+    { scope: "workspace.read offline_access", expected: ["workspace.read", "offline_access"], mutation: false },
+    ...newCapabilities.map(({ scope, mutation }) => ({ scope, expected: [scope], mutation })),
+    ...newCapabilities.map(({ scope, mutation }) => ({
+      scope: `${DEFAULT_SCOPES.join(" ")} ${scope}`,
+      expected: [...DEFAULT_SCOPES, scope],
+      mutation,
+    })),
+    { scope: "unknown workspace.read", expected: ["workspace.read"], mutation: false },
+    { scope: "unknown+workspace.write++workspace.write workspace.read", expected: ["workspace.write", "workspace.read"], mutation: true },
+  ])("grants exactly the requested capabilities for $scope", async ({ scope, expected, mutation }) => {
+    const clientId = await registerClient();
+    const { verifier, challenge } = pkceVerifierAndChallenge();
+    const pairing = bridge.pairing.create();
+    const authorization = await authorizeWithPairing(clientId, challenge, pairing.code, "scope-test", scope);
+    expect(authorization.code).toBeTruthy();
+    expect(authorization.page?.includes("(read-only)")).toBe(!mutation);
+    for (const capability of newCapabilities) {
+      expect(authorization.page?.includes(capability.label)).toBe(expected.includes(capability.scope));
+    }
+    expect(authorization.page).not.toContain("Delete files outside this workspace");
+
+    // A token request cannot add capabilities absent from the authorization code.
+    const token = await exchangeToken(clientId, authorization.code!, verifier, SUPPORTED_SCOPES.join(" "));
+    expect(token.status).toBe(200);
+    expect(token.body.scope.split(" ")).toEqual(expected);
+    expect(Boolean(token.body.refresh_token)).toBe(expected.includes("offline_access"));
+    expect(bridge.authStore.verifyAccessToken(token.body.access_token)).toMatchObject({
+      ok: true,
+      record: { scopes: expected },
+    });
+  });
+
+  it.each(["unknown", "+", "workspace.write,workspace.delete", ["workspace.read", "workspace.write"]])(
+    "rejects unsupported or malformed authorization scopes %j",
+    async (scope) => {
+      const clientId = await registerClient();
+      const { challenge } = pkceVerifierAndChallenge();
+      const pairing = bridge.pairing.create();
+      const result = await authorizeWithPairing(clientId, challenge, pairing.code, "invalid-scope", scope);
+      expect(result.code).toBeNull();
+      expect(result.status).toBe(302);
+      const redirect = new URL(result.location!);
+      expect(redirect.searchParams.get("error")).toBe("invalid_scope");
+      expect(redirect.searchParams.get("state")).toBe("invalid-scope");
+      expect(result.page).not.toContain('name="request_id"');
+    }
+  );
+
+  it("keeps write capabilities accurate when a pairing error re-renders the page", async () => {
+    const clientId = await registerClient();
+    const { challenge } = pkceVerifierAndChallenge();
+    bridge.pairing.create();
+    const result = await authorizeWithPairing(clientId, challenge, "AAAA-AAAA", "write-error", "filesystem.external.write");
+    expect(result.status).toBe(401);
+    expect(result.page).toContain("Create and modify permitted files outside this workspace");
+    expect(result.page).not.toContain("(read-only)");
+    expect(result.page).not.toContain("Delete files outside this workspace");
   });
 });
 
@@ -307,6 +400,41 @@ describe("token enforcement on /mcp", () => {
 });
 
 describe("refresh token rotation", () => {
+  it.each([
+    ["workspace.read", "offline_access"],
+    ["workspace.read", "workspace.write", "offline_access"],
+    ["workspace.delete", "offline_access"],
+    ["filesystem.external.read", "offline_access"],
+    ["filesystem.external.write", "offline_access"],
+  ])("cannot gain capabilities through refresh: %j", async (...scopes) => {
+    const clientId = await registerClient();
+    const { verifier, challenge } = pkceVerifierAndChallenge();
+    const pairing = bridge.pairing.create();
+    const { code } = await authorizeWithPairing(clientId, challenge, pairing.code, "refresh-scope", scopes.join(" "));
+    const initial = await exchangeToken(clientId, code!, verifier);
+    expect(initial.status).toBe(200);
+    let refreshToken = initial.body.refresh_token;
+
+    for (const requestedScope of [undefined, SUPPORTED_SCOPES.join(" ")]) {
+      const response = await fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: clientId,
+          ...(requestedScope === undefined ? {} : { scope: requestedScope }),
+        }),
+      });
+      expect(response.status).toBe(200);
+      const rotated = (await response.json()) as Record<string, string>;
+      expect(rotated.scope.split(" ")).toEqual(scopes);
+      expect(rotated.refresh_token).not.toBe(refreshToken);
+      expect(bridge.authStore.verifyAccessToken(rotated.access_token)).toMatchObject({ ok: true, record: { scopes } });
+      refreshToken = rotated.refresh_token;
+    }
+  });
+
   it("rotates refresh tokens and invalidates the old one", async () => {
     const clientId = await registerClient();
     const { verifier, challenge } = pkceVerifierAndChallenge();
