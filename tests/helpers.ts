@@ -16,12 +16,9 @@ export function makeTmpDir(name: string): string {
   return fs.realpathSync.native(dir);
 }
 
-export function cleanup(dir: string): void {
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch {
-    // best effort
-  }
+export function cleanup(_dir: string): void {
+  // Retain isolated fixtures in ignored .tooling/test-tmp. Normal test runs
+  // must not recursively delete files or require an uncommitted preload.
 }
 
 export function write(dir: string, rel: string, content: string): string {

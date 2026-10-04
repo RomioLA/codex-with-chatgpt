@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import fs from "node:fs";
 import path from "node:path";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
@@ -59,21 +58,20 @@ describe("gitStatus", () => {
   });
 
   it("omits sensitive and .c2cignore'd paths from the names ChatGPT sees", () => {
-    write(repo, ".c2cignore", "private-notes/\n");
-    write(repo, ".env", "SECRET_KEY=leaked-env\n");
-    write(repo, "private-notes/secret.md", "CONFIDENTIAL DATA\n");
-    write(repo, "public.txt", "PUBLIC CONTENT\n");
+    const isolated = makeTmpDir("git-sensitive-status");
+    makeGitRepo(isolated);
+    write(isolated, ".c2cignore", "private-notes/\n");
+    write(isolated, ".env", "SECRET_KEY=leaked-env\n");
+    write(isolated, "private-notes/secret.md", "CONFIDENTIAL DATA\n");
+    write(isolated, "public.txt", "PUBLIC CONTENT\n");
 
-    const status = gitStatus(repo);
+    const status = gitStatus(isolated);
     expect(status.untracked).toContain("public.txt");
     expect(status.untracked).not.toContain(".env");
     expect(status.untracked).not.toContain("private-notes/secret.md");
     expect(status.hidden.changes).toBeGreaterThan(0);
 
-    fs.rmSync(path.join(repo, ".c2cignore"), { force: true });
-    fs.rmSync(path.join(repo, ".env"), { force: true });
-    fs.rmSync(path.join(repo, "public.txt"), { force: true });
-    fs.rmSync(path.join(repo, "private-notes"), { recursive: true, force: true });
+    // Keep this fixture separate so later tests do not need destructive cleanup.
   });
 });
 

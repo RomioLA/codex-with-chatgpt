@@ -1,5 +1,6 @@
 import ignore from "ignore";
 import { SENSITIVE_PATTERNS } from "./ignore.js";
+import { isProtectedStatePath } from "./protected-state.js";
 
 /** Paths projected relative to their volume root, never raw absolute ignore inputs. */
 export interface HostSensitivePath {
@@ -18,6 +19,7 @@ export class DefaultHostSensitivePolicy implements HostSensitivePolicy {
   private readonly rules = ignore().add(SENSITIVE_PATTERNS);
 
   isSensitive(target: HostSensitivePath): boolean {
+    if (isProtectedStatePath(target.abs)) return true;
     const relative = target.rootRelative;
     if (!relative) return false;
     // Check directory markers too: .ssh itself is as sensitive as .ssh/config.

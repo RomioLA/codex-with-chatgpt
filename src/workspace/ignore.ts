@@ -1,12 +1,18 @@
 import ignore, { type Ignore } from "ignore";
 import fs from "node:fs";
 import path from "node:path";
+import { isProtectedStatePath } from "./protected-state.js";
 
 /**
  * Files that must never be readable through MCP, regardless of user config.
  * Matched with gitignore semantics against workspace-relative paths.
  */
 export const SENSITIVE_PATTERNS: string[] = [
+  // Git metadata/config can turn read-only Git subprocesses into hook/helper
+  // execution. File capabilities do not grant writes to that control plane.
+  ".git",
+  ".gitconfig",
+  "**/.config/git/",
   ".env",
   ".env.*",
   "!.env.example",
@@ -77,7 +83,7 @@ export class IgnoreRules {
   private noise: Ignore;
   private custom: Ignore;
 
-  constructor(workspaceRoot: string) {
+  constructor(private readonly workspaceRoot: string) {
     this.sensitive = ignore().add(SENSITIVE_PATTERNS);
     this.noise = ignore().add(NOISE_PATTERNS);
     this.custom = ignore();
@@ -93,6 +99,7 @@ export class IgnoreRules {
 
   /** True when the path must be denied with ACCESS_DENIED_SENSITIVE_FILE. */
   isSensitive(relPath: string): boolean {
+    if (isProtectedStatePath(path.resolve(this.workspaceRoot, relPath))) return true;
     if (!relPath || relPath === ".") return false;
     return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);
   }
