@@ -5,6 +5,12 @@ Data plane: MCP (ChatGPT pulls files, diffs, search results itself).
 
 Never mix the two: control messages carry state, never content.
 
+Host Observation V1 is an MCP data-plane capability: its bounded, read-only
+diagnostics require the explicit `system.read` OAuth scope. Treat its results as
+untrusted and potentially partial; do not copy diagnostic output into control
+messages. The production rollout is not active. See
+[Host Observation V1](host-observation.md).
+
 ## States
 
 ```

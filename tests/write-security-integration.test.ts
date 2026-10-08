@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
+import { HostObservation } from "../src/host-observation/service.js";
 import { readPermission, setPermission } from "../src/permission/index.js";
 import { makeTmpDir, pkceVerifierAndChallenge, write } from "./helpers.js";
 
@@ -116,7 +117,7 @@ afterAll(async () => {
 describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
   it("A: omitted scope grants only legacy defaults and denies create at local level2", async () => {
     expect([...DEFAULT_SCOPES]).toEqual(legacyScopes);
-    expect([...SUPPORTED_SCOPES]).toEqual([...legacyScopes, ...fileScopes.slice(1)]);
+    expect([...SUPPORTED_SCOPES]).toEqual([...legacyScopes, "system.read", ...fileScopes.slice(1)]);
     const { client, token } = await session();
     expect(token.scope.split(" ")).toEqual(legacyScopes);
     setPermission(bridge.workspace.id, "level2");
@@ -130,6 +131,28 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
     const relative = fresh();
     await call(client, "create_file", { path: relative, content: "denied" }, "LOCAL_PERMISSION_DENIED");
     expect(fs.existsSync(path.join(root, relative))).toBe(false);
+  });
+
+  it("legacy OAuth cannot observe the Host even at level2", async () => {
+    const { client } = await session();
+    setPermission(bridge.workspace.id, "level2");
+    for (const [name, args] of [
+      ["host_context", {}], ["process_query", { pid: 1 }], ["process_tree", { pid: 1 }],
+      ["network_listeners", {}], ["network_status", {}], ["dns_resolve", { hostname: "example.com" }],
+      ["path_inspect", { path: "." }],
+    ] as [string, Record<string, unknown>][]) await call(client, name, args, "INSUFFICIENT_SCOPE");
+  });
+
+  it("explicit system.read works at readonly and cannot grant file writes", async () => {
+    const mock = vi.spyOn(HostObservation.prototype, "context").mockResolvedValue({ capturedAt: "fixture" } as never);
+    try {
+      const { client, token } = await session(["system.read"]);
+      expect(token.scope).toBe("system.read");
+      expect(readPermission(bridge.workspace.id)).toBe("readonly");
+      expect((await call(client, "host_context", {})).capturedAt).toBe("fixture");
+      await call(client, "create_file", { path: fresh(), content: "denied" }, "INSUFFICIENT_SCOPE");
+      expect(mock).toHaveBeenCalledOnce();
+    } finally { mock.mockRestore(); }
   });
 
   it("C: explicit workspace.write + level1 creates but cannot delete without workspace.delete", async () => {

@@ -76,6 +76,7 @@ function pairingPage(opts: {
     "workspace.search": "Search this workspace",
     "git.read": "Read git status and diffs",
     "execution.read": "Read Codex execution summaries",
+    "system.read": "Read limited host system diagnostics",
     offline_access: "Stay connected between sessions",
     "workspace.write": "Create and modify files in this workspace",
     "workspace.delete": "Delete files in this workspace",

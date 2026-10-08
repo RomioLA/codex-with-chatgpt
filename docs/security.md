@@ -40,8 +40,60 @@ are `workspace.write`, `workspace.delete`, `filesystem.external.read`, and
 `filesystem.external.write`. Tools enforce scopes individually
 (`INSUFFICIENT_SCOPE`); explicitly requested scopes never gain unrequested
 capabilities. A mutation also needs the local permission mode to allow it.
+`system.read` is an additional, explicitly requested read-only scope for Host
+Observation; it is not in the default grant or the mutation set. Refresh rotation
+preserves the refresh token's stored scopes and never adds this scope. Scope
+filtering continues to drop unknown names; a request with no supported scopes
+is rejected.
 Access tokens live for 1 hour. Refresh tokens live for 30 days and rotate on
 use. All tokens are bound to `workspace_id` and `client_id`.
+
+## Host Observation
+
+The seven Host Observation tools fail closed unless the current MCP call has
+`system.read`, including local transports. This OAuth gate is independent of the
+local file permission mode: `system.read` does not grant file mutation, change
+the Windows account's OS permissions, or bypass the existing sensitive-path
+policy. Each tool is annotated read-only. Results are untrusted diagnostic data.
+
+Windows queries use a fixed, source-controlled PowerShell 7 script through
+`execFile` without a shell. Only a fixed executable candidate is selected: the
+Program Files PowerShell 7 path or the existing Codex bundled runtime path.
+Caller values are serialized as JSON on stdin; they are not inserted into the
+script or executable arguments. The implementation does not search PATH or the
+current directory and does not download/install PowerShell. Generic failures
+return a sanitized error rather than raw stderr or exception text.
+
+Process results are non-atomic CIM snapshots. Missing or access-denied fields
+are not proof that a process is absent; listener-to-process association comes
+from a separate snapshot and is marked unverified. Command-line credentials are
+redacted before output and before `commandContains` filtering, so that filter
+cannot be used as an oracle for hidden secret values.
+
+Network status reports adapters, configured DNS servers, and default-route
+presence as readiness evidence only. It sets `internetReachable` to null with
+`NOT_SUPPORTED` status; it does not establish Internet access or probe public
+HTTP. Adapter, address, and DNS lists are bounded and expose truncation.
+`dns_resolve` performs only a system-configured DNS lookup for a validated ASCII
+hostname; it does not make HTTP or TCP requests.
+
+`path_inspect` returns path metadata only and never reads file contents. It
+accepts local-drive absolute and workspace-relative paths; UNC/device paths and
+alternate data streams are rejected. The existing sensitive-path policy still
+applies to both aliases and canonical targets. In particular, `.git` is
+explicitly sensitive, so this tool cannot inspect its owner. The reparse tag
+field is null with `NOT_SUPPORTED` status. Supported metadata is read from one
+native Windows handle and bound to its file/volume identity before returning;
+an identity mismatch suppresses the metadata. Owner/ACL errors remain explicit
+in fieldStatus rather than being presented as missing paths. See
+[Host Observation V1](host-observation.md) for the exact handle and status contract.
+
+The source implementation is registered in this checkout, but production
+activation is not part of this change. No production restart or OAuth
+reauthorization is needed now. Enabling it later requires separate user
+authorization for deployment and connector reauthorization; existing refresh
+tokens will not gain `system.read`. See [Host Observation V1](host-observation.md)
+for the full schema and status contract.
 
 ## Local file permissions
 

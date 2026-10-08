@@ -117,6 +117,25 @@ changing the local mode does not add mutation scopes to an existing token.
 limited to one regular workspace file per call. External deletion and
 cross-boundary moves are not available.
 
+### Host Observation returns INSUFFICIENT_SCOPE or NOT_SUPPORTED
+
+Every Host Observation tool call requires the explicit `system.read` OAuth
+scope. The default grant excludes it, and refreshing an older token never adds
+it. This source feature is not active in production; no restart or reauthorization
+is needed now. A later activation requires separate authorization to deploy and
+reauthorize the connector.
+
+For a tool-level `NOT_SUPPORTED` error, check that the host is Windows and one
+fixed PowerShell 7 executable candidate exists. The bundled Codex runtime is
+accepted; a Program Files installation is not required. `path_inspect` also
+returns tool-level `NOT_SUPPORTED` for targets other than regular files and
+directories. A field-level `NOT_SUPPORTED` may be an intentional limit such as
+Internet reachability or a reparse tag. `ACCESS_DENIED` and `UNAVAILABLE`
+describe incomplete OS evidence, not proof that a process or path does not
+exist. Path inspection never returns file contents, and the sensitive-path rule
+rejects `.git` including owner inspection. See
+[Host Observation V1](host-observation.md).
+
 ### I have a Cloudflare domain and want a stable hostname
 During first-time setup (or the next coding session, once), say you have a
 Cloudflare account and give the domain. Codex opens a browser for Cloudflare

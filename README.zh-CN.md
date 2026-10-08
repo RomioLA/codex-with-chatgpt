@@ -140,6 +140,13 @@ c2c permission 2 -w <workspace>
 [权限需求与实现状态](docs/local-permission-model-requirements.zh-CN.md)和
 [Host Filesystem 路径边界](docs/host-filesystem-boundary.zh-CN.md)。
 
+### Host Observation（V1）
+
+Host Observation 通过 MCP 提供有界、只读的主机诊断。每次调用都要求可选 OAuth
+scope `system.read`；它与本机文件权限模式相互独立，也不属于默认授权。生产启用需要
+另行授权部署并重新授权 connector；当前无需重启或重新授权。详见
+[Host Observation V1](docs/host-observation.md)。
+
 ### 生成媒体交接
 
 `read_image` 仍是只读查看工具，用于查看工作区中的受支持图片。通过可见的 ChatGPT

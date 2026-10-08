@@ -6,11 +6,12 @@ import { cleanup, makeTmpDir, write } from "./helpers.js";
 
 const V1_SCOPES = ["workspace.read", "workspace.search", "git.read", "execution.read", "offline_access"];
 const NEW_SCOPES = ["workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write"];
+const HOST_OBSERVATION_SCOPE = "system.read";
 
 describe("OAuth scope filtering", () => {
   it("keeps the V1 default separate from advertised capabilities", () => {
     expect([...DEFAULT_SCOPES]).toEqual(V1_SCOPES);
-    expect([...SUPPORTED_SCOPES]).toEqual([...V1_SCOPES, ...NEW_SCOPES]);
+    expect([...SUPPORTED_SCOPES]).toEqual([...V1_SCOPES, HOST_OBSERVATION_SCOPE, ...NEW_SCOPES]);
   });
 
   it.each([undefined, "", " ", "\t\n"])("defaults %j to only the V1 read-only grant", (requested) => {
@@ -22,6 +23,11 @@ describe("OAuth scope filtering", () => {
     expect(filterScopes(`${V1_SCOPES.join(" ")} ${scope}`)).toEqual([...V1_SCOPES, scope]);
   });
 
+  it("grants host diagnostics only when system.read is explicitly requested", () => {
+    expect(filterScopes(HOST_OBSERVATION_SCOPE)).toEqual([HOST_OBSERVATION_SCOPE]);
+    expect(filterScopes()).toEqual(V1_SCOPES);
+  });
+
   it.each(["unknown", "+", "+++", "workspace.WRITE", "workspace.write,workspace.delete", null, 0, false, {}, ["workspace.write"]])(
     "does not grant anything for unsupported or malformed input %j",
     (requested) => {
@@ -30,8 +36,9 @@ describe("OAuth scope filtering", () => {
   );
 
   it("keeps only requested known scopes and deduplicates space/plus separators", () => {
-    expect(filterScopes(" unknown + workspace.read\tworkspace.write++workspace.write \nunknown ")).toEqual([
+    expect(filterScopes(` unknown + workspace.read\t${HOST_OBSERVATION_SCOPE}++workspace.write++workspace.write \nunknown `)).toEqual([
       "workspace.read",
+      HOST_OBSERVATION_SCOPE,
       "workspace.write",
     ]);
   });

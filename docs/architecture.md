@@ -43,6 +43,7 @@
 | --- | --- |
 | `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
 | `mcp/` | Read tools plus local-permission-gated file tools; stateless Streamable HTTP transport (fresh server per request, JSON responses) |
+| `host-observation/` | Bounded read-only host/process/network/path observations; each MCP call requires the separate `system.read` scope |
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment (realpath of deepest existing ancestor), sensitive-file policy, `.c2cignore`, paginated read/list, bounded image reads, ripgrep search with Node fallback, git status/diff with pagination, host path boundary |
@@ -72,6 +73,11 @@ external file creation or modification. Deletion is limited to one regular
 workspace file with its current hash. The current MCP set does not create
 external directories or move files across the workspace boundary; external
 deletion is always denied.
+
+**Host Observation**: its seven read-only tools require `system.read` on every
+call, independently of the local file permission mode. They report bounded
+snapshots and metadata; they do not expose file contents or a shell. See
+[Host Observation V1](host-observation.md) for schemas and evidence limits.
 
 **Authorization**: 401 with `WWW-Authenticate: resource_metadata=…` →
 `/.well-known/oauth-protected-resource/mcp` → AS metadata → DCR →

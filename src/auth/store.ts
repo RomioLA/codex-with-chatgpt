@@ -14,6 +14,7 @@ export const DEFAULT_SCOPES = [
 
 export const SUPPORTED_SCOPES = [
   ...DEFAULT_SCOPES,
+  "system.read",
   "workspace.write",
   "workspace.delete",
   "filesystem.external.read",

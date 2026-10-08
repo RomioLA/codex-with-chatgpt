@@ -224,6 +224,15 @@ original with `c2c asset import -w <workspace> --from <download> --to <new-path>
 Imports are workspace-contained, signature-checked, size-limited, reject active
 SVG content, and never overwrite an existing file.
 
+### Host Observation (V1)
+
+Host Observation exposes bounded, read-only host diagnostics through MCP. Every
+call requires the optional OAuth scope `system.read`, which is separate from the
+local file permission mode and is not part of the default grant. Production
+activation requires separate authorization to deploy and reauthorize the
+connector; no restart or reauthorization is needed now. See
+[Host Observation V1](docs/host-observation.md).
+
 ## Security model (short version)
 
 - **Local file permission gate**: file mutation tools require both an OAuth

@@ -136,6 +136,7 @@ describe("explicit OAuth capabilities", () => {
     { scope: "workspace.delete", label: "Delete files in this workspace", mutation: true },
     { scope: "filesystem.external.read", label: "Read permitted files outside this workspace", mutation: false },
     { scope: "filesystem.external.write", label: "Create and modify permitted files outside this workspace", mutation: true },
+    { scope: "system.read", label: "Read limited host system diagnostics", mutation: false },
   ];
 
   it.each([
@@ -406,6 +407,7 @@ describe("refresh token rotation", () => {
     ["workspace.delete", "offline_access"],
     ["filesystem.external.read", "offline_access"],
     ["filesystem.external.write", "offline_access"],
+    ["system.read", "offline_access"],
   ])("cannot gain capabilities through refresh: %j", async (...scopes) => {
     const clientId = await registerClient();
     const { verifier, challenge } = pkceVerifierAndChallenge();
