@@ -7,14 +7,14 @@
 ## 解决什么问题
 
 ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的 API 额度做
-规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，Codex 只负责
-执行。不用 API Key、不搞逆向代理——官方网页 + 只读 MCP 桥接。
+规划和 Review。本项目让网页版 ChatGPT 负责规划、审查和经本机授权的文件修改，
+Codex 继续负责命令、构建和测试。不用 API Key，也不搞逆向代理。
 
 ## 这是什么
 
-把 ChatGPT 网页版变成 Codex 编码会话的"规划与审查大脑"，而执行权完全保留在
-Codex 手里。你的仓库永远不会被上传——ChatGPT 通过一条安全的、OAuth 保护的
-**只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
+把 ChatGPT 网页版接入 Codex 编码会话。仓库不会被整体上传；ChatGPT 通过
+OAuth 保护的 MCP 连接按需读取内容。文件修改由 OAuth scope 和本机权限模式共同
+控制；C2C 不提供 shell 或命令执行工具。
 
 ## 一段话安装（纯小白专用）
 
@@ -98,11 +98,12 @@ Ready.
                         ▼          │
              ┌─────────────────────┐
              │      C2C Bridge     │   仅监听本机回环地址
-             │  只读 MCP           │   OAuth 2.1 + 一次性配对码
+             │  权限门控 MCP 文件工具 │ OAuth 2.1 + 一次性配对码
+             │  本机权限模式         │
              │  OAuth + 配对       │   Cloudflare Quick Tunnel
              │  Tunnel 管理        │
              └──────────┬──────────┘
-                        │  只读
+                        │ 按本机权限读取 / 修改文件
                         ▼
              ┌─────────────────────┐          ┌─────────────────────┐
              │     本地工作区      │◀─────────│    Codex Harness    │
@@ -113,24 +114,43 @@ Ready.
 - **控制面（Computer Use）**：Codex 与 ChatGPT 之间只交换极小的结构化 `[C2C]`
   状态消息——`INIT → PLAN → EXECUTED → REVIEW → DONE`。绝不粘贴 diff、日志
   或文件内容。
-- **数据面（MCP）**：ChatGPT 缺什么自己拉什么，共 10 个只读工具：
-  `workspace_info`、`list_directory`、`read_file`、`search_workspace`、
-  `git_status`、`git_diff`、`test_status`、`execution_summary`、
-  `execution_output`、`read_image`。
+- **数据面（MCP）**：ChatGPT 按需读取工作区信息、文件、图片、搜索结果、Git
+  状态和执行记录。创建、编辑、替换、移动和删除文件使用独立工具，同时受 OAuth
+  scope 和本机权限模式门控。C2C 不提供 shell 或命令执行工具。
 - **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
   和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
 
+### 本机文件权限
+
+默认模式是 `readonly`。权限按 workspace 保存在本机；只有本机命令可以切换。ChatGPT
+可通过只读的 `permission_status` 工具查看权限，不能远程提权：
+
+```text
+c2c permission status -w <workspace>
+c2c permission readonly -w <workspace>
+c2c permission 1 -w <workspace>
+c2c permission 2 -w <workspace>
+```
+
+权限 1 允许修改 workspace 文件，并读取符合敏感文件规则的外部文件。权限 2 还允许创建、
+修改外部文件，以及凭当前内容 hash 一次删除一个 workspace 普通文件。外部删除在所有模式
+下都禁止；文件移动只能发生在 workspace 内；目录创建目前也仅限 workspace。OAuth scope
+是独立门槛。Windows 默认状态目录为 `%LOCALAPPDATA%\OpenAI\c2c-local`；非空的
+`C2C_STATE_DIR` 会明确覆盖默认路径。详见
+[权限需求与实现状态](docs/local-permission-model-requirements.zh-CN.md)和
+[Host Filesystem 路径边界](docs/host-filesystem-boundary.zh-CN.md)。
+
 ### 生成媒体交接
 
-连接器仍然只读：`read_image` 可以查看工作区中的受支持图片，但不能写文件。
-通过可见的 ChatGPT 页面下载图片或视频原件后，本地执行端可以运行
+`read_image` 仍是只读查看工具，用于查看工作区中的受支持图片。通过可见的 ChatGPT
+页面下载图片或视频原件后，本地执行端可以运行
 `c2c asset import -w <workspace> --from <download> --to <new-path>` 安全导入。
 导入过程限制在工作区内，会验证签名和大小、拒绝活动 SVG，并且绝不覆盖现有文件。
 
 ## 安全模型（简版）
 
-- **从构造上只读**：服务端根本不存在写文件/删除/Shell/提交类工具，任何提示
-  注入都无法启用它们。
+- **本机权限门控文件修改**：文件修改工具同时要求 OAuth scope 和用户本机权限模式。
+  MCP 服务端没有 shell、命令执行或 Git 提交工具，也没有远程提权工具。
 - **一个工作区 = 一道边界**：每个令牌绑定单一工作区；路径校验基于规范化
   realpath（symlink、`../`、绝对路径逃逸全部被拦截并有测试覆盖）。
 - **敏感文件永不外泄**：`.env*`、密钥、SSH、各类凭据默认拒绝
@@ -147,7 +167,8 @@ Ready.
 ```bash
 pnpm install
 pnpm build          # 产出 dist/，暴露 c2c 命令
-pnpm test           # vitest：150 个测试（路径安全、OAuth、配对、MCP 端到端）
+pnpm test           # 先编译 TypeScript，再运行 Vitest
+pnpm test:watch     # 启动时编译一次，然后进入 Vitest watch 模式
 
 c2c setup           # 一条命令：Bridge + 隧道 + 配对码
 c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS / Windows）
@@ -158,15 +179,21 @@ c2c status / doctor / pair / unpair / logs / stop
 （自动检测，Skill 会替你安装）。如果 QUIC 被拦截，设置
 `C2C_TUNNEL_PROTOCOL=http2` 后重启 Bridge。
 
+`test:watch` 运行期间不会自动重建 `dist/`。如果源码修改影响了 autostart 预加载 helper，
+重新启动 watch 命令，或先运行 `pnpm build` 再重跑该测试。
+
 文档：[架构](docs/architecture.md) · [协议](docs/protocol.md) ·
-[安全](docs/security.md) · [故障排查](docs/troubleshooting.md)
+[安全](docs/security.md) · [故障排查](docs/troubleshooting.md) ·
+[本机权限](docs/local-permission-model-requirements.zh-CN.md)
 
 ## 目录结构
 
 ```
 src/
   bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个只读工具、无状态 Streamable HTTP
+  mcp/        读取和本机权限门控的文件工具、无状态 Streamable HTTP
+  permission/ 按 workspace 保存的本机权限和操作策略
+  write/      受边界检查保护的文件修改原语
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
   pairing/    一次性配对码（CSPRNG、TTL、限速）
   workspace/  路径收敛、敏感文件策略、搜索、git

@@ -14,7 +14,7 @@ export function getStateDir(): string {
     case "darwin":
       return path.join(home, "Library", "Application Support", "codex-with-chatgpt");
     case "win32":
-      return path.join(process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"), "codex-with-chatgpt");
+      return path.join(process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"), "OpenAI", "c2c-local");
     default: {
       const base = process.env.XDG_STATE_HOME ?? path.join(home, ".local", "state");
       return path.join(base, "codex-with-chatgpt");

@@ -10,25 +10,26 @@
 ## The problem · 解决什么问题
 
 **中文** — ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
-API 额度做规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，
-Codex 只负责执行。不用 API Key、不搞逆向代理——官方网页 + 只读 MCP 桥接。
+API 额度做规划和 Review。本项目让网页版 ChatGPT 负责规划、审查和经本机授权的
+文件修改，Codex 继续负责命令、构建和测试。不用 API Key、不搞逆向代理。
 
 **EN** — ChatGPT Plus/Pro web quota sits idle while your coding agent burns
-scarce API/Codex tokens on planning and review. This project moves the
-thinking to the subscription you already pay for; Codex only executes.
-No API keys, no reverse proxy — official web UI plus a read-only MCP bridge.
+scarce API/Codex tokens on planning and review. This project uses that web
+subscription for planning, review, and locally authorized file changes; Codex
+retains command, build, and test execution.
+No API keys, no reverse proxy — official web UI plus an OAuth-protected MCP
+bridge with local permission controls.
 
 ## What it is · 这是什么
 
-**中文** — 把 ChatGPT 网页版变成 Codex 编码会话的"规划与审查大脑"，执行权
-完全保留在 Codex 手里。你的仓库永远不会被上传：ChatGPT 通过一条安全的、
-OAuth 保护的**只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
+**中文** — 把 ChatGPT 网页版接入 Codex 编码会话。仓库不会被整体上传；
+ChatGPT 通过 OAuth 保护的 MCP 连接按需读取内容。文件修改由 OAuth scope 和
+本机权限模式共同控制；C2C 不提供 shell 或命令执行工具。
 
-**EN** — Use the ChatGPT web app as the planning and review brain for your
-Codex coding sessions, while Codex keeps full ownership of execution. Your
-repository is never uploaded: ChatGPT reads exactly the lines it needs through
-a secure, OAuth-protected, **read-only** MCP connection to your current
-workspace.
+**EN** — Connect the ChatGPT web app to Codex coding sessions. The repository
+is not uploaded as a bundle: ChatGPT requests the content it needs through an
+OAuth-protected MCP connection. OAuth scopes and a local permission mode govern
+file changes; C2C provides no shell or command-execution tool.
 
 Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
 
@@ -166,11 +167,12 @@ Credentials stay in the OS app state directory, not in the project.
                         ▼          │
              ┌─────────────────────┐
              │      C2C Bridge     │   loopback-only HTTP server
-             │  read-only MCP      │   OAuth 2.1 + one-time pairing code
+             │  permission-gated   │   OAuth 2.1 + one-time pairing code
+             │  MCP file tools     │   Local permission mode
              │  OAuth + Pairing    │   Cloudflare Quick Tunnel
              │  Tunnel Manager     │
              └──────────┬──────────┘
-                        │  read-only
+                        │ read / write according to local permission
                         ▼
              ┌─────────────────────┐          ┌─────────────────────┐
              │   Local Workspace   │◀─────────│    Codex Harness    │
@@ -181,27 +183,52 @@ Credentials stay in the OS app state directory, not in the project.
 - **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
   `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
   no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 10 read-only
-  tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
-  `git_status`, `git_diff`, `test_status`, `execution_summary`,
-  `execution_output`, `read_image`.
+- **Data plane (MCP)**: ChatGPT reads workspace information, files, images,
+  search results, Git state, and execution records. File creation, editing,
+  replacement, movement, and deletion use separate tools gated by OAuth scopes
+  and the local permission mode. C2C has no shell or command-execution tool.
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
 
+### Local file permissions
+
+The local default is `readonly`. The machine-side command changes the mode for
+one workspace; ChatGPT can read it through `permission_status` but cannot change
+it remotely:
+
+```text
+c2c permission status -w <workspace>
+c2c permission readonly -w <workspace>
+c2c permission 1 -w <workspace>
+c2c permission 2 -w <workspace>
+```
+
+Mode `1` allows workspace file changes and reads of permitted external files.
+Mode `2` also allows external file creation or modification and deletion of one
+workspace file at a time with its current content hash. External deletion is
+always denied. Moves stay within the workspace; directory creation is currently
+workspace-only. OAuth scopes remain an independent gate. See the
+[permission requirements and implementation status](docs/local-permission-model-requirements.zh-CN.md)
+and [host filesystem boundary](docs/host-filesystem-boundary.zh-CN.md).
+
+On Windows, the default state directory is
+`%LOCALAPPDATA%\OpenAI\c2c-local`; `C2C_STATE_DIR` explicitly overrides it.
+
 ### Generated media handoff
 
-The connector remains read-only: `read_image` can inspect supported workspace
-images but cannot write files. After a requested image or video is downloaded
-through the visible ChatGPT UI, the local executor can validate and import the
+`read_image` remains an inspection tool for supported workspace images. After
+a requested image or video is downloaded through the visible ChatGPT UI, the
+local executor can validate and import the
 original with `c2c asset import -w <workspace> --from <download> --to <new-path>`.
 Imports are workspace-contained, signature-checked, size-limited, reject active
 SVG content, and never overwrite an existing file.
 
 ## Security model (short version)
 
-- **Read-only by construction**: write/delete/shell/commit tools simply do not
-  exist on the server. No prompt injection can enable them.
+- **Local file permission gate**: file mutation tools require both an OAuth
+  scope and the user's local mode. The MCP server has no shell, command, or Git
+  commit tool, and it exposes no remote permission-elevation tool.
 - **One workspace = one boundary**: every token is bound to a single workspace;
   path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
   are all blocked and tested).
@@ -221,7 +248,8 @@ Full threat model: [docs/security.md](docs/security.md)
 ```bash
 pnpm install
 pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: 150 tests (path security, OAuth, pairing, MCP e2e)
+pnpm test           # compiles TypeScript, then runs Vitest
+pnpm test:watch     # compiles once, then starts Vitest watch mode
 
 c2c setup           # bridge + tunnel + pairing code, all in one
 c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
@@ -232,15 +260,22 @@ Requirements: Node.js >= 20, git. `cloudflared` for the public connection
 (auto-detected; the Skill installs it for you). If QUIC is blocked, set
 `C2C_TUNNEL_PROTOCOL=http2` and restart the bridge.
 
+`test:watch` does not rebuild `dist/` after its initial compile. If a source edit
+changes the preloaded autostart helper while watch mode is running, restart the
+watch command or run `pnpm build` before rerunning that test.
+
 Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
-[security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
+[security](docs/security.md) · [troubleshooting](docs/troubleshooting.md) ·
+[local permissions](docs/local-permission-model-requirements.zh-CN.md)
 
 ## Project layout
 
 ```
 src/
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 read-only tools, stateless Streamable HTTP
+  mcp/        read and permission-gated file tools, stateless Streamable HTTP
+  permission/ persisted local mode and operation policy
+  write/      guarded file mutation primitives
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
   workspace/  path containment, sensitive-file policy, search, git

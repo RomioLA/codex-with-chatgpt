@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { AutostartService, taskNameForWorkspace, type AutostartRegistration, type AutostartTaskAdapter } from "../src/autostart/registration.js";
+import { AutostartService, taskNameForWorkspace, type AutostartInstallContext, type AutostartInstallResult, type AutostartRegistration, type AutostartTaskAdapter } from "../src/autostart/registration.js";
 import {
   buildHiddenPowerShellAction,
   buildLogonTaskXml,
@@ -17,8 +17,9 @@ class FakeTaskScheduler implements AutostartTaskAdapter {
   readonly installed = new Set<string>();
   readonly installCalls: string[] = [];
   readonly removeCalls: string[] = [];
+  removeError: Error | null = null;
 
-  install(registration: AutostartRegistration): { backend: "task_scheduler" } {
+  install(registration: AutostartRegistration, _context?: AutostartInstallContext): { backend: "task_scheduler" } {
     this.installCalls.push(registration.taskName);
     this.installed.add(registration.taskName);
     return { backend: "task_scheduler" };
@@ -26,6 +27,7 @@ class FakeTaskScheduler implements AutostartTaskAdapter {
 
   remove(registration: AutostartRegistration): void {
     this.removeCalls.push(registration.taskName);
+    if (this.removeError) throw this.removeError;
     this.installed.delete(registration.taskName);
   }
 
@@ -37,14 +39,30 @@ class FakeTaskScheduler implements AutostartTaskAdapter {
 class FakeRunKey {
   readonly installed = new Set<string>();
   readonly removed: string[] = [];
+  readonly events: string[] = [];
 
-  install(registration: AutostartRegistration): { backend: "registry_run"; previousRunValueCaptured: true; previousRunValue: null } {
+  removeError: Error | null = null;
+
+  install(registration: AutostartRegistration, _overrides?: unknown, beforeMutation?: (metadata: AutostartInstallResult) => void): AutostartInstallResult {
+    const metadata: AutostartInstallResult = {
+      backend: "registry_run",
+      previousRunValueCaptured: registration.previousRunValueCaptured ?? true,
+      previousRunValue: registration.previousRunValue ?? null,
+      previousRunValueKind: registration.previousRunValueKind ?? null,
+    };
+    if (!beforeMutation) throw new Error("Run fallback requires a durable transition journal.");
+    beforeMutation(metadata);
+    this.events.push("run_install");
     this.installed.add(registration.taskName);
-    return { backend: "registry_run", previousRunValueCaptured: true, previousRunValue: null };
+    return {
+      ...metadata,
+      rollback: () => { this.installed.delete(registration.taskName); },
+    };
   }
 
   remove(registration: AutostartRegistration): void {
     this.removed.push(registration.taskName);
+    if (this.removeError) throw this.removeError;
     this.installed.delete(registration.taskName);
   }
 
@@ -57,6 +75,7 @@ describe("Windows workspace autostart registration", () => {
   const dirs: string[] = [];
 
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const dir of dirs) cleanup(dir);
     dirs.length = 0;
     delete process.env.C2C_STATE_DIR;
@@ -80,6 +99,85 @@ describe("Windows workspace autostart registration", () => {
     expect(status.registrationState).toBe("enabled");
     expect(status.taskInstalled).toBe(true);
     expect(service.getRegistrationById(new Workspace(workspaceRoot).id)?.workspaceRoot).toBe(workspaceRoot);
+  });
+
+  it("rolls back an installed authority when the first registration file cannot be created", () => {
+    const { service, stateDir, tasks } = fixture();
+    const workspaceRoot = makeTmpDir("autostart-first-write-failure");
+    dirs.push(workspaceRoot);
+    const id = new Workspace(workspaceRoot).id;
+    const registrations = path.join(stateDir, "autostart", "workspaces");
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: unknown, ...args: unknown[]) => {
+      if (typeof file === "string" && file.startsWith(registrations)) throw new Error("registration create denied");
+      return (open as (...args: unknown[]) => number)(file, ...args);
+    }) as typeof fs.openSync);
+
+    expect(() => service.enable(workspaceRoot)).toThrow("registration create denied");
+    expect(tasks.installed.size).toBe(0);
+    expect(service.getRegistrationById(id)).toBeNull();
+    expect(fs.existsSync(path.join(registrations, `${id}.json`))).toBe(false);
+  });
+
+  it("never publishes a partial or interrupted registration temp file", () => {
+    const { service, stateDir, tasks } = fixture();
+    const workspaceRoot = makeTmpDir("autostart-partial-registration");
+    dirs.push(workspaceRoot);
+    const id = new Workspace(workspaceRoot).id;
+    const registrations = path.join(stateDir, "autostart", "workspaces");
+    const write = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((target: unknown, ...args: unknown[]) => {
+      if (typeof target === "number") {
+        (write as (...args: unknown[]) => void)(target, "{\"workspaceId\":", "utf8");
+        throw new Error("registration write interrupted");
+      }
+      return (write as (...args: unknown[]) => void)(target, ...args);
+    }) as typeof fs.writeFileSync);
+
+    expect(() => service.enable(workspaceRoot)).toThrow("registration write interrupted");
+    expect(tasks.installed.size).toBe(0);
+    expect(service.getRegistrationById(id)).toBeNull();
+    expect(fs.existsSync(path.join(registrations, `${id}.json`))).toBe(false);
+    expect(fs.readdirSync(registrations)).toEqual([]);
+  });
+
+  it("unlinks the known registration path when disable encounters malformed JSON", () => {
+    const { service, stateDir, tasks } = fixture();
+    const workspaceRoot = makeTmpDir("autostart-disable-corrupt-json");
+    dirs.push(workspaceRoot);
+    const id = new Workspace(workspaceRoot).id;
+    const file = path.join(stateDir, "autostart", "workspaces", `${id}.json`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "{broken json", "utf8");
+    const exists = fs.existsSync;
+    vi.spyOn(fs, "existsSync").mockImplementation(((target: unknown, ...args: unknown[]) => {
+      if (target === file) return false;
+      return (exists as (...args: unknown[]) => boolean)(target, ...args);
+    }) as typeof fs.existsSync);
+
+    const disabled = service.disable(workspaceRoot);
+
+    expect(disabled.registrationState).toBe("not_registered");
+    expect(tasks.removeCalls).toEqual([taskNameForWorkspace(id)]);
+    expect((exists as (target: string) => boolean)(file)).toBe(false);
+  });
+
+  it("reports failure to unlink the known registration path", () => {
+    const { service, stateDir } = fixture();
+    const workspaceRoot = makeTmpDir("autostart-disable-unlink-failure");
+    dirs.push(workspaceRoot);
+    const id = new Workspace(workspaceRoot).id;
+    const file = path.join(stateDir, "autostart", "workspaces", `${id}.json`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "{broken json", "utf8");
+    const unlink = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation(((target: unknown, ...args: unknown[]) => {
+      if (target === file) throw new Error("registration unlink denied");
+      return (unlink as (...args: unknown[]) => void)(target, ...args);
+    }) as typeof fs.unlinkSync);
+
+    expect(() => service.disable(workspaceRoot)).toThrow("registration unlink denied");
+    expect(fs.existsSync(file)).toBe(true);
   });
 
   it("supports multiple independent workspaces and removes only the selected task", () => {
@@ -183,6 +281,13 @@ describe("Windows workspace autostart registration", () => {
     taskScheduler.install = () => { throw new Error(message); };
     const runKey = new FakeRunKey();
     const adapter = new WindowsAutostartAdapter(taskScheduler, runKey);
+    const context: AutostartInstallContext = {
+      persistTransition: (transition) => {
+        expect(transition).toMatchObject({ pendingBackend: "registry_run", previousRunValueCaptured: true, previousRunValue: null });
+        expect(runKey.installed.has(registration.taskName)).toBe(false);
+        runKey.events.push("journal");
+      },
+    };
     const registration: AutostartRegistration = {
       workspaceId: "aabbccddeeff",
       workspaceRoot: "C:\\workspace",
@@ -190,13 +295,70 @@ describe("Windows workspace autostart registration", () => {
       updatedAt: new Date().toISOString(),
     };
 
-    const installed = adapter.install(registration);
+    const installed = adapter.install(registration, context);
 
     expect(installed.backend).toBe("registry_run");
+    expect(installed.pendingBackend).toBe("registry_run");
+    expect(runKey.events).toEqual(["journal", "run_install"]);
     expect(runKey.installed.has(registration.taskName)).toBe(true);
     expect(adapter.isInstalled({ ...registration, backend: "registry_run" })).toBe(true);
     adapter.remove({ ...registration, ...installed });
     expect(runKey.installed.size).toBe(0);
+  });
+
+  it("keeps successful Scheduled Task registration primary without installing a Run fallback", () => {
+    const scheduler = new FakeTaskScheduler();
+    const runKey = new FakeRunKey();
+    const adapter = new WindowsAutostartAdapter(scheduler, runKey);
+    const registration: AutostartRegistration = {
+      workspaceId: "aabbccddeeff", workspaceRoot: "C:\\workspace",
+      taskName: taskNameForWorkspace("aabbccddeeff"), updatedAt: new Date().toISOString(),
+    };
+    const installed = adapter.install(registration);
+    expect(installed.backend).toBe("task_scheduler");
+    expect(scheduler.installCalls).toEqual([registration.taskName]);
+    expect(runKey.installed.size).toBe(0);
+    expect(adapter.isInstalled({ ...registration, ...installed })).toBe(true);
+  });
+
+  it("defers removing the old task until fallback registration is committed", () => {
+    const scheduler = new FakeTaskScheduler();
+    scheduler.install = () => { throw new Error("Access is denied."); };
+    const runKey = new FakeRunKey();
+    const adapter = new WindowsAutostartAdapter(scheduler, runKey);
+    const journal: AutostartRegistration[] = [];
+    const registration: AutostartRegistration = {
+      workspaceId: "aabbccddeeff", workspaceRoot: "C:\\workspace",
+      taskName: taskNameForWorkspace("aabbccddeeff"), updatedAt: new Date().toISOString(),
+    };
+    scheduler.installed.add(registration.taskName);
+    const installed = adapter.install(registration, { persistTransition: (transition) => { journal.push(transition); } });
+    expect(journal).toHaveLength(1);
+    expect(scheduler.installed.has(registration.taskName)).toBe(true);
+    expect(scheduler.removeCalls).toEqual([]);
+    installed.commit?.();
+    expect(scheduler.installed.has(registration.taskName)).toBe(false);
+    expect(runKey.installed.has(registration.taskName)).toBe(true);
+  });
+
+  it("rolls back the Run fallback and fails closed when the old Scheduled Task cannot be removed", () => {
+    const scheduler = new FakeTaskScheduler();
+    scheduler.install = () => { throw new Error("Access is denied."); };
+    scheduler.removeError = new Error("task deletion denied");
+    const runKey = new FakeRunKey();
+    const adapter = new WindowsAutostartAdapter(scheduler, runKey);
+    const journal: AutostartRegistration[] = [];
+    const registration: AutostartRegistration = {
+      workspaceId: "aabbccddeeff", workspaceRoot: "C:\\workspace",
+      taskName: taskNameForWorkspace("aabbccddeeff"), updatedAt: new Date().toISOString(),
+    };
+    scheduler.installed.add(registration.taskName);
+    const installed = adapter.install(registration, { persistTransition: (transition) => { journal.push(transition); } });
+    expect(journal).toHaveLength(1);
+
+    expect(() => installed.commit?.()).toThrow(/task deletion denied/);
+    expect(scheduler.installed.has(registration.taskName)).toBe(true);
+    expect(runKey.installed.has(registration.taskName)).toBe(false);
   });
 
   it("does not use HKCU Run for unrelated Task Scheduler failures", () => {

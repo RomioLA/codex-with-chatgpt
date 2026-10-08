@@ -1,8 +1,8 @@
 ---
 name: codex-with-chatgpt
 description: >
-  Use ChatGPT (web) as the planning and review brain for Codex coding sessions,
-  while Codex keeps full execution ownership. Use when the user says
+  Use ChatGPT (web) for planning, review, and locally permissioned file changes
+  during Codex coding sessions; Codex keeps command and test execution. Use when the user says
   "使用 Codex with ChatGPT ..." / "Set up Codex with ChatGPT" / "用 ChatGPT 规划",
   when they ask to connect ChatGPT to the current workspace, disconnect it,
   or run a task through the ChatGPT planning loop.
@@ -12,11 +12,11 @@ description: >
 
 ChatGPT thinks. Codex works.
 
-You (Codex) own execution: editing, shell, git, tests, recovery.
-ChatGPT owns high-level reasoning: understanding, planning, review, debug strategy.
-The C2C Bridge gives ChatGPT read-only MCP access to the current workspace, so
-control messages between you and ChatGPT stay tiny (< 1 KB) — ChatGPT pulls
-whatever data it needs by itself.
+You (Codex) own shell, git, build, test, and recovery execution. ChatGPT owns
+high-level reasoning and may change files through C2C when OAuth scopes and the
+user's local permission mode allow it. The Bridge also gives ChatGPT read access
+to the current workspace, so control messages stay tiny (< 1 KB) and ChatGPT
+pulls the content it needs itself.
 
 **Golden rules**
 
@@ -97,6 +97,24 @@ whatever data it needs by itself.
    public address.
    A ChatGPT-side 401 after a sent message is different: repair then, do not
    treat it as permission to skip this gate next time.
+
+## C2C file permission rules
+
+- Before relying on an MCP file change, read `permission_status` for this
+  workspace. `readonly` allows reads only. `level1` allows workspace file
+  changes and permitted external reads. `level2` also allows external file
+  creation or modification and deletion of one regular workspace file with its
+  current content hash.
+- OAuth scopes are an independent gate. A local mode change does not add token
+  scopes. If a scope is missing, explain that the connector needs the required
+  authorization; do not treat a local mode change as a substitute.
+- ChatGPT cannot change the local permission mode. Never run the permission
+  elevation command on the user's behalf. If the user chooses to change it,
+  give the local command: `c2c permission readonly|1|2|status -w <workspace>`.
+- External deletion is unavailable at every level. Moves stay inside the
+  workspace, and directory creation is currently workspace-only. C2C provides
+  no shell or command-execution tool; Codex remains responsible for commands,
+  builds, and tests.
 
 ## In-app browser (ChatGPT)
 
@@ -183,6 +201,8 @@ that close the tab, hide the window, or stall on the settings page.
   (installer/update MUST replace this line in the installed Skill with the user's actual checkout path.)
 - Codex home: let `<codex-home>` be a non-empty `CODEX_HOME` when set; otherwise
   use `~/.codex` (`%USERPROFILE%\.codex` on Windows).
+- C2C state directory: Windows defaults to `%LOCALAPPDATA%\OpenAI\c2c-local`;
+  a non-empty `C2C_STATE_DIR` explicitly overrides the platform default.
 - CLI: let `<checkout>` mean the path on the previous line; run
   `node "<checkout>/bin/c2c.js" <command>` (or `c2c <command>` if globally linked).
   All commands support `--json` for parsing.
@@ -190,7 +210,7 @@ that close the tab, hide the window, or stall on the settings page.
   `corepack pnpm install && corepack pnpm build` inside it.
 - For commands that act on the user's project (`setup`, `doctor`, `session`,
   `restart`, `start`, `stop`, `status`, `pair`, `unpair`, `logs`, `workspace`,
-  `record`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
+  `record`, `permission`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
   (the project the user is working on, NOT the c2c repo).
 - Do not add `-w` to machine-wide commands: `update-check`, `sandbox-allow`,
   `prefs`, `tunnel login`. They still accept and ignore `-w`, so a leftover
@@ -204,7 +224,7 @@ commands (both are cheap / cached; never mention them unless an update exists):
 1. `c2c update-check --json` (do not pass `-w`)
 2. `c2c sandbox-allow --json` (do not pass `-w`) — writes the C2C state directory into Codex's
    sandbox `writable_roots` (macOS: `~/Library/Application Support/codex-with-chatgpt`;
-   Windows: `%LOCALAPPDATA%\codex-with-chatgpt`; config file is
+   Windows: `%LOCALAPPDATA%\OpenAI\c2c-local`; config file is
    `<codex-home>/config.toml`; see **Locations**).
    If already allowlisted, this is a no-op and does not trigger elevation.
 
@@ -642,9 +662,9 @@ If status is restricted, ignore it and review from git_diff.
 
 ## Workflow: ChatGPT-generated media
 
-The connector remains read-only. It can view supported PNG/JPEG/GIF/WebP/SVG
-files with `read_image`, but it cannot write into the repository or retrieve a
-browser download by itself.
+`read_image` is a read-only inspection tool for supported PNG/JPEG/GIF/WebP/SVG
+files. Other MCP file changes follow the local permission rules above. ChatGPT
+cannot retrieve a browser download through the connector by itself.
 
 When the user asks ChatGPT web to generate an image or video:
 

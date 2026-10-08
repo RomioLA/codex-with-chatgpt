@@ -839,3 +839,36 @@ ChatGPT 不能自己执行“把权限改成 2”。
 - 是否以后增加单独的“workspace 外删除”更高权限层。
 
 这些待设计项不能反向修改前面已经确认的权限矩阵，除非用户重新明确确认。
+
+---
+
+## 附录 A：当前实现状态
+
+本文件前文仍是产品需求基线；下表说明当前代码已经交付的范围，避免把目标需求误读成
+现有能力。OAuth scope 和本机权限模式分别检查：新授权默认仍只有读取 scopes，文件修改
+还要求本机已保存的模式允许该操作。MCP 的 `permission_status` 只能读取权限，不能提权；
+本机命令为：
+
+```text
+c2c permission readonly
+c2c permission 1
+c2c permission 2
+c2c permission status
+```
+
+当前权限状态按 workspace 持久化，包含 `level2`，当前没有重启后自动降级选项；状态缺失、
+格式错误、workspace 不匹配或版本不支持时，读取结果回退到 `readonly`。当前实际能力如下：
+
+| 能力 | 当前实现 |
+|---|---|
+| workspace 文件创建、编辑、替换 | 权限 1、2 可用；替换和编辑要求与本次读取一致的内容 hash |
+| workspace 文件移动 | 权限 1、2 可用；仅 workspace 内移动，目标必须不存在 |
+| workspace 目录创建 | 权限 1、2 可用；一次创建一个目录，父目录必须存在 |
+| workspace 删除 | 权限 2 仅可删除一个普通文件，并要求当前内容 hash；**目录删除和递归删除尚未实现** |
+| workspace 外读取 | 权限 1、2 可读取受敏感文件规则保护的文本文件 |
+| workspace 外写入 | 权限 2 可创建、编辑或替换文件；**workspace 外目录创建尚未实现** |
+| workspace 外移动或删除 | **没有跨边界移动工具；外部删除在所有权限级别都硬拒绝** |
+
+因此，前文 6.2 所述 workspace 目录和递归删除仍属于未完成要求，不是当前可调用能力。
+前文权限矩阵继续描述目标边界；实施现状以本附录和
+[Host Filesystem 路径边界](host-filesystem-boundary.zh-CN.md)为准。

@@ -15,7 +15,8 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
-import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { probeBridge, writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { acquireBridgeInstanceLock, type BridgeInstanceLock } from "./instance-lock.js";
 import { readPermission } from "../permission/index.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
@@ -57,9 +58,15 @@ export interface Bridge {
 }
 
 /**
- * Listen on the preferred port; on EADDRINUSE fall back to an ephemeral port.
+ * Use the preferred port when available. Refuse a same-workspace Bridge;
+ * retain ephemeral fallback only when the port belongs to another service.
  */
-function listen(app: express.Express, host: string, preferredPort: number): Promise<{ server: Server; port: number }> {
+function listen(
+  app: express.Express,
+  host: string,
+  preferredPort: number,
+  workspaceId: string
+): Promise<{ server: Server; port: number }> {
   return new Promise((resolve, reject) => {
     const tryListen = (port: number, allowFallback: boolean): void => {
       const server = app.listen(port, host);
@@ -70,7 +77,15 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
       });
       server.once("error", (error: NodeJS.ErrnoException) => {
         if (error.code === "EADDRINUSE" && allowFallback) {
-          tryListen(0, false);
+          void probeBridge(port, 1000)
+            .then((existing) => {
+              if (existing?.workspaceId === workspaceId) {
+                reject(new Error(`A Bridge for workspace ${workspaceId} is already listening on port ${port}.`));
+                return;
+              }
+              tryListen(0, false);
+            })
+            .catch(reject);
         } else {
           reject(error);
         }
@@ -92,7 +107,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
-
   let publicBaseUrl: string | null = null;
 
   const app = express();
@@ -210,6 +224,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       publicBaseUrl = null;
       persistRuntime();
       res.json({ stopped: true });
+    }).catch(() => {
+      logger.error("Tunnel stop could not be confirmed");
+      res.status(500).json({ error: "tunnel_stop_failed", message: "Tunnel stop could not be confirmed." });
     });
   });
 
@@ -227,7 +244,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }, 100);
   });
 
-  const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
+  // Initialize routes before acquiring the guard so a synchronous setup failure
+  // cannot strand a lock owned by this still-running process. Every Bridge,
+  // including persistRuntime:false instances, must hold it before listening.
+  const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id);
+  const listening = await listen(app, host, opts.port ?? DEFAULT_PORT, workspace.id).catch(async (error: unknown) => {
+    await instanceLock.release().catch(() => undefined);
+    throw error;
+  });
+  const { server, port } = listening;
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
@@ -246,7 +271,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     };
     writeRuntimeState(state);
   };
-  persistRuntime();
+  try {
+    persistRuntime();
+  } catch (error) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await instanceLock.release().catch(() => undefined);
+    throw error;
+  }
 
   let closed = false;
   const shutdown = async (): Promise<void> => {
@@ -255,6 +286,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
+    await instanceLock.release().catch(() => undefined);
     logger.info("Bridge stopped");
   };
 

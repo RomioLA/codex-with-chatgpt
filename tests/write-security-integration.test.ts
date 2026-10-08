@@ -258,22 +258,25 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
   it("persisted readonly-era refresh cannot gain new capabilities after loading upgraded Bridge", async () => {
     const legacy = await authorize(legacyScopes.join(" "));
     setPermission(bridge.workspace.id, "level2");
-    const upgraded = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
-    try {
-      const response = await fetch(`${upgraded.localBaseUrl()}/oauth/token`, {
-        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ grant_type: "refresh_token", client_id: legacy.clientId,
-          refresh_token: legacy.token.refresh_token!, scope: SUPPORTED_SCOPES.join(" ") }),
-      });
-      expect(response.status).toBe(200);
-      const refreshed = await response.json() as Token;
-      expect(refreshed.scope.split(" ")).toEqual(legacyScopes);
-      const client = await connect(refreshed.access_token, upgraded);
-      const relative = fresh();
-      await call(client, "create_file", { path: relative, content: "denied" }, "INSUFFICIENT_SCOPE");
-      expect(fs.existsSync(path.join(root, relative))).toBe(false);
-      await client.close();
-    } finally { await upgraded.close(); }
+    for (const client of clients) await client.close();
+    clients.length = 0;
+    sessions.clear();
+    await bridge.close();
+    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
+
+    const response = await fetch(`${bridge.localBaseUrl()}/oauth/token`, {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", client_id: legacy.clientId,
+        refresh_token: legacy.token.refresh_token!, scope: SUPPORTED_SCOPES.join(" ") }),
+    });
+    expect(response.status).toBe(200);
+    const refreshed = await response.json() as Token;
+    expect(refreshed.scope.split(" ")).toEqual(legacyScopes);
+    const client = await connect(refreshed.access_token, bridge);
+    const relative = fresh();
+    await call(client, "create_file", { path: relative, content: "denied" }, "INSUFFICIENT_SCOPE");
+    expect(fs.existsSync(path.join(root, relative))).toBe(false);
+    await client.close();
   });
 
   it("real OAuth stale replace/edit/delete preserves newer bytes for both locations", async () => {

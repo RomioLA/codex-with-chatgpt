@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { randomUUID } from "node:crypto";
+import { ensureDir, getStateDir, readJsonIfExists } from "../config/paths.js";
 import { Workspace } from "../workspace/manager.js";
 
 export interface AutostartRegistration {
@@ -9,6 +10,14 @@ export interface AutostartRegistration {
   taskName: string;
   updatedAt: string;
   backend?: "task_scheduler" | "registry_run";
+  /** Durable intent published before changing the Run authority. */
+  pendingBackend?: "registry_run";
+  /** Identifies the namespace from which the Run backup was captured. */
+  runAuthority?: "host_user";
+  /** Private caller-view cleanup intent, retained while a migration is pending. */
+  legacyRunValueCaptured?: boolean;
+  legacyRunValue?: string | null;
+  legacyRunValueKind?: "String" | "ExpandString" | null;
   previousRunValueCaptured?: boolean;
   previousRunValue?: string | null;
   previousRunValueKind?: "String" | "ExpandString" | null;
@@ -19,15 +28,29 @@ export interface AutostartRegistration {
 
 export interface AutostartInstallResult {
   backend: NonNullable<AutostartRegistration["backend"]>;
+  pendingBackend?: "registry_run";
+  runAuthority?: "host_user";
+  legacyRunValueCaptured?: boolean;
+  legacyRunValue?: string | null;
+  legacyRunValueKind?: "String" | "ExpandString" | null;
   previousRunValueCaptured?: boolean;
   previousRunValue?: string | null;
   previousRunValueKind?: "String" | "ExpandString" | null;
+  /** Restore the pre-install OS/filesystem state if registration persistence fails. */
+  rollback?: () => void;
+  /** Finish authority cleanup before publishing a stable pending backend. */
+  commit?: () => void;
+}
+
+export interface AutostartInstallContext {
+  persistTransition(registration: AutostartRegistration): void;
 }
 
 export interface AutostartTaskAdapter {
-  install(registration: AutostartRegistration): AutostartInstallResult;
+  install(registration: AutostartRegistration, context?: AutostartInstallContext): AutostartInstallResult;
   remove(registration: AutostartRegistration): void;
   isInstalled(registration: AutostartRegistration): boolean;
+  getAuthorityState?(registration: AutostartRegistration): { taskPresent: boolean; runPresent: boolean };
 }
 
 export interface AutostartStatus {
@@ -38,7 +61,7 @@ export interface AutostartStatus {
   taskInstalled: boolean;
   backend: AutostartRegistration["backend"] | null;
   backendInstalled: boolean;
-  registrationState: "not_registered" | "enabled" | "task_missing" | "workspace_missing";
+  registrationState: "not_registered" | "enabled" | "task_missing" | "workspace_missing" | "transition_pending" | "authority_conflict";
   lastRunAt?: string;
   lastRunStatus?: AutostartRegistration["lastRunStatus"];
   lastRunMessage?: string;
@@ -66,14 +89,39 @@ function registrationFile(stateDir: string, workspaceId: string): string {
 function readRegistration(stateDir: string, workspaceId: string): AutostartRegistration | null {
   if (!/^[a-f0-9]{12}$/i.test(workspaceId)) return null;
   const value = readJsonIfExists<AutostartRegistration>(registrationFile(stateDir, workspaceId));
-  if (!value || value.workspaceId !== workspaceId || typeof value.workspaceRoot !== "string" || typeof value.taskName !== "string") {
+  if (!value || value.workspaceId !== workspaceId || typeof value.workspaceRoot !== "string"
+    || value.taskName !== taskNameForWorkspace(workspaceId)
+    || (value.backend !== undefined && value.backend !== "task_scheduler" && value.backend !== "registry_run")
+    || (value.pendingBackend !== undefined && value.pendingBackend !== "registry_run")
+    || (value.runAuthority !== undefined && value.runAuthority !== "host_user")
+    || (value.legacyRunValueCaptured !== undefined && typeof value.legacyRunValueCaptured !== "boolean")
+    || (value.legacyRunValue !== undefined && value.legacyRunValue !== null && typeof value.legacyRunValue !== "string")
+    || (value.legacyRunValueKind !== undefined && value.legacyRunValueKind !== null && value.legacyRunValueKind !== "String" && value.legacyRunValueKind !== "ExpandString")) {
     return null;
   }
   return value;
 }
 
 function writeRegistration(stateDir: string, registration: AutostartRegistration): void {
-  writeSecureJson(registrationFile(stateDir, registration.workspaceId), registration);
+  const file = registrationFile(stateDir, registration.workspaceId);
+  const directory = path.dirname(file);
+  ensureDir(directory);
+  const temporaryFile = path.join(directory, `.${registration.workspaceId}.${randomUUID()}.tmp`);
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(temporaryFile, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify(registration, null, 2)}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(temporaryFile, file);
+  } catch (error) {
+    if (descriptor !== null) {
+      try { fs.closeSync(descriptor); } catch { /* retain the original persistence error */ }
+    }
+    try { fs.unlinkSync(temporaryFile); } catch { /* the temporary file may not have been created */ }
+    throw error;
+  }
 }
 
 function pathKey(value: string): string {
@@ -114,7 +162,15 @@ export class AutostartService {
   }
 
   getRegistrationForWorkspace(workspaceRoot: string): AutostartRegistration | null {
-    const key = pathKey(workspaceRootOrResolved(workspaceRoot));
+    const resolved = workspaceRootOrResolved(workspaceRoot);
+    const key = pathKey(resolved);
+    try {
+      const workspace = new Workspace(resolved);
+      const registration = readRegistration(this.stateDir, workspace.id);
+      return registration && pathKey(registration.workspaceRoot) === key ? registration : null;
+    } catch {
+      // A formerly registered workspace may have been moved or deleted.
+    }
     return this.allRegistrations().find((item) => pathKey(item.workspaceRoot) === key) ?? null;
   }
 
@@ -131,6 +187,13 @@ export class AutostartService {
       ...(previous?.lastRunStatus ? { lastRunStatus: previous.lastRunStatus } : {}),
       ...(previous?.lastRunMessage ? { lastRunMessage: previous.lastRunMessage } : {}),
       ...(previous?.backend ? { backend: previous.backend } : {}),
+      ...(previous?.pendingBackend ? { pendingBackend: previous.pendingBackend } : {}),
+      ...(previous?.runAuthority ? { runAuthority: previous.runAuthority } : {}),
+      ...(previous?.legacyRunValueCaptured ? {
+        legacyRunValueCaptured: true,
+        legacyRunValue: previous.legacyRunValue ?? null,
+        legacyRunValueKind: previous.legacyRunValueKind ?? null,
+      } : {}),
       ...(previous?.previousRunValueCaptured ? {
         previousRunValueCaptured: true,
         previousRunValue: previous.previousRunValue ?? null,
@@ -138,24 +201,74 @@ export class AutostartService {
       } : {}),
     };
 
-    writeRegistration(this.stateDir, registration);
     let installResult: AutostartInstallResult | null = null;
+    let registrationPublished = false;
+    let transitionPublished = !!previous?.pendingBackend;
     try {
-      installResult = this.tasks.install(registration);
-      writeRegistration(this.stateDir, {
-        ...registration,
-        ...installResult,
+      installResult = this.tasks.install(registration, {
+        persistTransition: (transition) => {
+          if (transition.workspaceId !== workspace.id || transition.workspaceRoot !== workspace.root
+            || transition.taskName !== registration.taskName || transition.pendingBackend !== "registry_run") {
+            throw new Error("Invalid autostart backend transition.");
+          }
+          writeRegistration(this.stateDir, transition);
+          transitionPublished = true;
+        },
       });
-    } catch (error) {
-      const file = registrationFile(this.stateDir, workspace.id);
-      if (installResult) {
-        try { this.tasks.remove({ ...registration, ...installResult }); } catch { /* rollback is best-effort */ }
+      const { rollback: _rollback, commit: _commit, pendingBackend, ...persistedResult } = installResult;
+      if (pendingBackend) {
+        if (!transitionPublished) throw new Error("Autostart backend transition was not persisted.");
+        if (!installResult.commit) throw new Error("Autostart backend transition has no authority cleanup.");
+        // A crash or final publication failure leaves the durable intent. The next
+        // enable/reconcile resumes cleanup instead of trusting the selected backend.
+        installResult.commit();
       }
-      if (previous) writeRegistration(this.stateDir, previous);
-      else if (fs.existsSync(file)) fs.unlinkSync(file);
+      const { pendingBackend: _pendingBackend, legacyRunValueCaptured: _oldLegacyCaptured,
+        legacyRunValue: _oldLegacyValue, legacyRunValueKind: _oldLegacyKind, ...stableRegistration } = registration;
+      const { legacyRunValueCaptured: _legacyCaptured, legacyRunValue: _legacyValue,
+        legacyRunValueKind: _legacyKind, ...stableResult } = persistedResult;
+      const stable = {
+        ...stableRegistration,
+        ...stableResult,
+      };
+      if (pendingBackend && !this.tasks.isInstalled(stable)) {
+        throw new Error("Autostart backend transition did not establish a unique healthy authority.");
+      }
+      writeRegistration(this.stateDir, stable);
+      registrationPublished = true;
+      if (!pendingBackend) installResult.commit?.();
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      if (installResult) {
+        try {
+          if (installResult.rollback) installResult.rollback();
+          else this.tasks.remove({ ...registration, ...installResult });
+        } catch (rollbackError) {
+          rollbackErrors.push(`autostart rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
+      // A pending journal stays pending after rollback: Task cleanup may already
+      // have completed, so restoring old stable JSON could claim a missing Task.
+      // Its intent allows the next enable to retry; it never reports healthy.
+      if (registrationPublished && !transitionPublished) {
+        const file = registrationFile(this.stateDir, workspace.id);
+        try {
+          if (previous) writeRegistration(this.stateDir, previous);
+          else if (fs.existsSync(file)) fs.unlinkSync(file);
+        } catch (rollbackError) {
+          rollbackErrors.push(`registration rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+        }
+      }
+      if (rollbackErrors.length) {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; ${rollbackErrors.join("; ")}`);
+      }
       throw error;
     }
     return this.status(workspace.root);
+  }
+
+  reconcile(workspacePath: string): AutostartStatus {
+    return this.enable(workspacePath);
   }
 
   disable(workspacePath: string): AutostartStatus {
@@ -165,10 +278,13 @@ export class AutostartService {
     const workspaceId = registration?.workspaceId ?? (() => {
       try { return new Workspace(resolvedRoot).id; } catch { return null; }
     })();
-    const taskName = registration?.taskName ?? (workspaceId ? taskNameForWorkspace(workspaceId) : null);
+    if (!workspaceId) {
+      throw new Error("Cannot determine the workspace identity for autostart cleanup.");
+    }
+    const taskName = taskNameForWorkspace(workspaceId);
 
     if (registration) this.tasks.remove(registration);
-    else if (taskName && workspaceId) {
+    else {
       this.tasks.remove({
         workspaceId,
         workspaceRoot: resolvedRoot,
@@ -176,9 +292,10 @@ export class AutostartService {
         updatedAt: new Date(0).toISOString(),
       });
     }
-    if (registration) {
-      const file = registrationFile(this.stateDir, registration.workspaceId);
-      if (fs.existsSync(file)) fs.unlinkSync(file);
+    const file = registrationFile(this.stateDir, workspaceId);
+    try { fs.unlinkSync(file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     return this.status(resolvedRoot);
   }
@@ -188,15 +305,22 @@ export class AutostartService {
     const workspace = workspaceRootOrResolved(workspacePath);
     const registration = this.getRegistrationForWorkspace(workspace);
     const workspaceExists = fs.existsSync(workspace) && fs.statSync(workspace).isDirectory();
-    const backendInstalled = registration ? this.tasks.isInstalled(registration) : false;
-    const taskInstalled = backendInstalled && (registration?.backend ?? "task_scheduler") === "task_scheduler";
+    const authorities = registration ? this.tasks.getAuthorityState?.(registration) : undefined;
+    const conflict = !!authorities?.taskPresent && !!authorities?.runPresent;
+    const backendInstalled = registration && !registration.pendingBackend && !conflict ? this.tasks.isInstalled(registration) : false;
+    const taskInstalled = authorities?.taskPresent
+      ?? (backendInstalled && (registration?.backend ?? "task_scheduler") === "task_scheduler");
     const registrationState: AutostartStatus["registrationState"] = !registration
       ? "not_registered"
-      : !workspaceExists
-        ? "workspace_missing"
-        : backendInstalled
-          ? "enabled"
-          : "task_missing";
+      : registration.pendingBackend
+        ? "transition_pending"
+        : conflict
+          ? "authority_conflict"
+          : !workspaceExists
+            ? "workspace_missing"
+            : backendInstalled
+              ? "enabled"
+              : "task_missing";
     return {
       enabled: registrationState === "enabled",
       workspace: registration?.workspaceRoot ?? workspace,

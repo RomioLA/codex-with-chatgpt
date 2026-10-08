@@ -48,7 +48,12 @@ class FakeTunnel implements TunnelProvider {
   }
 
   status(): TunnelStatus {
-    return { running: this.running, url: this.url, provider: this.name };
+    return {
+      running: this.running,
+      url: this.url,
+      provider: this.name,
+      ...(this.name === "cloudflare-named" ? { processRunning: this.running, connected: this.running } : {}),
+    };
   }
 
   getPublicUrl(): string | null {
@@ -237,7 +242,7 @@ describe("workspace runtime recovery", () => {
     }
   });
 
-  it("reports an unavailable configured named hostname as action needed", async () => {
+  it("reports a failed Named public self-probe as diagnostic without failing recovery", async () => {
     dirs.push(isolateStateDir());
     const { root, workspace } = makeWorkspace("restore-hostname-unavailable");
     setNamedPreference(workspace.id);
@@ -248,8 +253,12 @@ describe("workspace runtime recovery", () => {
     try {
       const unavailable: typeof fetch = async () => new Response("unavailable", { status: 503 });
       const result = await restoreWorkspace(root, { fetchImpl: unavailable });
-      expect(result.ok).toBe(false);
-      expect(result.reason).toBe("hostnameUnavailable");
+      expect(result.ok).toBe(true);
+      expect(result.reason).toBeNull();
+      expect(result.tunnelAction).toBe("started");
+      expect(result.diagnostics.publicProbe.publicProbeStatus).toBe("degraded");
+      expect(result.diagnostics.publicProbe.publicProbeError).toBe("http_error");
+      expect(result.diagnostics.recovery).toMatchObject({ status: "healthy", reason: null });
       expect(result.diagnostics.configuredHostname).toBe("c2c-demo.example.com");
       expect(provider.starts).toBe(1);
       expect(provider.name).toBe("cloudflare-named");

@@ -29,30 +29,71 @@
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
-| Generated media handoff | ChatGPT's connector remains read-only. The local executor explicitly imports the original browser download into a new workspace-relative path; signatures, size, containment and SVG active-content checks are enforced, and existing files are never overwritten. |
+| Generated media handoff | `read_image` is a read-only inspection tool. The local executor imports the original browser download into a new workspace-relative path; signatures, size, containment and SVG active-content checks are enforced, and existing files are never overwritten. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
 
 ## Token & scope design
 
-Scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
-`offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`).
-Access tokens: 1 hour. Refresh tokens: 30 days, rotated. All tokens bound to
-`workspace_id` and `client_id`.
+The default grant remains read-only: `workspace.read`, `workspace.search`,
+`git.read`, `execution.read`, and `offline_access`. Optional mutation scopes
+are `workspace.write`, `workspace.delete`, `filesystem.external.read`, and
+`filesystem.external.write`. Tools enforce scopes individually
+(`INSUFFICIENT_SCOPE`); explicitly requested scopes never gain unrequested
+capabilities. A mutation also needs the local permission mode to allow it.
+Access tokens live for 1 hour. Refresh tokens live for 30 days and rotate on
+use. All tokens are bound to `workspace_id` and `client_id`.
+
+## Local file permissions
+
+Permission mode is stored per workspace under the active C2C state directory.
+Missing, malformed, mismatched, or unsupported permission state falls back to
+`readonly`. The local CLI accepts `c2c permission readonly|1|2|status`; the MCP
+`permission_status` tool only reads the mode and cannot change it.
+
+`readonly` permits workspace reads only. `level1` permits workspace file
+creation and modification, workspace moves, and non-sensitive external reads.
+`level2` adds workspace deletion and external file creation or modification.
+Current deletion is one regular workspace file per call, guarded by its
+expected content hash. Moves are workspace-to-workspace only. Directory
+creation is workspace-only. External deletion is a hard deny in every mode.
+OAuth scope checks remain independent, so a local mode alone does not grant a
+token a new scope.
 
 ## Storage
 
-State lives under the OS-convention app dir
-(`~/Library/Application Support/codex-with-chatgpt` on macOS), directories 0700,
-files 0600. Named-hostname preference and tunnel metadata live there too
-(`tunnels/<workspaceId>.json`) — never in the project. Only SHA-256 hashes of
-tokens are persisted — a stolen state file does not yield usable bearer tokens.
+State lives under the OS-convention app directory: Windows
+`%LOCALAPPDATA%\OpenAI\c2c-local`, macOS
+`~/Library/Application Support/codex-with-chatgpt`, and Linux
+`$XDG_STATE_HOME/codex-with-chatgpt` (or `~/.local/state/codex-with-chatgpt`).
+A non-empty `C2C_STATE_DIR` explicitly overrides the platform default. Directory
+and file modes request 0700 and 0600 where the filesystem supports those bits.
+Permission state, the per-workspace Bridge lock, named-hostname preference, and
+tunnel metadata live there, never in the project. Only SHA-256 token hashes
+are persisted; a stolen state file does not yield usable bearer tokens.
+
+`c2c state migrate --from <path>` explicitly imports recognized durable JSON
+from `auth/`, `permissions/`, `tunnels/`, `endpoints/`, and `autostart/`, plus
+`prefs.json`. It excludes runtime files, logs, sessions, executions, and
+execution output. The source must be a separate existing state directory with
+recognized entries; source and destination must be separate, non-nested paths,
+and the destination cannot traverse a symlink or junction. Destination files
+are never overwritten: matching files are reported as already present, while
+conflicts stop the migration. A completion marker prevents a second migration
+into the same destination. On failure, the migrator attempts identity-checked
+rollback of objects it created. If another process changes the filesystem or
+object identity cannot be verified, full rollback is not guaranteed; the
+migrator reports the failure and avoids deleting unverified paths.
 
 **V1 limitation**: client registrations and token hashes are file-based rather
 than OS-keychain-based. Raw tokens are never written anywhere. Keychain
 integration is a V2 item.
 
-## What ChatGPT can never do (V1)
+## What ChatGPT cannot do through C2C (V1)
 
-Write files, delete files, run shell commands, commit, install packages —
-these tools do not exist on the server, so no prompt injection, scope bug, or
-UI confusion can enable them.
+Run shell commands, commit, or install packages: C2C exposes no such tool.
+ChatGPT also cannot change the local permission mode through MCP. File
+mutations exist, but each is gated by both an OAuth scope and the local mode;
+external deletion remains unavailable even in `level2`. Workspace deletion is
+limited to one regular file with an expected content hash. These rules do not
+turn the Bridge into an OS sandbox: local processes with access to the files
+remain outside this MCP policy boundary.

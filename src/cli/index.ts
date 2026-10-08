@@ -29,6 +29,7 @@ import {
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
+import { migratePersistentState } from "../config/state-migration.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -233,6 +234,43 @@ function collectAutostartDiagnostics(workspaceRoot: string): AutostartDiagnostic
   }
 }
 
+/** Read-only check for obvious Codex config path conflicts; this cannot guarantee a later write. */
+function inspectSandboxAllowPrerequisite(): { ok: true } | { ok: false; error: string } {
+  try {
+    const configPath = getCodexConfigPath();
+    const configDirectory = path.dirname(configPath);
+    const root = path.parse(configDirectory).root;
+    let current = configDirectory;
+    for (;;) {
+      try {
+        const directoryStat = fs.lstatSync(current);
+        if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+          return { ok: false, error: "Codex config directory path includes a non-directory or symbolic link." };
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      }
+      if (current === root) break;
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    try {
+      const configStat = fs.lstatSync(configPath);
+      if (!configStat.isFile() || configStat.isSymbolicLink()) {
+        return { ok: false, error: "Codex config path is not a regular file." };
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "Could not inspect the Codex config path." };
+  }
+}
+
 function printRuntimeDiagnostics(
   diagnostics: Awaited<ReturnType<typeof collectRuntimeDiagnostics>>,
   autostart?: AutostartDiagnostics
@@ -249,11 +287,18 @@ function printRuntimeDiagnostics(
   }
   say(`Tunnel preference: ${diagnostics.tunnelPreference}`);
   say(`Tunnel: ${diagnostics.tunnel.status}${diagnostics.tunnel.provider ? ` (${diagnostics.tunnel.provider})` : ""}`);
+  if (diagnostics.publicProbe.publicProbeStatus === "degraded") {
+    say(`PUBLIC_SELF_PROBE=DEGRADED cause=${diagnostics.publicProbe.publicProbeError ?? "unavailable"} checkedAt=${diagnostics.publicProbe.checkedAt ?? "unknown"}`);
+  } else if (diagnostics.publicProbe.publicProbeStatus === "healthy") {
+    say(`PUBLIC_SELF_PROBE=HEALTHY checkedAt=${diagnostics.publicProbe.checkedAt ?? "unknown"}`);
+  } else {
+    say("PUBLIC_SELF_PROBE=NOT_CHECKED");
+  }
   say(`Configured hostname: ${diagnostics.configuredHostname ?? "none"}`);
   say(`Current public URL: ${diagnostics.currentPublicUrl ?? "none"}`);
   say(`Connector endpoint (saved locally): ${diagnostics.connectorEndpoint ?? "none"}`);
   say(`Connector endpoint matches current: ${diagnostics.connectorEndpointMatchesCurrent === null ? "unknown" : diagnostics.connectorEndpointMatchesCurrent ? "yes" : "no"}`);
-  say(`Connector endpoint healthy: ${diagnostics.connectorEndpointHealthy === null ? "unknown" : diagnostics.connectorEndpointHealthy ? "yes" : "no"}`);
+  say(`Connector endpoint healthy (local public probe): ${diagnostics.connectorEndpointHealthy === null ? "unknown" : diagnostics.connectorEndpointHealthy ? "yes" : "no"}`);
   say(`Endpoint stable: ${diagnostics.endpointStable ? "yes" : "no"}`);
   say(`Restart-safe connector: ${diagnostics.restartSafeConnector ? "yes" : "no"}`);
   say(`OAuth token count: ${diagnostics.oauth.tokenCount}`);
@@ -354,6 +399,55 @@ program
 
 // ---------------------------------------------------------------- start
 
+const stateCmd = program.command("state").description("Manage local C2C state");
+
+stateCmd
+  .command("migrate")
+  .description("Import durable settings from an explicitly selected state directory")
+  .requiredOption("--from <path>", "validated source state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { from: string; json: boolean }) => {
+    const sandboxPreflight = inspectSandboxAllowPrerequisite();
+    if (!sandboxPreflight.ok) {
+      if (opts.json) {
+        say(JSON.stringify({
+          ok: false,
+          status: "MIGRATION_NOT_STARTED",
+          error: sandboxPreflight.error,
+          sandbox: { ok: false, warning: sandboxPreflight.error },
+        }));
+      } else {
+        say(`错误：MIGRATION_NOT_STARTED：${sandboxPreflight.error}`);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const result = migratePersistentState(path.resolve(opts.from), getStateDir());
+      const sandbox = trySandboxAllow();
+      const payload = {
+        ok: true,
+        status: "MIGRATION_COMMITTED",
+        destinationRoot: result.destinationRoot,
+        copied: result.copied,
+        alreadyPresent: result.alreadyPresent,
+        markerPath: result.markerPath,
+        sandbox: sandbox.ok
+          ? { ok: true, added: sandbox.added, alreadyAllowed: sandbox.alreadyAllowed }
+          : { ok: false, warning: `Could not update the Codex writable root: ${sandbox.error}` },
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else {
+        check(`MIGRATION_COMMITTED：已迁移 ${result.copied.length} 个持久状态文件`);
+        if (result.alreadyPresent.length) say(`已存在且内容一致：${result.alreadyPresent.length} 个文件`);
+        say(`迁移标记：${result.markerPath}`);
+        if (!sandbox.ok) say(`警告：迁移已提交，但未能更新 Codex writable root：${sandbox.error}`);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
 program
   .command("start")
   .description("Start (or reuse) the bridge for this workspace")
@@ -452,6 +546,10 @@ autostartCmd
     try {
       const service = createAutostartService();
       const outcome = await restoreRegisteredWorkspace(service, opts.workspaceId, workspaceRoot);
+      if (outcome.result?.diagnostics.publicProbe.publicProbeStatus === "degraded") {
+        const probe = outcome.result.diagnostics.publicProbe;
+        say(`PUBLIC_SELF_PROBE=DEGRADED cause=${probe.publicProbeError ?? "unavailable"} checkedAt=${probe.checkedAt ?? "unknown"}`);
+      }
       if (outcome.status === "failed" || outcome.status === "workspace_missing") process.exitCode = 1;
     } catch (error) {
       const service = createAutostartService();
@@ -1554,7 +1652,11 @@ acceptUnusedWorkspaceOption(
   });
 
 function handleCliError(error: unknown, json: boolean): void {
-  const message = error instanceof Error ? error.message : String(error);
+  // JSON parser errors can include source excerpts on some runtimes. Keep their
+  // CLI representation generic so malformed auth/credential data is never echoed.
+  const message = error instanceof SyntaxError
+    ? "Invalid JSON data (syntax error)."
+    : error instanceof Error ? error.message : String(error);
   if (json) {
     say(JSON.stringify({ ok: false, error: message }));
   } else if (message.startsWith("NEED_CLOUDFLARED")) {

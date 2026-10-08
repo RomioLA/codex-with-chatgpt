@@ -1,8 +1,9 @@
 # Host Filesystem 路径边界
 
-`src/workspace/host-filesystem.ts` 提供独立的 `HostFilesystem`。现有
-`Workspace.resolve()` 的实现、containment 和敏感文件行为均不改变。
-本模块不接 MCP，不实现读写、删除、命令或权限等级。
+`src/workspace/host-filesystem.ts` 提供独立的 `HostFilesystem`，负责解析、
+canonicalization、路径分类和敏感文件边界。它本身不执行文件 I/O，也不授予权限。
+当前 MCP 文件工具由 `src/mcp/file-tools.ts` 集成：在调用写入原语前，分别检查
+OAuth scope、本机权限模式和重新解析后的 canonical 路径。
 
 ```ts
 const host = new HostFilesystem(workspace);
@@ -59,16 +60,32 @@ gitignore 语义，包含 sensitive directory 本身。不会把绝对路径直�
 `requires-permission`，不是允许结果。敏感路径仍抛出 `ACCESS_DENIED_SENSITIVE_FILE`。
 无论解析器给出什么分类，后续权限层都必须独立批准操作。
 
+## 当前 MCP 文件工具集成
+
+| 操作 | 当前规则 |
+|---|---|
+| workspace 文件创建、编辑、替换 | 需要 `workspace.write` scope 和 `level1` 或 `level2`；替换与编辑要求匹配本次读取的内容 hash |
+| workspace 目录创建 | 只创建一个 workspace 目录，父目录必须存在；需要 `workspace.write` 和可写本机模式 |
+| workspace 文件移动 | 只允许 workspace 到 workspace，目标必须不存在；需要 `workspace.write` 和可写本机模式 |
+| workspace 文件删除 | 只删一个普通文件，并要求匹配当前内容 hash；需要 `workspace.delete` 和 `level2` |
+| workspace 外读取 | 读取非敏感 UTF-8 普通文件，受大小和分页上限约束；需要 `filesystem.external.read` 和权限 1 或 2 |
+| workspace 外创建、编辑、替换 | 仅支持文件；需要 `filesystem.external.write` 和 `level2` |
+| workspace 外目录创建、跨边界移动、删除 | 当前没有这些工具；外部删除在所有模式都硬拒绝 |
+
+`permission_status` 只读报告当前 workspace 的本机权限。权限只能由本机
+`c2c permission readonly|1|2|status` 命令变更。OAuth scope 与本机权限是两道独立门槛。
+
 ## 集成约束与验证范围
 
-返回值是冻结的路径快照，**不是文件访问 capability**。未来工具必须通过正式 operation
-检查后使用返回的 canonical `abs`，禁止使用未检查的原始输入直接调用 `fs`。
-移动、重命名、覆盖等涉及多个路径的操作必须分别检查各端，并单独处理移除源目录项
-和覆盖目标的语义，不能把 write 的结果当成删除授权。
+返回值是冻结的路径快照，**不是文件访问 capability**。当前 MCP 写工具在执行前重新解析
+canonical `abs` 并检查 OAuth scope、本机权限和敏感文件规则，禁止使用未检查的原始输入
+直接调用 `fs`。移动涉及两个路径，源码分别重新解析并确认两端仍在 workspace；当前目标
+必须不存在。覆盖与删除分别使用独立操作授权和内容 hash 检查，不能把 write 的结果当成
+删除授权。
 
-本层不执行 syscall，因此不宣称消除 TOCTOU。后续 I/O 必须在实际访问前重新解析并再次
-检查权限；需要 handles/原生安全机制防止检查与访问之间的链接替换。`checkOperation()`
-不是包装 `fs.rm` 的删除工具，也不能独自约束绕开正式层的任意本地代码。
+本层不执行 syscall，因此不宣称消除 TOCTOU。MCP 写原语会在同步操作前再次解析和检查，
+但该检查不能隔离其他原生进程，也不能约束绕开正式层的任意本地代码。`checkOperation()`
+不是包装 `fs.rm` 的删除工具；当前 MCP 删除只处理单个普通 workspace 文件，不提供目录删除。
 
 独立测试区分纯 Windows parser 测试和实际 host 测试。Windows 上用真实 junction 验证
 目录跳转及不存在 leaf；文件 symlink 权限不足时测试显式 skip。POSIX 测试仅在 POSIX

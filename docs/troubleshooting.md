@@ -9,7 +9,9 @@ c2c restore -w <workspace> --json
 It reuses or starts the workspace Bridge, restores the saved tunnel preference,
 and checks the public health endpoint. It never generates a pairing code,
 revokes OAuth tokens, or changes ChatGPT connector settings. `c2c doctor` remains
-the broader diagnostic command; `c2c status --json` is read-only.
+the broader diagnostic command; `c2c status --json` is read-only. A healthy
+public self-probe only confirms that the C2C `/health` endpoint answered; it
+does not prove ChatGPT authentication or a connector tool call succeeds.
 
 ## Common situations
 
@@ -81,10 +83,39 @@ Fixed ChatGPT pages for first-time setup and later repair (do not hunt the UI):
 Run `c2c restore -w <workspace> --json` or `c2c doctor --json -w <workspace>`.
 For a configured Named Tunnel, credential and hostname failures are reported
 explicitly. Restore does not fall back to a Quick URL or change the connector.
-If the fixed hostname remains unavailable after its credentials are restored,
-check the reported `hostnameUnavailable` reason. For a Quick Tunnel, compare
-the active public URL with `connectorEndpoint`; update the ChatGPT connector
-manually if they differ. Do not generate a pairing code during runtime recovery.
+When the Named Tunnel connection, Bridge/runtime identity, and configured
+endpoint are reconfirmed, a degraded public self-probe (including
+`ECONNRESET`) is diagnostic only: it does not trigger a restart, set recovery
+to `actionNeeded`, or by itself produce exit code 1. That probe requests only
+the Bridge `/health` route; it does not exercise OAuth or an MCP tool call. Do
+not treat the probe failure as `hostnameUnavailable`; use an actual connector
+call to check the end-to-end path. Quick Tunnel uses an independent health
+decision and may report `quickTunnelFailed` when its public probe fails.
+For a Quick Tunnel, compare the active public URL with `connectorEndpoint` and
+update the ChatGPT connector manually if they differ. Do not generate a pairing
+code during runtime recovery.
+
+Named Tunnel startup retries only recognized transient DNS or network failures,
+for up to six attempts and a 75-second total deadline. Permanent, unknown, or
+credential failures stop without retrying. The retry policy is independent of
+Quick Tunnel startup. A healthy Named Tunnel self-probe still reports only the
+Bridge `/health` endpoint, not a successful connector request.
+
+### `LOCAL_PERMISSION_DENIED` or a file operation is unavailable
+
+Check the workspace's saved local mode:
+
+```text
+c2c permission status -w <workspace>
+```
+
+Change it only from the local machine with `c2c permission readonly`,
+`c2c permission 1`, or `c2c permission 2`. OAuth scopes are a separate gate:
+changing the local mode does not add mutation scopes to an existing token.
+`level1` permits workspace file changes and permitted external reads;
+`level2` adds workspace file deletion and external file changes. Deletion is
+limited to one regular workspace file per call. External deletion and
+cross-boundary moves are not available.
 
 ### I have a Cloudflare domain and want a stable hostname
 During first-time setup (or the next coding session, once), say you have a
@@ -127,7 +158,8 @@ If cloudflared is installed in a custom location that is not on `PATH`, set
 ### Every new Codex chat “repairs” the connection / cannot write logs
 The C2C state directory lives outside the project (macOS:
 `~/Library/Application Support/codex-with-chatgpt`; Windows:
-`%LOCALAPPDATA%\codex-with-chatgpt`). Codex's default sandbox cannot write
+`%LOCALAPPDATA%\OpenAI\c2c-local`). A non-empty `C2C_STATE_DIR` overrides the
+default. Codex's default sandbox cannot write
 there, so each new chat looks like a health-check failure.
 
 `c2c setup`, `c2c doctor` and `c2c sandbox-allow` add that directory to
@@ -135,6 +167,12 @@ there, so each new chat looks like a health-check failure.
 `<codex-home>` is a non-empty `CODEX_HOME` when set, otherwise `~/.codex`
 (`%USERPROFILE%\.codex` on Windows). After that, later chats do not need
 elevation.
+
+To explicitly import durable state from an older directory, use
+`c2c state migrate --from <old-state-dir>`. It copies only recognized durable
+settings, never overwrites conflicting destination files, excludes runtime
+data and logs, and writes a completion marker so the same destination cannot
+be migrated twice.
 
 ### Port already in use
 Handled automatically: an existing healthy bridge for the same workspace is

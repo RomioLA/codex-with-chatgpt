@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { inspectBridgeInstanceLock } from "../bridge/instance-lock.js";
 import { Workspace } from "../workspace/manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -38,6 +39,10 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
       `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
     );
   }
+  const lockStatus = inspectBridgeInstanceLock(workspace.id);
+  if (lockStatus === "live_pid_unverified" || lockStatus === "unknown") {
+    throw new Error("Bridge instance lock is present but its owner cannot be verified; refusing to start another bridge.");
+  }
 
   const logDir = ensureDir(path.join(getStateDir(), "logs"));
   const logFile = path.join(logDir, `bridge-${workspace.id}.out.log`);
@@ -69,6 +74,12 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
     const runtime = await findLiveBridge(workspace.id);
     if (runtime) return { runtime, spawned: true };
     if (child.exitCode !== null && child.exitCode !== 0) {
+      const concurrentStartDeadline = Date.now() + 2000;
+      while (Date.now() < concurrentStartDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const concurrentRuntime = await findLiveBridge(workspace.id);
+        if (concurrentRuntime) return { runtime: concurrentRuntime, spawned: false };
+      }
       throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
     }
   }
@@ -112,10 +123,7 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
       // fall through to kill
     }
   }
-  try {
-    process.kill(runtime.pid, "SIGTERM");
-    return true;
-  } catch {
-    return false;
-  }
+  // A PID alone is not proof of Bridge ownership. If health and the authenticated
+  // admin shutdown path both fail, do not signal a possibly reused PID.
+  return false;
 }
