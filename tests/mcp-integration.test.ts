@@ -91,6 +91,7 @@ describe("MCP tools over Streamable HTTP", () => {
       "execution_output",
       "execution_summary",
       "git_diff",
+      "git_info",
       "git_status",
       "host_context",
       "list_directory",
@@ -119,8 +120,9 @@ describe("MCP tools over Streamable HTTP", () => {
     expectToolOutputSchema(tools, "read_file", ["path", "content", "contentHash", "startLine", "endLine", "nextStartLine"]);
     expectToolOutputSchema(tools, "read_image", ["path", "sizeBytes", "mimeType"]);
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
-    expectToolOutputSchema(tools, "git_status", ["isRepo", "branch", "staged", "unstaged", "untracked", "hidden"]);
-    expectToolOutputSchema(tools, "git_diff", ["isRepo", "mode", "diff", "hasMore", "nextOffset"]);
+    expectToolOutputSchema(tools, "git_info", ["isRepo", "repositoryPath", "topLevel", "branch", "head", "dirty"]);
+    expectToolOutputSchema(tools, "git_status", ["isRepo", "repositoryPath", "topLevel", "branch", "staged", "unstaged", "untracked", "hidden"]);
+    expectToolOutputSchema(tools, "git_diff", ["isRepo", "repositoryPath", "topLevel", "mode", "diff", "hasMore", "nextOffset"]);
     expectToolOutputSchema(tools, "test_status", ["available", "tests", "outputAvailable", "outputId"]);
     expectToolOutputSchema(tools, "execution_summary", ["records"]);
     expectToolOutputSchema(tools, "execution_output", ["action", "items", "text"]);
@@ -198,6 +200,211 @@ describe("MCP tools over Streamable HTTP", () => {
     const diff = structuredJsonOf<{ diff: string; hasMore: boolean }>(result);
     expect(diff.diff).toContain("answer = 43");
     expect(diff.hasMore).toBe(false);
+  });
+
+  it("selects nested repositories and worktrees without crossing their Git state", async () => {
+    const nested = path.join(root, "repo-a");
+    const cleanRepo = path.join(root, "repo-b");
+    const primary = path.join(root, "repo-worktree-primary");
+    const secondary = path.join(root, "worktrees", "SECONDARY");
+    fs.mkdirSync(nested, { recursive: true });
+    fs.mkdirSync(cleanRepo, { recursive: true });
+    fs.mkdirSync(primary, { recursive: true });
+    fs.mkdirSync(path.dirname(secondary), { recursive: true });
+    makeGitRepo(nested);
+    makeGitRepo(cleanRepo);
+    makeGitRepo(primary);
+    git(primary, "worktree", "add", "-b", "secondary", secondary);
+
+    write(nested, ".c2cignore", "private-notes/\n");
+    write(nested, "private-notes/secret.txt", "initial nested secret\n");
+    git(nested, "add", ".c2cignore");
+    git(nested, "add", "-f", "private-notes/secret.txt");
+    git(nested, "commit", "-m", "add nested sensitive fixture");
+    const nestedHead = git(nested, "rev-parse", "HEAD").trim();
+    write(nested, "src/index.ts", "export const answer = 44; // nested edit\n");
+    write(nested, "staged.txt", "staged in repo-a\n");
+    write(nested, "untracked.txt", "untracked in repo-a\n");
+    write(nested, "private-notes/secret.txt", "nested-ignore-secret\n");
+    git(nested, "add", "staged.txt");
+
+    const selectedInfo = structuredJsonOf<{
+      isRepo: boolean;
+      requestedRepositoryPath: string;
+      repositoryPath: string;
+      topLevel: string | null;
+      branch: string | null;
+      head: string | null;
+      dirty: boolean;
+    }>(await client.callTool({ name: "git_info", arguments: { repository_path: "repo-a" } }));
+    expect(selectedInfo).toMatchObject({
+      isRepo: true,
+      requestedRepositoryPath: "repo-a",
+      repositoryPath: "repo-a",
+      topLevel: "repo-a",
+      branch: "main",
+      head: nestedHead,
+      dirty: true,
+    });
+
+    const nestedStatus = structuredJsonOf<{
+      isRepo: boolean;
+      branch: string;
+      repositoryPath: string;
+      topLevel: string | null;
+      staged: { path: string }[];
+      unstaged: { path: string }[];
+      untracked: string[];
+      hidden: { changes: number; conflicts: number };
+    }>(await client.callTool({ name: "git_status", arguments: { repository_path: "repo-a" } }));
+    expect(nestedStatus.isRepo).toBe(true);
+    expect(nestedStatus.branch).toBe("main");
+    expect(nestedStatus.repositoryPath).toBe("repo-a");
+    expect(nestedStatus.topLevel).toBe("repo-a");
+    expect(nestedStatus.staged.map((entry) => entry.path)).toContain("staged.txt");
+    expect(nestedStatus.unstaged.map((entry) => entry.path)).toContain("src/index.ts");
+    expect(nestedStatus.untracked).toContain("untracked.txt");
+    expect(nestedStatus.untracked).not.toContain("private-notes/secret.txt");
+    expect(nestedStatus.hidden.changes).toBeGreaterThan(0);
+
+    const nestedDiff = structuredJsonOf<{ repositoryPath: string; diff: string }>(
+      await client.callTool({
+        name: "git_diff",
+        arguments: { repository_path: "repo-a", path: "src/index.ts", mode: "unstaged" },
+      })
+    );
+    expect(nestedDiff.repositoryPath).toBe("repo-a");
+    expect(nestedDiff.diff).toContain("nested edit");
+    expect(nestedDiff.diff).not.toContain("answer = 43");
+    const escapedDiffScope = await client.callTool({
+      name: "git_diff",
+      arguments: { repository_path: "repo-a", path: "../src/index.ts" },
+    });
+    expect(escapedDiffScope.isError).toBe(true);
+    expect(textOf(escapedDiffScope)).toContain("PATH_OUTSIDE_REPOSITORY");
+
+    write(nested, ".env", "NESTED_SECRET=before\n");
+    git(nested, "add", "-f", ".env");
+    git(nested, "commit", "-m", "add nested sensitive fixture");
+    write(nested, ".env", "NESTED_SECRET=must-not-leak\n");
+    const filteredNestedDiff = structuredJsonOf<{ diff: string }>(
+      await client.callTool({ name: "git_diff", arguments: { repository_path: "repo-a", mode: "unstaged" } })
+    );
+    expect(filteredNestedDiff.diff).not.toContain("must-not-leak");
+
+    write(primary, "primary-only.txt", "primary dirty state\n");
+    const secondaryClean = structuredJsonOf<{
+      isRepo: boolean;
+      branch: string;
+      dirty: boolean;
+      head: string;
+      topLevel: string | null;
+    }>(await client.callTool({ name: "git_info", arguments: { repository_path: "worktrees/SECONDARY" } }));
+    expect(fs.statSync(path.join(secondary, ".git")).isFile()).toBe(true);
+    expect(secondaryClean).toMatchObject({
+      isRepo: true,
+      branch: "secondary",
+      dirty: false,
+      head: git(primary, "rev-parse", "HEAD").trim(),
+      topLevel: "worktrees/SECONDARY",
+    });
+
+    write(secondary, "src/index.ts", "export const answer = 99; // secondary edit\n");
+    write(secondary, "staged.txt", "staged in secondary\n");
+    write(secondary, "untracked.txt", "untracked in secondary\n");
+    git(secondary, "add", "staged.txt");
+    const secondaryStatus = structuredJsonOf<{
+      branch: string;
+      staged: { path: string }[];
+      unstaged: { path: string }[];
+      untracked: string[];
+    }>(await client.callTool({ name: "git_status", arguments: { repository_path: "worktrees/SECONDARY" } }));
+    expect(secondaryStatus.branch).toBe("secondary");
+    expect(secondaryStatus.staged.map((entry) => entry.path)).toContain("staged.txt");
+    expect(secondaryStatus.unstaged.map((entry) => entry.path)).toContain("src/index.ts");
+    expect(secondaryStatus.untracked).toContain("untracked.txt");
+
+    const secondaryDiff = structuredJsonOf<{ diff: string }>(
+      await client.callTool({ name: "git_diff", arguments: { repository_path: "worktrees/SECONDARY" } })
+    );
+    expect(secondaryDiff.diff).toContain("secondary edit");
+    expect(secondaryDiff.diff).not.toContain("primary dirty state");
+
+    const isolatedClean = structuredJsonOf<{
+      isRepo: boolean;
+      staged: unknown[];
+      unstaged: unknown[];
+      untracked: unknown[];
+    }>(await client.callTool({ name: "git_status", arguments: { repository_path: "repo-b" } }));
+    expect(isolatedClean.isRepo).toBe(true);
+    expect(isolatedClean.staged).toEqual([]);
+    expect(isolatedClean.unstaged).toEqual([]);
+    expect(isolatedClean.untracked).toEqual([]);
+
+    const defaultStatus = structuredJsonOf<{ repositoryPath: string; topLevel: string | null; unstaged: { path: string }[] }>(
+      await client.callTool({ name: "git_status", arguments: {} })
+    );
+    expect(defaultStatus.repositoryPath).toBe(".");
+    expect(defaultStatus.topLevel).toBe(".");
+    expect(defaultStatus.unstaged.some((entry) => entry.path === "src/index.ts")).toBe(true);
+
+    fs.mkdirSync(path.join(root, "not-a-repository"), { recursive: true });
+    const noFallback = structuredJsonOf<{ isRepo: boolean; head: string | null }>(
+      await client.callTool({ name: "git_info", arguments: { repository_path: "not-a-repository" } })
+    );
+    expect(noFallback).toMatchObject({ isRepo: false, head: null });
+
+    const conflictRepo = path.join(root, "repo-conflicts");
+    fs.mkdirSync(conflictRepo, { recursive: true });
+    makeGitRepo(conflictRepo);
+    write(conflictRepo, ".c2cignore", "private-notes/\n");
+    write(conflictRepo, "private-notes/conflict.txt", "base\n");
+    git(conflictRepo, "add", ".c2cignore", "private-notes/conflict.txt");
+    git(conflictRepo, "commit", "-m", "add ignored conflict fixture");
+    git(conflictRepo, "checkout", "-b", "conflict-side");
+    write(conflictRepo, "private-notes/conflict.txt", "side-conflict-secret\n");
+    git(conflictRepo, "add", "private-notes/conflict.txt");
+    git(conflictRepo, "commit", "-m", "side change");
+    git(conflictRepo, "checkout", "main");
+    write(conflictRepo, "private-notes/conflict.txt", "main-conflict-secret\n");
+    git(conflictRepo, "add", "private-notes/conflict.txt");
+    git(conflictRepo, "commit", "-m", "main change");
+    expect(() => git(conflictRepo, "merge", "conflict-side")).toThrow();
+
+    const hiddenConflictStatus = structuredJsonOf<{
+      isRepo: boolean;
+      conflicted: string[];
+      hidden: { changes: number; conflicts: number };
+    }>(await client.callTool({ name: "git_status", arguments: { repository_path: "repo-conflicts" } }));
+    expect(hiddenConflictStatus.isRepo).toBe(true);
+    expect(hiddenConflictStatus.conflicted).toEqual([]);
+    expect(hiddenConflictStatus.hidden.conflicts).toBeGreaterThan(0);
+    const hiddenConflictDiff = structuredJsonOf<{ diff: string }>(
+      await client.callTool({ name: "git_diff", arguments: { repository_path: "repo-conflicts", mode: "head" } })
+    );
+    expect(hiddenConflictDiff.diff).not.toContain("side-conflict-secret");
+    expect(hiddenConflictDiff.diff).not.toContain("main-conflict-secret");
+  });
+
+  it("rejects repository selectors outside the workspace, through reparse points, and for non-directories", async () => {
+    const outside = path.join(path.dirname(root), "mcp-repository-outside");
+    fs.mkdirSync(outside, { recursive: true });
+    const junction = path.join(root, "repository-escape");
+    fs.symlinkSync(outside, junction, "junction");
+
+    for (const repositoryPath of ["../mcp-repository-outside", outside, "repository-escape"]) {
+      const result = await client.callTool({ name: "git_status", arguments: { repository_path: repositoryPath } });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("PATH_OUTSIDE_WORKSPACE");
+    }
+
+    const missing = await client.callTool({ name: "git_status", arguments: { repository_path: "missing-repository" } });
+    expect(missing.isError).toBe(true);
+    expect(textOf(missing)).toContain("FILE_NOT_FOUND");
+
+    const file = await client.callTool({ name: "git_status", arguments: { repository_path: "hello.txt" } });
+    expect(file.isError).toBe(true);
+    expect(textOf(file)).toContain("NOT_A_DIRECTORY");
   });
 
   it("git_diff paginates large diffs", async () => {

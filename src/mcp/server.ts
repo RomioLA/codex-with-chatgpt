@@ -3,7 +3,14 @@ import { z } from "zod";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { gitDiff, gitInfo, gitStatus, type DiffMode } from "../workspace/git.js";
+import {
+  gitDiff,
+  gitInfo,
+  gitRepositoryInfo,
+  gitStatus,
+  selectGitRepository,
+  type DiffMode,
+} from "../workspace/git.js";
 import { executionRecordSchema, latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
 import type { Logger } from "../logger/index.js";
@@ -55,7 +62,7 @@ const gitIdentityOutputSchema = z.object({
   isRepo: z.boolean(),
   branch: z.string().nullable(),
   commit: z.string().nullable(),
-  dirty: z.boolean(),
+  dirty: z.boolean().nullable(),
 });
 
 const workspaceInfoOutputSchema = {
@@ -124,6 +131,8 @@ const gitChangeOutputSchema = z.object({
 
 const gitStatusOutputSchema = {
   isRepo: z.boolean(),
+  repositoryPath: z.string(),
+  topLevel: z.string().nullable(),
   branch: z.string().nullable(),
   upstream: z.string().nullable(),
   ahead: z.number().int().nonnegative(),
@@ -140,6 +149,8 @@ const gitStatusOutputSchema = {
 
 const gitDiffOutputSchema = {
   isRepo: z.boolean(),
+  repositoryPath: z.string(),
+  topLevel: z.string().nullable(),
   mode: z.enum(["unstaged", "staged", "head"]),
   totalBytes: z.number().int().nonnegative(),
   offset: z.number().int().nonnegative(),
@@ -147,6 +158,16 @@ const gitDiffOutputSchema = {
   hasMore: z.boolean(),
   nextOffset: z.number().int().nonnegative().nullable(),
   diff: z.string(),
+};
+
+const gitRepositoryInfoOutputSchema = {
+  isRepo: z.boolean(),
+  requestedRepositoryPath: z.string(),
+  repositoryPath: z.string(),
+  topLevel: z.string().nullable(),
+  branch: z.string().nullable(),
+  head: z.string().nullable(),
+  dirty: z.boolean().nullable(),
 };
 
 const testStatusOutputSchema = {
@@ -350,19 +371,67 @@ export function createMcpServer(ctx: McpContext): McpServer {
   );
 
   server.registerTool(
-    "git_status",
+    "git_info",
     {
-      title: "Git status",
-      description: `Structured git status of the workspace: branch, staged/unstaged/untracked files. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
-      outputSchema: gitStatusOutputSchema,
+      title: "Git repository info",
+      description:
+        `Get branch, full HEAD, and dirty state for the workspace or a selected nested repository/worktree. ` +
+        `repository_path selects an existing workspace-relative repository directory. ${UNTRUSTED_NOTE}`,
+      inputSchema: {
+        repository_path: z.string().optional().describe("Select a nested repository/worktree by workspace-relative directory"),
+      },
+      outputSchema: gitRepositoryInfoOutputSchema,
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
+    async (args, extra) => {
       const denied = requireScope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
-        return okStructured(gitStatus(workspace));
+        const selection = selectGitRepository(workspace, args.repository_path);
+        return okStructured(gitRepositoryInfo(selection));
+      } catch (error) {
+        return mapError(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    "git_status",
+    {
+      title: "Git status",
+      description:
+        `Structured git status of the workspace or selected nested repository/worktree: branch, staged/unstaged/untracked files. ` +
+        `When repository_path is omitted, the connected workspace root is used. ${UNTRUSTED_NOTE}`,
+      inputSchema: {
+        repository_path: z.string().optional().describe("Select a nested repository/worktree by workspace-relative directory"),
+      },
+      outputSchema: gitStatusOutputSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (args, extra) => {
+      const denied = requireScope(extra.authInfo, "git.read");
+      if (denied) return denied;
+      try {
+        const selection = selectGitRepository(workspace, args.repository_path);
+        const status = selection.explicit && !selection.isRepo
+          ? {
+              isRepo: false,
+              branch: null,
+              upstream: null,
+              ahead: 0,
+              behind: 0,
+              staged: [],
+              unstaged: [],
+              untracked: [],
+              conflicted: [],
+              hidden: { changes: 0, conflicts: 0 },
+            }
+          : gitStatus(selection.target);
+        return okStructured({
+          ...status,
+          repositoryPath: selection.repositoryPath,
+          topLevel: selection.topLevel,
+        });
       } catch (error) {
         return mapError(error);
       }
@@ -378,7 +447,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `(working tree vs HEAD). When hasMore is true, call again with offset=nextOffset. ${UNTRUSTED_NOTE}`,
       inputSchema: {
         mode: z.enum(["unstaged", "staged", "head"]).default("unstaged"),
-        path: z.string().optional().describe("Limit the diff to one workspace-relative path"),
+        repository_path: z.string().optional().describe("Select a nested repository/worktree by workspace-relative directory"),
+        path: z.string().optional().describe("Limit the diff to one path relative to the selected repository"),
         offset: z.number().int().min(0).default(0).describe("Byte offset for pagination"),
         max_bytes: z.number().int().min(1024).max(262144).default(65536),
       },
@@ -389,17 +459,32 @@ export function createMcpServer(ctx: McpContext): McpServer {
       const denied = requireScope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
+        const selection = selectGitRepository(workspace, args.repository_path);
         let relPath: string | undefined;
         if (args.path) {
-          relPath = workspace.resolve(args.path).rel;
+          relPath = workspace.resolveRepositoryScope(selection.target.root, args.path).rel;
         }
-        return okStructured(
-          gitDiff(
-            workspace,
-            { mode: args.mode as DiffMode, offset: args.offset, maxBytes: args.max_bytes },
-            relPath
-          )
-        );
+        const diff = selection.explicit && !selection.isRepo
+          ? {
+              isRepo: false,
+              mode: args.mode as DiffMode,
+              totalBytes: 0,
+              offset: 0,
+              returnedBytes: 0,
+              hasMore: false,
+              nextOffset: null,
+              diff: "",
+            }
+          : gitDiff(
+              selection.target,
+              { mode: args.mode as DiffMode, offset: args.offset, maxBytes: args.max_bytes },
+              relPath
+            );
+        return okStructured({
+          ...diff,
+          repositoryPath: selection.repositoryPath,
+          topLevel: selection.topLevel,
+        });
       } catch (error) {
         return mapError(error);
       }

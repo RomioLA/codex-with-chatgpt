@@ -8,6 +8,7 @@ import { readJsonIfExists } from "../config/paths.js";
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
   | "PATH_OUTSIDE_WORKSPACE"
+  | "PATH_OUTSIDE_REPOSITORY"
   | "ACCESS_DENIED_SENSITIVE_FILE"
   | "FILE_NOT_FOUND"
   | "NOT_A_FILE"
@@ -166,6 +167,67 @@ export class Workspace {
       throw new WorkspaceError(
         "ACCESS_DENIED_SENSITIVE_FILE",
         `ACCESS_DENIED_SENSITIVE_FILE: '${rel}' matches the sensitive-file policy and cannot be read.`
+      );
+    }
+    return { abs: canonical, rel };
+  }
+
+  /** Resolve an existing directory that may select a nested repository/worktree. */
+  resolveRepositoryPath(requested: string): { abs: string; rel: string } {
+    const resolved = this.resolve(requested);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(resolved.abs);
+    } catch {
+      throw new WorkspaceError("FILE_NOT_FOUND", `Directory not found: ${resolved.rel || "."}`);
+    }
+    if (!stat.isDirectory()) {
+      throw new WorkspaceError("NOT_A_DIRECTORY", `Not a directory: ${resolved.rel || "."}`);
+    }
+    return resolved;
+  }
+
+  /** Resolve a git_diff pathspec relative to a selected repository and keep it inside that repo. */
+  resolveRepositoryScope(repositoryRoot: string, requested: string): { abs: string; rel: string } {
+    if (typeof requested !== "string" || requested.includes("\0")) {
+      throw new WorkspaceError("INVALID_PATH", "Invalid path");
+    }
+    const base = this.resolve(repositoryRoot, { allowSensitive: true });
+    let baseStat: fs.Stats;
+    try {
+      baseStat = fs.statSync(base.abs);
+    } catch {
+      throw new WorkspaceError("FILE_NOT_FOUND", "Selected repository directory no longer exists");
+    }
+    if (!baseStat.isDirectory()) {
+      throw new WorkspaceError("NOT_A_DIRECTORY", "Selected repository path is not a directory");
+    }
+
+    let p = requested.trim().replace(/\\/g, "/");
+    if (p === "" || p === "/") p = ".";
+    const canonical = /^workspace:\/*/i.test(p)
+      ? this.resolve(p, { allowSensitive: true }).abs
+      : this.canonicalize(path.resolve(base.abs, p));
+    if (!this.contains(canonical)) {
+      throw new WorkspaceError(
+        "PATH_OUTSIDE_WORKSPACE",
+        `Path resolves outside the connected workspace: ${requested}`
+      );
+    }
+    const baseKey = normCase(base.abs);
+    const candidateKey = normCase(canonical);
+    if (candidateKey !== baseKey && !candidateKey.startsWith(baseKey + path.sep)) {
+      throw new WorkspaceError(
+        "PATH_OUTSIDE_REPOSITORY",
+        `Path resolves outside the selected repository: ${requested}`
+      );
+    }
+    const rel = path.relative(base.abs, canonical).split(path.sep).join("/");
+    const workspaceRel = path.relative(this.root, canonical).split(path.sep).join("/");
+    if (workspaceRel !== "" && this.ignoreRules.isSensitive(workspaceRel)) {
+      throw new WorkspaceError(
+        "ACCESS_DENIED_SENSITIVE_FILE",
+        `ACCESS_DENIED_SENSITIVE_FILE: '${workspaceRel}' matches the sensitive-file policy and cannot be read.`
       );
     }
     return { abs: canonical, rel };

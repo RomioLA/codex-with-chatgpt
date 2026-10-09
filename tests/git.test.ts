@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
+import { Workspace } from "../src/workspace/manager.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
 let repo: string;
@@ -9,14 +12,12 @@ let plain: string;
 beforeAll(() => {
   repo = makeTmpDir("git-repo");
   makeGitRepo(repo);
-  plain = makeTmpDir("not-a-repo");
-  // The test-tmp dir lives inside this project's own git repo; stop git from
-  // walking up so `plain` is genuinely outside any repository.
-  process.env.GIT_CEILING_DIRECTORIES = path.dirname(plain);
+  // Keep this fixture outside the checkout; the Git runner intentionally clears
+  // inherited GIT_CEILING_DIRECTORIES along with other repository authority.
+  plain = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-not-a-repo-"));
 });
 
 afterAll(() => {
-  delete process.env.GIT_CEILING_DIRECTORIES;
   cleanup(repo);
   cleanup(plain);
 });
@@ -57,6 +58,19 @@ describe("gitStatus", () => {
     git(repo, "checkout", "--", "hello.txt");
   });
 
+  it("parses NUL-delimited rename paths in source-to-destination order", () => {
+    const isolated = makeTmpDir("git-status-rename-paths");
+    makeGitRepo(isolated);
+    write(isolated, "old name.txt", "rename source content\n");
+    git(isolated, "add", "old name.txt");
+    git(isolated, "commit", "-m", "add rename source");
+    git(isolated, "mv", "old name.txt", "new name.txt");
+
+    const status = gitStatus(isolated);
+    expect(status.isRepo).toBe(true);
+    expect(status.staged).toContainEqual({ path: "old name.txt -> new name.txt", change: "R" });
+  });
+
   it("omits sensitive and .c2cignore'd paths from the names ChatGPT sees", () => {
     const isolated = makeTmpDir("git-sensitive-status");
     makeGitRepo(isolated);
@@ -72,6 +86,33 @@ describe("gitStatus", () => {
     expect(status.hidden.changes).toBeGreaterThan(0);
 
     // Keep this fixture separate so later tests do not need destructive cleanup.
+  });
+});
+
+describe("gitDiff workspace-relative paths", () => {
+  it("keeps inventory and patch paths relative when the workspace is inside a parent repo", () => {
+    const parent = makeTmpDir("git-subdirectory-workspace-parent");
+    makeGitRepo(parent);
+    const workspaceRoot = path.join(parent, "connected");
+    fs.mkdirSync(workspaceRoot, { recursive: true });
+    write(workspaceRoot, ".c2cignore", "private/**\n");
+    write(workspaceRoot, "private/tracked-secret.txt", "baseline private value\n");
+    write(workspaceRoot, "public.txt", "baseline public value\n");
+    git(parent, "add", "connected/.c2cignore", "connected/private/tracked-secret.txt", "connected/public.txt");
+    git(parent, "commit", "-m", "add connected workspace fixture");
+
+    write(workspaceRoot, "private/tracked-secret.txt", "sensitive changed content\n");
+    write(workspaceRoot, "public.txt", "visible changed content\n");
+
+    const workspace = new Workspace(workspaceRoot);
+    const status = gitStatus(workspace);
+    const diff = gitDiff(workspace, { mode: "unstaged" });
+    expect(status.isRepo).toBe(true);
+    expect(status.hidden.changes).toBeGreaterThan(0);
+    expect(diff.isRepo).toBe(true);
+    expect(diff.diff).toContain("visible changed content");
+    expect(diff.diff).not.toContain("tracked-secret.txt");
+    expect(diff.diff).not.toContain("sensitive changed content");
   });
 });
 

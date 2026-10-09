@@ -187,6 +187,20 @@ Credentials stay in the OS app state directory, not in the project.
   search results, Git state, and execution records. File creation, editing,
   replacement, movement, and deletion use separate tools gated by OAuth scopes
   and the local permission mode. C2C has no shell or command-execution tool.
+- **Nested Git repositories**: when the connected workspace contains several
+  repositories or worktrees, pass their workspace-relative directory as
+  `repository_path` to `git_info`, `git_status`, or `git_diff`. Without it, Git
+  tools keep using the connected workspace root. In `git_diff`, `path` stays
+  relative to the selected repository.
+- **Git read boundary**: these tools expose fixed repository info, status, and
+  diff queries; `repository_path` selects a repository/worktree and does not
+  accept arbitrary Git commands. Their subprocess environment drops inherited
+  `GIT_*` variables, disables fsmonitor, external diff, textconv, and configured
+  clean/process filters for status and diff queries, and minimizes optional index
+  writes. A filter key that cannot be safely overridden makes the query fail closed.
+  If Git status cannot be safely established, `git_info.dirty` is `null`.
+  Repository and connected-workspace sensitive rules both apply; repository config
+  is not treated as a trusted source for launching helpers.
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.

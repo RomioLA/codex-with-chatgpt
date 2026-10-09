@@ -63,6 +63,45 @@ workspace；不要自动把所有项目接到 `C:\codex`，也不要跨 connecto
 workspace 工具使用 workspace 相对路径（可用 `workspace:/`）；外部文件工具必须使用
 明确的 host 绝对路径，并且 canonical 目标仍在 workspace 外，不能用别名跨越工具边界。
 
+### Nested Git repositories and worktrees
+
+When a connected workspace contains multiple repositories or worktrees, select a nested
+repository with the workspace-relative `repository_path` argument on `git_info`,
+`git_status`, or `git_diff`. For example, when the workspace is `C:\codex`, use
+`repository_path="cinderella-companion/worktrees/WORK2"` to inspect WORK2. Do not
+report the container workspace's Git state as the nested repository's state.
+
+`repository_path` must resolve to an existing directory inside the connected workspace
+and to that repository/worktree's Git top-level. Canonical path validation blocks
+`..`, outside absolute paths, and symlink/junction escapes; a normal subdirectory of a
+parent repository does not fall back to that parent. Git commands remain fixed and use
+the selected directory as `cwd`. `git_diff.path` is a separate pathspec relative to the
+selected repository. Responses include `repositoryPath` and `topLevel`; `git_info`
+returns branch, full `head`, and `dirty` without requiring a full status query. Omitting
+`repository_path` preserves the existing workspace-root behavior.
+
+These APIs expose fixed repository-info, status, and diff queries; `repository_path`
+selects a repository/worktree and does not provide arbitrary Git command execution.
+The shared runner removes inherited `GIT_*` variables, sets noninteractive and
+`GIT_OPTIONAL_LOCKS=0` behavior, fixes `core.fsmonitor=false`, and uses `--no-pager`.
+Diff inventory and patch queries use `--no-ext-diff` and `--no-textconv`; configured
+clean/process filters are overridden for status and diff execution. Normal Git configuration
+continues to supply metadata such as branch/upstream information, but repository
+configuration is not trusted to launch helpers. Git queries may read repository
+metadata, configuration, and attributes as part of their normal operation.
+Filter keys that cannot be safely represented as command-line overrides make the
+query fail closed; if status cannot be safely established, `git_info.dirty` is `null`.
+Status paths are parsed from NUL-delimited records and mapped to the selected root
+before sensitive checks; diff inventory and patch paths use that same root-relative base.
+Repositories that rely on external clean/process filters may show additional dirty
+paths or a raw-worktree diff representation because those programs are intentionally
+not executed.
+
+Sensitive rules from the connected workspace and selected repository are both
+checked. Repository paths are matched relative to the repository root, then mapped
+to workspace-relative paths for the connected workspace rules. Either layer denying
+a path hides it; repository negation cannot reopen a workspace-level deny.
+
 新授权默认只有读取 scopes。workspace 修改/移动需要 `workspace.write`，删除需要
 `workspace.delete`，外部读/写分别需要 `filesystem.external.read` / `filesystem.external.write`。
 本机模式和 OAuth scope 两道门槛都必须通过；切换模式不会给已有 token 增加 scope。

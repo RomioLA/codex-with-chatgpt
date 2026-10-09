@@ -248,6 +248,35 @@ Rules:
     in that Project's instructions. Do not use another workspace's connector.
 ```
 
+## Nested repositories and worktrees
+
+When the connected workspace is a container such as `C:\codex` and the requested
+project is a nested repository or Git worktree, call `git_info`, `git_status`,
+and `git_diff` with `repository_path` set to that workspace-relative directory.
+Do not present the container's Git state as the nested project's state.
+`git_diff.path` is a separate pathspec relative to the selected repository.
+The tools return `repositoryPath` and `topLevel` so callers can verify which
+repository supplied the result. Omitting `repository_path` retains the existing
+workspace-root behavior.
+
+The Git tools expose only fixed info/status/diff queries; `repository_path` selects
+a repository or worktree and is not an arbitrary command interface. The subprocess
+runner drops inherited `GIT_*` variables, disables fsmonitor, external diff,
+textconv, and configured clean/process filters for status and diff queries, and sets
+`GIT_OPTIONAL_LOCKS=0`. Repository-local and connected-workspace sensitive rules
+are combined as a deny union, so a repository rule cannot negate a workspace deny.
+If status cannot be safely established, `git_info.dirty` is `null` rather than a
+clean result. Filter configuration names that cannot be safely overridden also make
+status or diff fail closed. Normal Git configuration and attributes can still affect
+metadata and file interpretation, but are not trusted to launch these helpers. Git
+queries may read repository metadata, configuration, and attributes as part of their
+operation. Status uses NUL-delimited records and maps paths back to the selected root
+before applying sensitive rules. Diff inventory and patch paths use the same selected
+root-relative base.
+Repositories that rely on external clean/process filters can show additional dirty
+paths or a raw-worktree diff representation because those programs are intentionally
+not executed.
+
 ## Project instructions
 
 New workspaces store durable identity in the ChatGPT Project settings

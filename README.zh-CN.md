@@ -117,6 +117,15 @@ Ready.
 - **数据面（MCP）**：ChatGPT 按需读取工作区信息、文件、图片、搜索结果、Git
   状态和执行记录。创建、编辑、替换、移动和删除文件使用独立工具，同时受 OAuth
   scope 和本机权限模式门控。C2C 不提供 shell 或命令执行工具。
+- **嵌套 Git 仓库**：当已连接的 workspace 内包含多个仓库或 worktree 时，调用
+  `git_info`、`git_status` 或 `git_diff` 时传入 workspace 相对目录 `repository_path`。
+  不传时仍以已连接 workspace 根目录为目标。`git_diff` 的 `path` 始终相对于所选仓库。
+- **Git 读取边界**：这些工具只提供固定的仓库信息、状态和 diff 查询；`repository_path`
+  只用于选择仓库或 worktree，不接受任意 Git 命令。子进程会清除继承的 `GIT_*` 环境变量，
+  禁用 fsmonitor、external diff、textconv，以及 status/diff 中配置的 clean/process filter，
+  并尽量减少可选 index 写入。无法安全覆盖的 filter 配置会让查询 fail closed；无法安全确认
+  status 时，`git_info.dirty` 返回 `null`。仓库规则与连接 workspace 的敏感规则同时生效；
+  不会把仓库 Git 配置视为可信任的 helper 执行来源。
 - **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
   和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
 

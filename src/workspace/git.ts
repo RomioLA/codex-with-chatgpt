@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 import { IgnoreRules } from "./ignore.js";
+import { Workspace, WorkspaceError } from "./manager.js";
 
 export interface GitCommandResult {
   ok: boolean;
@@ -8,14 +10,106 @@ export interface GitCommandResult {
   code: number | null;
 }
 
-export function runGit(root: string, args: string[]): GitCommandResult {
-  const result = spawnSync("git", args, {
+const SAFE_GIT_GLOBAL_ARGS = [
+  "--no-pager",
+  "-c", "core.fsmonitor=false",
+  "-c", "core.pager=cat",
+  "-c", "core.editor=:",
+  "-c", "sequence.editor=:",
+  "-c", "credential.interactive=false",
+];
+
+const SAFE_FILTER_CONFIG_OVERRIDE_PATTERN = /^filter\.[A-Za-z0-9._-]+\.(?:clean|process)$/i;
+const MAX_FILTER_CONFIG_OVERRIDES = 128;
+const MAX_FILTER_CONFIG_OVERRIDE_BYTES = 16 * 1024;
+
+function createGitEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && !name.toUpperCase().startsWith("GIT_")) {
+      env[name] = value;
+    }
+  }
+
+  // Do not inherit Git's repository/config authority. Preserve normal process
+  // startup variables (PATH, SystemRoot, etc.) and install fixed query policy.
+  Object.assign(env, {
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_PAGER: "cat",
+    GIT_EDITOR: ":",
+    GIT_SEQUENCE_EDITOR: ":",
+    PAGER: "cat",
+  });
+  return env;
+}
+
+function spawnGit(root: string, args: string[], env: NodeJS.ProcessEnv) {
+  return spawnSync("git", args, {
     cwd: root,
     encoding: "utf8",
+    env,
     maxBuffer: 64 * 1024 * 1024,
     timeout: 30_000,
     windowsHide: true,
   });
+}
+
+/** Find configured clean/process filters so worktree queries can disable their commands. */
+function getFilterExecutionConfigKeys(root: string, env: NodeJS.ProcessEnv): string[] | null {
+  const result = spawnGit(root, [
+    ...SAFE_GIT_GLOBAL_ARGS,
+    "config",
+    "--null",
+    "--name-only",
+    "--get-regexp",
+    "^filter\\..*\\.(clean|process)$",
+  ], env);
+  // `git config --get-regexp` returns 1 when there are no matching keys.
+  if (result.status !== 0 && result.status !== 1) return null;
+
+  // Git's regexp selected the relevant config keys. Do not pre-filter its
+  // output with a broader JS regexp: characters such as U+2028 can be treated
+  // as line terminators by JS and silently hide an unsafe key from validation.
+  const keys = [...new Set((result.stdout ?? "").split("\0").filter((key) => key.length > 0))];
+  // `-c key=` parses the key using config syntax. Restrict names to the
+  // unambiguous subset we can represent exactly on the command line.
+  if (keys.some((key) => !SAFE_FILTER_CONFIG_OVERRIDE_PATTERN.test(key))) return null;
+  const overrideBytes = keys.reduce((total, key) => total + Buffer.byteLength(key, "utf8") + 4, 0);
+  if (keys.length > MAX_FILTER_CONFIG_OVERRIDES || overrideBytes > MAX_FILTER_CONFIG_OVERRIDE_BYTES) {
+    return null;
+  }
+  return keys;
+}
+
+export function runGit(root: string, args: string[]): GitCommandResult {
+  const env = createGitEnvironment();
+  let safeArgs = [...SAFE_GIT_GLOBAL_ARGS, ...args];
+
+  if (args[0] === "diff" || args[0] === "status") {
+    const filterKeys = getFilterExecutionConfigKeys(root, env);
+    if (filterKeys === null) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: "Unable to establish a safe Git filter policy",
+        code: null,
+      };
+    }
+    const filterOverrides = filterKeys.flatMap((key) => ["-c", `${key}=`]);
+    safeArgs = args[0] === "diff"
+      ? [
+          ...SAFE_GIT_GLOBAL_ARGS,
+          ...filterOverrides,
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          ...args.slice(1),
+        ]
+      : [...SAFE_GIT_GLOBAL_ARGS, ...filterOverrides, ...args];
+  }
+
+  const result = spawnGit(root, safeArgs, env);
   return {
     ok: result.status === 0,
     stdout: result.stdout ?? "",
@@ -28,7 +122,8 @@ export interface GitInfo {
   isRepo: boolean;
   branch: string | null;
   commit: string | null;
-  dirty: boolean;
+  /** `null` means status could not be safely established. */
+  dirty: boolean | null;
 }
 
 export function gitInfo(root: string): GitInfo {
@@ -45,16 +140,137 @@ export function gitInfo(root: string): GitInfo {
     isRepo: true,
     branch: branch.ok ? branch.stdout.trim() : null,
     commit: commit.ok ? commit.stdout.trim() : null,
-    dirty: status.ok ? status.stdout.trim().length > 0 : false,
+    dirty: status.ok ? status.stdout.trim().length > 0 : null,
   };
 }
 
 export interface WorkspaceLike {
   root: string;
-  ignoreRules?: IgnoreRules;
+  ignoreRules?: SensitivePathPolicy;
+}
+
+export interface SensitivePathPolicy {
+  isSensitive(relPath: string): boolean;
 }
 
 export type GitTarget = string | WorkspaceLike;
+
+export interface GitRepositorySelection {
+  target: WorkspaceLike;
+  explicit: boolean;
+  isRepo: boolean;
+  requestedRepositoryPath: string;
+  repositoryPath: string;
+  topLevel: string | null;
+}
+
+const normPath = (value: string): string =>
+  process.platform === "win32" || process.platform === "darwin" ? value.toLowerCase() : value;
+
+function isWithinPath(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function createNestedSensitivePolicy(workspace: Workspace, repositoryRoot: string): SensitivePathPolicy {
+  const repositoryRules = new IgnoreRules(repositoryRoot);
+  return {
+    isSensitive(repositoryRelativePath: string): boolean {
+      let absolutePath: string;
+      try {
+        absolutePath = path.resolve(repositoryRoot, repositoryRelativePath);
+      } catch {
+        return true;
+      }
+      if (!isWithinPath(repositoryRoot, absolutePath) || !isWithinPath(workspace.root, absolutePath)) {
+        return true;
+      }
+
+      const repositoryRelative = path.relative(repositoryRoot, absolutePath).split(path.sep).join("/");
+      if (repositoryRules.isSensitive(repositoryRelative)) return true;
+
+      const workspaceRelative = path.relative(workspace.root, absolutePath).split(path.sep).join("/");
+      return workspaceRelative !== "" && workspace.ignoreRules.isSensitive(workspaceRelative);
+    },
+  };
+}
+
+/** Resolve an optional workspace-relative repository selector without allowing parent-repo fallback. */
+export function selectGitRepository(
+  workspace: Workspace,
+  requestedRepositoryPath?: string
+): GitRepositorySelection {
+  const explicit = requestedRepositoryPath !== undefined;
+  const resolved = explicit
+    ? workspace.resolveRepositoryPath(requestedRepositoryPath)
+    : { abs: workspace.root, rel: "" };
+  const root = resolved.abs;
+  const target: WorkspaceLike = explicit
+    ? { root, ignoreRules: createNestedSensitivePolicy(workspace, root) }
+    : workspace;
+  const topResult = runGit(root, ["rev-parse", "--show-toplevel"]);
+  let topAbs: string | null = null;
+  let topLevel: string | null = null;
+  if (topResult.ok) {
+    try {
+      const canonicalTop = workspace.resolve(topResult.stdout.trim(), { allowSensitive: true });
+      topAbs = canonicalTop.abs;
+      topLevel = canonicalTop.rel || ".";
+    } catch (error) {
+      // A parent repository outside the connected workspace is not a valid
+      // explicit target, and its path must not be returned to the caller.
+      if (!(error instanceof WorkspaceError)) throw error;
+    }
+  }
+  const isRepo = explicit
+    ? topAbs !== null && normPath(topAbs) === normPath(root)
+    : topResult.ok;
+  return {
+    target,
+    explicit,
+    isRepo,
+    requestedRepositoryPath: resolved.rel || ".",
+    repositoryPath: resolved.rel || ".",
+    topLevel: isRepo ? topLevel : null,
+  };
+}
+
+export interface GitRepositoryInfo {
+  isRepo: boolean;
+  requestedRepositoryPath: string;
+  repositoryPath: string;
+  topLevel: string | null;
+  branch: string | null;
+  head: string | null;
+  /** `null` means status could not be safely established. */
+  dirty: boolean | null;
+}
+
+export function gitRepositoryInfo(selection: GitRepositorySelection): GitRepositoryInfo {
+  const empty: GitRepositoryInfo = {
+    isRepo: false,
+    requestedRepositoryPath: selection.requestedRepositoryPath,
+    repositoryPath: selection.repositoryPath,
+    topLevel: null,
+    branch: null,
+    head: null,
+    dirty: false,
+  };
+  if (!selection.isRepo) return empty;
+
+  const branch = runGit(selection.target.root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const head = runGit(selection.target.root, ["rev-parse", "HEAD"]);
+  const status = runGit(selection.target.root, ["status", "--porcelain", "--", "."]);
+  return {
+    ...empty,
+    isRepo: true,
+    topLevel: selection.topLevel,
+    branch: branch.ok ? branch.stdout.trim() : null,
+    head: head.ok ? head.stdout.trim() : null,
+    dirty: status.ok ? status.stdout.trim().length > 0 : null,
+  };
+}
 
 export interface GitStatusResult {
   isRepo: boolean;
@@ -86,12 +302,36 @@ export function gitStatus(target: GitTarget): GitStatusResult {
     conflicted: [],
     hidden: { changes: 0, conflicts: 0 },
   };
-  const result = runGit(root, ["status", "--porcelain=v2", "--branch", "--", "."]);
+  const result = runGit(root, ["status", "--porcelain=v2", "-z", "--branch", "--", "."]);
   if (!result.ok) return empty;
+  const prefixResult = runGit(root, ["rev-parse", "--show-prefix"]);
+  if (!prefixResult.ok) return empty;
+  const repositoryPrefix = prefixResult.stdout.replace(/\r?\n$/, "");
+  const toWorkspacePath = (repositoryPath: string): string | null => {
+    if (!repositoryPrefix) return repositoryPath;
+    return repositoryPath.startsWith(repositoryPrefix)
+      ? repositoryPath.slice(repositoryPrefix.length)
+      : null;
+  };
   const out: GitStatusResult = { ...empty, hidden: { ...empty.hidden }, isRepo: true };
   const withheld = (paths: string[]): boolean => paths.some((p) => ignoreRules.isSensitive(p));
 
-  for (const line of result.stdout.split("\n")) {
+  const fields = (record: string, separatorCount: number): string[] | null => {
+    const values: string[] = [];
+    let start = 0;
+    for (let i = 0; i < separatorCount; i += 1) {
+      const separator = record.indexOf(" ", start);
+      if (separator < 0) return null;
+      values.push(record.slice(start, separator));
+      start = separator + 1;
+    }
+    values.push(record.slice(start));
+    return values;
+  };
+
+  const records = result.stdout.split("\0");
+  for (let i = 0; i < records.length; i += 1) {
+    const line = records[i] ?? "";
     if (line.startsWith("# branch.head ")) {
       out.branch = line.slice("# branch.head ".length).trim();
     } else if (line.startsWith("# branch.upstream ")) {
@@ -102,30 +342,48 @@ export function gitStatus(target: GitTarget): GitStatusResult {
         out.ahead = parseInt(m[1], 10);
         out.behind = parseInt(m[2], 10);
       }
-    } else if (line.startsWith("1 ") || line.startsWith("2 ")) {
-      const parts = line.split(" ");
+    } else if (line.startsWith("1 ")) {
+      const parts = fields(line, 8);
+      if (!parts || parts.length !== 9 || parts[1]?.length !== 2 || !parts[8]) return empty;
       const xy = parts[1] ?? "";
-      const isRename = line.startsWith("2 ");
-      const destination = isRename
-        ? (line.split("\t")[0]?.split(" ").slice(9).join(" ") ?? "")
-        : parts.slice(8).join(" ");
-      const origin = isRename ? (line.split("\t")[1] ?? "") : null;
-      const rawPaths = origin === null ? [destination] : [destination, origin];
-      const filePath = origin === null ? destination : `${destination} -> ${origin}`;
-      if (withheld(rawPaths)) {
+      const filePath = toWorkspacePath(parts[8] ?? "");
+      if (!filePath) return empty;
+      if (withheld([filePath])) {
         out.hidden.changes += (xy[0] !== "." ? 1 : 0) + (xy[1] !== "." ? 1 : 0);
         continue;
       }
       if (xy[0] !== ".") out.staged.push({ path: filePath, change: xy[0] });
       if (xy[1] !== ".") out.unstaged.push({ path: filePath, change: xy[1] });
+    } else if (line.startsWith("2 ")) {
+      const parts = fields(line, 9);
+      if (!parts || parts.length !== 10 || parts[1]?.length !== 2 || !parts[9]) return empty;
+      const xy = parts[1] ?? "";
+      const destination = toWorkspacePath(parts[9] ?? "");
+      const origin = toWorkspacePath(records[i + 1] ?? "");
+      if (!destination || !origin) return empty;
+      i += 1;
+      if (withheld([destination, origin])) {
+        out.hidden.changes += (xy[0] !== "." ? 1 : 0) + (xy[1] !== "." ? 1 : 0);
+        continue;
+      }
+      const filePath = `${origin} -> ${destination}`;
+      if (xy[0] !== ".") out.staged.push({ path: filePath, change: xy[0] });
+      if (xy[1] !== ".") out.unstaged.push({ path: filePath, change: xy[1] });
     } else if (line.startsWith("? ")) {
-      const filePath = line.slice(2);
+      if (line.length <= 2) return empty;
+      const filePath = toWorkspacePath(line.slice(2));
+      if (!filePath) return empty;
       if (withheld([filePath])) out.hidden.changes += 1;
       else out.untracked.push(filePath);
     } else if (line.startsWith("u ")) {
-      const filePath = line.split(" ").slice(10).join(" ");
+      const parts = fields(line, 10);
+      if (!parts || parts.length !== 11 || parts[1]?.length !== 2 || !parts[10]) return empty;
+      const filePath = toWorkspacePath(parts[10] ?? "");
+      if (!filePath) return empty;
       if (withheld([filePath])) out.hidden.conflicts += 1;
       else out.conflicted.push(filePath);
+    } else if (line && !line.startsWith("#")) {
+      return empty;
     }
   }
   return out;
@@ -205,6 +463,7 @@ export function gitDiff(
   // 1. Full-workspace inventory using NUL separation and global rename detection
   const listArgs = [
     "diff",
+    "--relative",
     "--name-status",
     "-z",
     "--find-renames=1%",
@@ -278,6 +537,7 @@ export function gitDiff(
     const pathspecs = batch.map((p) => `:(literal)${p}`);
     const diffArgs = [
       "diff",
+      "--relative",
       "--no-color",
       "--find-renames=1%",
       ...modeArgs,
