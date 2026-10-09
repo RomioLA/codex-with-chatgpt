@@ -4,6 +4,8 @@
 
 > ChatGPT 负责思考，Codex 负责干活。
 
+> 本仓库是 **RomioLA 维护的 C2C Local fork**，基于 [XiaoDuoYa 的 Codex with ChatGPT](https://github.com/XiaoDuoYa/codex-with-chatgpt)。在原项目基础上增加了本机权限模式、Windows production/runtime 恢复、受限只读 Host Observation，以及对嵌套 Git 仓库/worktree 的安全定位（限固定 info/status/diff 查询）。
+
 ## 解决什么问题
 
 ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的 API 额度做
@@ -27,7 +29,7 @@ Agent（Codex），然后去倒杯咖啡：
 
 1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
-2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
+2. 下载：把 https://github.com/RomioLA/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
 4. 安装 Skill：先确定 Codex home：如果设置了非空的 CODEX_HOME 就使用它，

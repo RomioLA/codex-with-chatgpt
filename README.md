@@ -3,6 +3,8 @@
 > ChatGPT thinks. Codex works.
 > ChatGPT 负责思考，Codex 负责干活。
 
+> This repository is **RomioLA's C2C Local fork** of [Codex with ChatGPT by XiaoDuoYa](https://github.com/XiaoDuoYa/codex-with-chatgpt). It adds the local permission model, Windows production/runtime recovery, bounded read-only Host Observation, and secure nested Git repository/worktree targeting for fixed info/status/diff queries.
+
 > [!IMPORTANT]
 > **遇到问题？** 请先向 Codex 发送 **「更新 Codex with ChatGPT」** 并重试。更新到最新版本可以解决大多数已知问题。  
 > **Having trouble?** First ask Codex to **“Update Codex with ChatGPT”** and try again. Updating to the latest version resolves most known issues.
@@ -71,7 +73,7 @@ I am a non-technical user — do everything yourself:
 1. Check the environment: git and Node.js >= 20 must be available. Install
    anything missing yourself (macOS: Homebrew, Windows: winget). Also install
    cloudflared.
-2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
+2. Download: clone https://github.com/RomioLA/codex-with-chatgpt into
    ~/codex-with-chatgpt (if it already exists, git pull to update).
 3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
 4. Install the Skill: determine the Codex home first: use a non-empty CODEX_HOME
