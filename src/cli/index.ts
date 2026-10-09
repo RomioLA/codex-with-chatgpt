@@ -60,6 +60,14 @@ import {
 } from "../session/state.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import {
+  approveTrustedCommand,
+  listTrustedCommands,
+  readPackageScriptForApproval,
+  revokeTrustedCommand,
+} from "../execution/trusted-registry.js";
+import { resolveRepositoryIdentity } from "../execution/repository-identity.js";
+import { EXECUTION_KINDS, type ExecutionKind, type PackageManager } from "../execution/job-types.js";
 import { importMediaAsset } from "../media/import.js";
 import { isPermissionMode, readPermission, setPermission, type PermissionMode } from "../permission/index.js";
 import {
@@ -769,6 +777,139 @@ permissionCmd
       };
       if (opts.json) say(JSON.stringify(payload));
       else check(`Permission: ${actualMode}（${workspace.name}）`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+// ------------------------------------------------------------ execution trust
+
+const executionCmd = program
+  .command("execution")
+  .description("Manage local trust for bounded execution jobs");
+const executionTrustCmd = executionCmd
+  .command("trust")
+  .description("Approve, list, or revoke trusted package-script recipes");
+
+executionTrustCmd
+  .command("list")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const commands = listTrustedCommands(workspace.id).map((item) => ({
+        repositoryIdentity: item.repositoryIdentity,
+        canonicalRepositoryPath: item.canonicalRepositoryPath,
+        kind: item.kind,
+        target: item.target,
+        packageManager: item.packageManager,
+        approvedAt: item.approvedAt,
+        approvalSource: item.approvalSource,
+      }));
+      const payload = { ok: true, workspaceId: workspace.id, commands };
+      if (opts.json) say(JSON.stringify(payload));
+      else if (commands.length === 0) say(`No trusted execution recipes for ${workspace.name}.`);
+      else for (const command of commands) say(`${command.kind}:${command.target} (${command.packageManager}) ${command.canonicalRepositoryPath}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+executionTrustCmd
+  .command("approve")
+  .requiredOption("--kind <kind>", "test, build, lint, typecheck, or package_script")
+  .requiredOption("--target <name>", "exact package.json script name")
+  .option("-w, --workspace <path>")
+  .option("-r, --repository <path>", "workspace-relative repository/worktree path", ".")
+  .option("--manager <manager>", "fixed package manager: npm or pnpm", "npm")
+  .option("--approve", "write local approval after reviewing the preview", false)
+  .option("--json", "machine-readable output", false)
+  .action((opts: {
+    kind: string;
+    target: string;
+    workspace?: string;
+    repository: string;
+    manager: string;
+    approve: boolean;
+    json: boolean;
+  }) => {
+    try {
+      const kind = opts.kind as ExecutionKind;
+      const manager = opts.manager as PackageManager;
+      if (!(EXECUTION_KINDS as readonly string[]).includes(kind)) {
+        throw new Error(`Invalid recipe kind: ${opts.kind}`);
+      }
+      if (manager !== "npm" && manager !== "pnpm") throw new Error("Package manager must be npm or pnpm.");
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const repository = resolveRepositoryIdentity(workspace, opts.repository);
+      const script = readPackageScriptForApproval(repository.canonicalPath, opts.target);
+      if (!opts.approve) {
+        const preview = {
+          ok: true,
+          approvalRequired: true,
+          workspaceId: workspace.id,
+          repositoryIdentity: repository.identity,
+          repositoryPath: repository.workspaceRelativePath,
+          kind,
+          target: opts.target,
+          packageManager: manager,
+          script,
+          instruction: "Review this exact package.json script, then rerun with --approve to store local trust.",
+        };
+        say(opts.json ? JSON.stringify(preview) : `${JSON.stringify(preview, null, 2)}\nNo approval was written.`);
+        return;
+      }
+      const entry = approveTrustedCommand({
+        workspaceId: workspace.id,
+        repositoryIdentity: repository.identity,
+        canonicalRepositoryPath: repository.canonicalPath,
+        kind,
+        target: opts.target,
+        packageManager: manager,
+        localApproval: true,
+      });
+      const result = {
+        ok: true,
+        workspaceId: workspace.id,
+        repositoryIdentity: entry.repositoryIdentity,
+        repositoryPath: repository.workspaceRelativePath,
+        kind: entry.kind,
+        target: entry.target,
+        packageManager: entry.packageManager,
+        scriptHash: entry.scriptHash,
+        approvedAt: entry.approvedAt,
+      };
+      if (opts.json) say(JSON.stringify(result));
+      else check(`Locally approved ${kind}:${opts.target} (${manager}) for ${repository.workspaceRelativePath}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+executionTrustCmd
+  .command("revoke")
+  .requiredOption("--kind <kind>")
+  .requiredOption("--target <name>")
+  .option("-w, --workspace <path>")
+  .option("-r, --repository <path>", "workspace-relative repository/worktree path", ".")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { kind: string; target: string; workspace?: string; repository: string; json: boolean }) => {
+    try {
+      const kind = opts.kind as ExecutionKind;
+      if (!(EXECUTION_KINDS as readonly string[]).includes(kind)) throw new Error(`Invalid recipe kind: ${opts.kind}`);
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const repository = resolveRepositoryIdentity(workspace, opts.repository);
+      const revoked = revokeTrustedCommand({
+        workspaceId: workspace.id,
+        repositoryIdentity: repository.identity,
+        kind,
+        target: opts.target,
+      });
+      const result = { ok: true, revoked, workspaceId: workspace.id, repositoryIdentity: repository.identity, kind, target: opts.target };
+      if (opts.json) say(JSON.stringify(result));
+      else if (revoked) check(`Revoked ${kind}:${opts.target}`);
+      else say(`No matching trust entry for ${kind}:${opts.target}.`);
     } catch (error) {
       handleCliError(error, opts.json);
     }

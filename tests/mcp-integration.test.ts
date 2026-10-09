@@ -3,9 +3,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
+import { createMcpServer } from "../src/mcp/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
+import { approveTrustedCommand } from "../src/execution/trusted-registry.js";
+import { resolveRepositoryIdentity } from "../src/execution/repository-identity.js";
+import type { ExecutionRunner } from "../src/execution/supervisor.js";
+import type { OutputStream } from "../src/execution/job-types.js";
+import type { NativeRunnerCompletion, NativeRunnerHandle } from "../src/execution/native-runner.js";
+import { nullLogger } from "../src/logger/index.js";
+import { setPermission } from "../src/permission/store.js";
 import { makeTmpDir, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
 let root: string;
@@ -13,19 +22,55 @@ let bridge: Bridge;
 let client: Client;
 let accessToken: string;
 let stateDir: string;
+let executionToken: string;
+let secondExecutionToken: string;
 
-function textOf(result: { content?: unknown }): string {
-  const content = result.content as { type: string; text: string }[];
-  return content?.[0]?.text ?? "";
+interface CapturedExecution {
+  callbacks: Parameters<ExecutionRunner["start"]>[1];
+  resolve: (value: NativeRunnerCompletion) => void;
 }
 
-function jsonOf<T = Record<string, unknown>>(result: { content?: unknown }): T {
+class McpControlledRunner implements ExecutionRunner {
+  readonly runs = new Map<string, CapturedExecution>();
+
+  start(request: Parameters<ExecutionRunner["start"]>[0], callbacks: Parameters<ExecutionRunner["start"]>[1]): NativeRunnerHandle {
+    let resolve!: (value: NativeRunnerCompletion) => void;
+    const completion = new Promise<NativeRunnerCompletion>((done) => { resolve = done; });
+    this.runs.set(request.jobId, { callbacks, resolve });
+    return {
+      completion,
+      cancel: () => undefined,
+      abandon: () => undefined,
+    };
+  }
+
+  emit(jobId: string, stream: OutputStream, value: string): void {
+    this.runs.get(jobId)?.callbacks.onOutput(stream, Buffer.from(value, "utf8"));
+  }
+
+  finish(jobId: string, outcome: NativeRunnerCompletion["result"]["outcome"]): void {
+    this.runs.get(jobId)?.resolve({ result: { outcome, exitCode: 0, win32Error: 0 }, helperExitCode: 0 });
+  }
+}
+
+interface McpExecutionJob { job_id: string; state: string }
+
+const executionRunner = new McpControlledRunner();
+
+function textOf(result: unknown): string {
+  const content = (result as { content?: unknown } | null)?.content;
+  if (!Array.isArray(content)) return "";
+  const first = content[0] as { text?: unknown } | undefined;
+  return typeof first?.text === "string" ? first.text : "";
+}
+
+function jsonOf<T = Record<string, unknown>>(result: unknown): T {
   return JSON.parse(textOf(result)) as T;
 }
 
-function structuredJsonOf<T = Record<string, unknown>>(result: { content?: unknown; structuredContent?: unknown }): T {
+function structuredJsonOf<T = Record<string, unknown>>(result: unknown): T {
   const parsed = jsonOf<T>(result);
-  expect(result.structuredContent).toEqual(parsed);
+  expect((result as { structuredContent?: unknown } | null)?.structuredContent).toEqual(parsed);
   return parsed;
 }
 
@@ -56,12 +101,21 @@ beforeAll(async () => {
     port: 0,
     persistRuntime: false,
     authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
+    executionRunner,
   });
   const tokens = bridge.authStore.issueTokens({
     clientId: "it-client",
     scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
   });
   accessToken = tokens.accessToken;
+  executionToken = bridge.authStore.issueTokens({
+    clientId: "execution-client-a",
+    scopes: ["execution.jobs.read", "execution.run", "execution.cancel"],
+  }).accessToken;
+  secondExecutionToken = bridge.authStore.issueTokens({
+    clientId: "execution-client-b",
+    scopes: ["execution.jobs.read", "execution.run", "execution.cancel"],
+  }).accessToken;
 
   client = new Client({ name: "c2c-test-client", version: "1.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
@@ -88,7 +142,12 @@ describe("MCP tools over Streamable HTTP", () => {
       "dns_resolve",
       "edit_external_file",
       "edit_file",
+      "execution_cancel",
+      "execution_job_output",
+      "execution_list",
       "execution_output",
+      "execution_start",
+      "execution_status",
       "execution_summary",
       "git_diff",
       "git_info",
@@ -126,6 +185,11 @@ describe("MCP tools over Streamable HTTP", () => {
     expectToolOutputSchema(tools, "test_status", ["available", "tests", "outputAvailable", "outputId"]);
     expectToolOutputSchema(tools, "execution_summary", ["records"]);
     expectToolOutputSchema(tools, "execution_output", ["action", "items", "text"]);
+    expectToolOutputSchema(tools, "execution_start", ["job", "duplicate"]);
+    expectToolOutputSchema(tools, "execution_status", ["available", "job"]);
+    expectToolOutputSchema(tools, "execution_list", ["jobs"]);
+    expectToolOutputSchema(tools, "execution_job_output", ["offset", "next_offset", "oldest_available_offset", "eof", "truncated", "text"]);
+    expectToolOutputSchema(tools, "execution_cancel", ["job"]);
   });
 
   it("documents git_diff pagination with its output field names", async () => {
@@ -609,5 +673,163 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(result.diff).not.toContain("src/public.txt");
 
     git(root, "reset", "--hard", "HEAD");
+  });
+
+  it("fails closed without authInfo and isolates execution jobs between OAuth clients", async () => {
+    const localServer = createMcpServer({
+      workspace: bridge.workspace,
+      logger: nullLogger,
+      executionSupervisor: bridge.executionSupervisor,
+    });
+    const [localClientTransport, localServerTransport] = InMemoryTransport.createLinkedPair();
+    const localClient = new Client({ name: "c2c-local-no-auth", version: "1.0.0" });
+    await localServer.connect(localServerTransport);
+    await localClient.connect(localClientTransport);
+    const unauthenticated = await localClient.callTool({
+      name: "execution_status",
+      arguments: { job_id: "a".repeat(24) },
+    });
+    expect(unauthenticated.isError).toBe(true);
+    expect(textOf(unauthenticated)).toContain("UNAUTHENTICATED");
+    await localClient.close();
+    await localServer.close();
+
+    const noExecutionScope = await client.callTool({
+      name: "execution_start",
+      arguments: {
+        repository_path: ".",
+        kind: "test",
+        target: "test",
+        timeout_seconds: 30,
+        idempotency_key: "mcp-no-scope-00000001",
+      },
+    });
+    expect(noExecutionScope.isError).toBe(true);
+    expect(textOf(noExecutionScope)).toContain("INSUFFICIENT_SCOPE");
+
+    const startClient = new Client({ name: "c2c-execution-client-a", version: "1.0.0" });
+    const otherClient = new Client({ name: "c2c-execution-client-b", version: "1.0.0" });
+    await startClient.connect(new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${executionToken}` } },
+    }));
+    await otherClient.connect(new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${secondExecutionToken}` } },
+    }));
+    try {
+      setPermission(bridge.workspace.id, "level1");
+      const repository = resolveRepositoryIdentity(bridge.workspace, ".");
+      const unapproved = await startClient.callTool({
+        name: "execution_start",
+        arguments: {
+          repository_path: ".",
+          kind: "test",
+          target: "test",
+          timeout_seconds: 30,
+          idempotency_key: "mcp-unapproved-000001",
+        },
+      });
+      expect(unapproved.isError).toBe(true);
+      expect(textOf(unapproved)).toContain("COMMAND_NOT_APPROVED");
+
+      const maliciousTarget = await startClient.callTool({
+        name: "execution_start",
+        arguments: {
+          repository_path: ".",
+          kind: "package_script",
+          target: "../test && whoami",
+          timeout_seconds: 30,
+          idempotency_key: "mcp-malicious-000001",
+        },
+      });
+      expect(maliciousTarget.isError).toBe(true);
+
+      approveTrustedCommand({
+        workspaceId: bridge.workspace.id,
+        repositoryIdentity: repository.identity,
+        canonicalRepositoryPath: repository.canonicalPath,
+        kind: "test",
+        target: "test",
+        packageManager: "npm",
+        localApproval: true,
+      });
+      const started = structuredJsonOf<{ job: McpExecutionJob; duplicate: boolean }>(await startClient.callTool({
+        name: "execution_start",
+        arguments: {
+          repository_path: ".",
+          kind: "test",
+          target: "test",
+          timeout_seconds: 30,
+          idempotency_key: "mcp-start-000000000001",
+        },
+      }));
+      expect(started.duplicate).toBe(false);
+      expect(started.job.state).toBe("running");
+      executionRunner.emit(started.job.job_id, "stdout", `ready\n${"x".repeat(200)}`);
+
+      const listed = structuredJsonOf<{ jobs: McpExecutionJob[] }>(await startClient.callTool({
+        name: "execution_list",
+        arguments: { limit: 20 },
+      }));
+      expect(listed.jobs.map((job) => job.job_id)).toContain(started.job.job_id);
+
+      const statusDenied = await otherClient.callTool({
+        name: "execution_status",
+        arguments: { job_id: started.job.job_id },
+      });
+      expect(statusDenied.isError).toBe(true);
+      expect(textOf(statusDenied)).toContain("NOT_FOUND");
+      const cancelDenied = await otherClient.callTool({
+        name: "execution_cancel",
+        arguments: { job_id: started.job.job_id },
+      });
+      expect(cancelDenied.isError).toBe(true);
+      expect(textOf(cancelDenied)).toContain("NOT_FOUND");
+
+      const output = structuredJsonOf<{ offset: number; next_offset: number; text: string; eof: boolean }>(
+        await startClient.callTool({
+          name: "execution_job_output",
+          arguments: { job_id: started.job.job_id, stream: "stdout", offset: 0, max_bytes: 5 },
+        })
+      );
+      expect(output).toMatchObject({ offset: 0, next_offset: 5, text: "ready", eof: false });
+
+      const cancel = structuredJsonOf<{ job: McpExecutionJob }>(await startClient.callTool({
+        name: "execution_cancel",
+        arguments: { job_id: started.job.job_id },
+      }));
+      expect(cancel.job.state).toBe("cancelling");
+      executionRunner.finish(started.job.job_id, 1);
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const status = structuredJsonOf<{ job: McpExecutionJob }>(await startClient.callTool({
+          name: "execution_status",
+          arguments: { job_id: started.job.job_id },
+        }));
+        if (status.job.state === "cancelled") break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const finalStatus = structuredJsonOf<{ job: McpExecutionJob }>(await startClient.callTool({
+        name: "execution_status",
+        arguments: { job_id: started.job.job_id },
+      }));
+      expect(finalStatus.job.state).toBe("cancelled");
+
+      setPermission(bridge.workspace.id, "readonly");
+      const downgraded = await startClient.callTool({
+        name: "execution_start",
+        arguments: {
+          repository_path: ".",
+          kind: "test",
+          target: "test",
+          timeout_seconds: 30,
+          idempotency_key: "mcp-readonly-00000001",
+        },
+      });
+      expect(downgraded.isError).toBe(true);
+      expect(textOf(downgraded)).toContain("EXECUTION_PERMISSION_DENIED");
+    } finally {
+      setPermission(bridge.workspace.id, "readonly");
+      await startClient.close();
+      await otherClient.close();
+    }
   });
 });

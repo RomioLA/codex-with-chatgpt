@@ -19,6 +19,9 @@ export const SUPPORTED_SCOPES = [
   "workspace.delete",
   "filesystem.external.read",
   "filesystem.external.write",
+  "execution.jobs.read",
+  "execution.run",
+  "execution.cancel",
 ] as const;
 
 export type Scope = (typeof SUPPORTED_SCOPES)[number];

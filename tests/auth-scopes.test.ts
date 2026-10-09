@@ -7,18 +7,24 @@ import { cleanup, makeTmpDir, write } from "./helpers.js";
 const V1_SCOPES = ["workspace.read", "workspace.search", "git.read", "execution.read", "offline_access"];
 const NEW_SCOPES = ["workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write"];
 const HOST_OBSERVATION_SCOPE = "system.read";
+const EXECUTION_SCOPES = ["execution.jobs.read", "execution.run", "execution.cancel"];
 
 describe("OAuth scope filtering", () => {
   it("keeps the V1 default separate from advertised capabilities", () => {
     expect([...DEFAULT_SCOPES]).toEqual(V1_SCOPES);
-    expect([...SUPPORTED_SCOPES]).toEqual([...V1_SCOPES, HOST_OBSERVATION_SCOPE, ...NEW_SCOPES]);
+    expect([...SUPPORTED_SCOPES]).toEqual([
+      ...V1_SCOPES,
+      HOST_OBSERVATION_SCOPE,
+      ...NEW_SCOPES,
+      ...EXECUTION_SCOPES,
+    ]);
   });
 
   it.each([undefined, "", " ", "\t\n"])("defaults %j to only the V1 read-only grant", (requested) => {
     expect(filterScopes(requested)).toEqual(V1_SCOPES);
   });
 
-  it.each(NEW_SCOPES)("grants %s only when explicitly requested", (scope) => {
+  it.each([...NEW_SCOPES, ...EXECUTION_SCOPES])("grants %s only when explicitly requested", (scope) => {
     expect(filterScopes(scope)).toEqual([scope]);
     expect(filterScopes(`${V1_SCOPES.join(" ")} ${scope}`)).toEqual([...V1_SCOPES, scope]);
   });
@@ -45,8 +51,13 @@ describe("OAuth scope filtering", () => {
 });
 
 describe("persisted OAuth scopes", () => {
-  it.each([V1_SCOPES, ["workspace.read", "offline_access"], ...NEW_SCOPES.map((scope) => ["workspace.read", scope, "offline_access"])])(
-    "preserves existing access and refresh grants after reload: %j",
+  it.each([
+    V1_SCOPES,
+    ["workspace.read", "offline_access"],
+    ...NEW_SCOPES.map((scope) => ["workspace.read", scope, "offline_access"]),
+    ...EXECUTION_SCOPES.map((scope) => ["workspace.read", scope, "offline_access"]),
+  ])(
+    "preserves persisted access and refresh grants without upgrading their scopes: %j",
     (...scopes) => {
       const root = makeTmpDir("auth-scopes");
       const workspaceId = "oauth-scope-test";

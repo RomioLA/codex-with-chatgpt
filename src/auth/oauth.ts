@@ -76,6 +76,9 @@ function pairingPage(opts: {
     "workspace.search": "Search this workspace",
     "git.read": "Read git status and diffs",
     "execution.read": "Read Codex execution summaries",
+    "execution.jobs.read": "View execution job status",
+    "execution.run": "Start execution jobs",
+    "execution.cancel": "Cancel execution jobs",
     "system.read": "Read limited host system diagnostics",
     offline_access: "Stay connected between sessions",
     "workspace.write": "Create and modify files in this workspace",
@@ -84,7 +87,13 @@ function pairingPage(opts: {
     "filesystem.external.write": "Create and modify permitted files outside this workspace",
   };
   const hasMutationScope = opts.scopes.some((scope) =>
-    ["workspace.write", "workspace.delete", "filesystem.external.write"].includes(scope)
+    [
+      "workspace.write",
+      "workspace.delete",
+      "filesystem.external.write",
+      "execution.run",
+      "execution.cancel",
+    ].includes(scope)
   );
   const accessLabel = hasMutationScope ? "" : " (read-only)";
   const scopeList = opts.scopes

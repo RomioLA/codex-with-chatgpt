@@ -18,6 +18,7 @@ import { SERVICE_NAME, VERSION } from "../version.js";
 import { probeBridge, writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 import { acquireBridgeInstanceLock, type BridgeInstanceLock } from "./instance-lock.js";
 import { readPermission } from "../permission/index.js";
+import { ExecutionSupervisor, type ExecutionRunner } from "../execution/supervisor.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -42,6 +43,8 @@ export interface BridgeOptions {
   authStoreFile?: string;
   pairingTtlMs?: number;
   accessTokenTtlMs?: number;
+  /** Internal test seam; production callers use the fixed Windows helper. */
+  executionRunner?: ExecutionRunner;
 }
 
 export interface Bridge {
@@ -52,6 +55,7 @@ export interface Bridge {
   authStore: AuthStore;
   pairing: PairingManager;
   tunnel: TunnelProvider;
+  executionSupervisor: ExecutionSupervisor;
   getPublicBaseUrl(): string | null;
   localBaseUrl(): string;
   close(): Promise<void>;
@@ -140,7 +144,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
-  const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
+  let executionSupervisor: ExecutionSupervisor | null = null;
+  const mcpHandler = createMcpHttpHandler(
+    () => createMcpServer({ workspace, logger, executionSupervisor: executionSupervisor ?? undefined }),
+    logger
+  );
   app.all(
     "/mcp",
     express.json({ limit: "8mb" }),
@@ -248,7 +256,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // cannot strand a lock owned by this still-running process. Every Bridge,
   // including persistRuntime:false instances, must hold it before listening.
   const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id);
+  const supervisor = new ExecutionSupervisor(workspace, { runner: opts.executionRunner });
+  executionSupervisor = supervisor;
   const listening = await listen(app, host, opts.port ?? DEFAULT_PORT, workspace.id).catch(async (error: unknown) => {
+    await supervisor.shutdown().catch(() => undefined);
     await instanceLock.release().catch(() => undefined);
     throw error;
   });
@@ -274,6 +285,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   try {
     persistRuntime();
   } catch (error) {
+    await supervisor.shutdown().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await instanceLock.release().catch(() => undefined);
     throw error;
@@ -283,6 +295,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    await supervisor.shutdown();
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
@@ -298,6 +311,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     authStore,
     pairing,
     tunnel,
+    executionSupervisor: supervisor,
     getPublicBaseUrl: () => publicBaseUrl,
     localBaseUrl: () => `http://${host}:${port}`,
     close: shutdown,
