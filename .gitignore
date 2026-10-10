@@ -8,5 +8,5 @@ dist/
 .env.*
 !.env.example
 coverage/
-/build/native/c2c-execution-helper.exe
+/build/native/
 /.verification-*/

@@ -10,7 +10,7 @@ import { runExecutionTempCleanup } from "../src/execution/execution-temp-cleanup
 import { serializeTempCleanupRequest } from "../src/execution/helper-protocol.js";
 import { ExecutionJobStore } from "../src/execution/job-store.js";
 import type { ExecutionJob } from "../src/execution/job-types.js";
-import { resolveExecutionHelperPath } from "../src/execution/native-runner.js";
+import { resolveExecutionLauncherPath } from "../src/execution/native-runner.js";
 
 function makeSystemTempDir(name: string): string {
   return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `c2c-${name}-`)));
@@ -121,9 +121,12 @@ describe("ExecutionTempOwner", () => {
     const outsideOwner = makeExecutionTempOwner("execution-temp-outside-state-root", expectedWorkspaceId);
     const id = jobId("outside-root");
     const lease = outsideOwner.create(id);
-    const result = spawnSync(resolveExecutionHelperPath(), ["--cleanup-temp"], {
+    const launcherPath = resolveExecutionLauncherPath();
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+    const result = spawnSync(launcherPath, [], {
+      cwd: path.dirname(launcherPath),
       input: serializeTempCleanupRequest(lease),
-      env: { ...process.env, C2C_STATE_DIR: expectedStateRoot },
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot, PATH: path.join(systemRoot, "System32"), C2C_STATE_DIR: expectedStateRoot },
       windowsHide: true,
       shell: false,
       timeout: 30_000,
@@ -191,9 +194,12 @@ describe("ExecutionTempOwner", () => {
     const id = jobId("missing-sidecar");
     const lease = owner.create(id);
     fs.unlinkSync(path.join(storeDirectory, `.c2c-execution-temp-job-${id}`));
-    const result = spawnSync(resolveExecutionHelperPath(), ["--cleanup-temp"], {
+    const launcherPath = resolveExecutionLauncherPath();
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+    const result = spawnSync(launcherPath, [], {
+      cwd: path.dirname(launcherPath),
       input: serializeTempCleanupRequest(lease),
-      env: { ...process.env, C2C_STATE_DIR: stateRoot },
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot, PATH: path.join(systemRoot, "System32"), C2C_STATE_DIR: stateRoot },
       windowsHide: true,
       shell: false,
       timeout: 30_000,

@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { ExecutionTempLease } from "./execution-temp.js";
-import { resolveExecutionHelperPath } from "./native-runner.js";
+import { resolveExecutionLauncherPath } from "./native-runner.js";
 import { serializeTempCleanupRequest } from "./helper-protocol.js";
 
 /** Invoke only the fixed helper's identity-bound execution-temp cleanup operation. */
@@ -33,11 +33,19 @@ export function runExecutionTempCleanup(
   }
   let result: ReturnType<typeof spawnSync>;
   try {
-    const helperPath = resolveExecutionHelperPath();
+    const launcherPath = resolveExecutionLauncherPath();
     const input = serializeTempCleanupRequest(lease);
-    result = spawnSync(helperPath, ["--cleanup-temp"], {
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+    const systemDirectory = path.join(systemRoot, "System32");
+    result = spawnSync(launcherPath, [], {
+      cwd: path.dirname(launcherPath),
       input,
-      env: { ...process.env, C2C_STATE_DIR: stateRoot },
+      env: {
+        SystemRoot: systemRoot,
+        WINDIR: systemRoot,
+        PATH: systemDirectory,
+        C2C_STATE_DIR: stateRoot,
+      },
       windowsHide: true,
       shell: false,
       timeout: 30_000,

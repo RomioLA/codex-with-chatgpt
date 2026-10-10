@@ -1617,6 +1617,9 @@ bool BuildCommandLine(const Request& request, const ChildEnvironment& environmen
         arguments.push_back(L"--config.store-dir=" + environment.pnpmStore);
         arguments.push_back(L"--config.cache-dir=" + environment.pnpmCache);
         arguments.push_back(L"--config.node-options=");
+        // Avoid an implicit `pnpm install` child process resolved through the
+        // reduced PATH; C2C starts only the pinned CLI and approved recipe.
+        arguments.push_back(L"--config.verify-deps-before-run=warn");
     }
     arguments.push_back(L"run");
     arguments.push_back(request.target);

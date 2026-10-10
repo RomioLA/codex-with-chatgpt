@@ -44,7 +44,33 @@ export function resolveExecutionHelperPath(options: {
   architecture?: string;
   moduleDirectory?: string;
   helperPath?: string;
+  launcherPath?: string;
 } = {}): string {
+  return resolveExecutionArtifacts(options).helperPath;
+}
+
+export function resolveExecutionLauncherPath(options: {
+  platform?: NodeJS.Platform;
+  architecture?: string;
+  moduleDirectory?: string;
+  helperPath?: string;
+  launcherPath?: string;
+} = {}): string {
+  return resolveExecutionArtifacts(options).launcherPath;
+}
+
+interface ExecutionHelperArtifacts {
+  helperPath: string;
+  launcherPath: string;
+}
+
+function resolveExecutionArtifacts(options: {
+  platform?: NodeJS.Platform;
+  architecture?: string;
+  moduleDirectory?: string;
+  helperPath?: string;
+  launcherPath?: string;
+}): ExecutionHelperArtifacts {
   if ((options.platform ?? process.platform) !== "win32" ||
       (options.architecture ?? process.arch) !== "x64") {
     throw new Error("EXECUTION_HELPER_UNAVAILABLE");
@@ -52,12 +78,16 @@ export function resolveExecutionHelperPath(options: {
   const moduleDirectory = options.moduleDirectory ?? path.dirname(fileURLToPath(import.meta.url));
   const packageRoot = path.resolve(moduleDirectory, "../..");
   const expectedHelper = path.resolve(packageRoot, "build/native/c2c-execution-helper.exe");
-  const candidate = options.helperPath ? path.resolve(options.helperPath) : expectedHelper;
+  const candidateHelper = options.helperPath ? path.resolve(options.helperPath) : expectedHelper;
+  const expectedLauncher = path.resolve(packageRoot, "build/native/c2c-execution-launcher.exe");
+  const candidateLauncher = options.launcherPath ? path.resolve(options.launcherPath) : expectedLauncher;
   const metadataPath = path.resolve(packageRoot, "dist/execution/c2c-execution-helper-integrity.json");
   try {
-    const absolute = path.resolve(candidate);
-    if (absolute.toLowerCase() !== expectedHelper.toLowerCase()) throw new Error("EXECUTION_HELPER_UNAVAILABLE");
-    for (const file of [metadataPath, absolute]) {
+    if (candidateHelper.toLowerCase() !== expectedHelper.toLowerCase() ||
+        candidateLauncher.toLowerCase() !== expectedLauncher.toLowerCase()) {
+      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    }
+    for (const file of [metadataPath, candidateHelper, candidateLauncher]) {
       const parsed = path.parse(file);
       let current = parsed.root;
       for (const component of file.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
@@ -65,13 +95,24 @@ export function resolveExecutionHelperPath(options: {
         if (fs.lstatSync(current).isSymbolicLink()) throw new Error("EXECUTION_HELPER_UNAVAILABLE");
       }
     }
-    const stat = fs.lstatSync(candidate);
-    const canonical = fs.realpathSync.native(candidate);
-    if (!stat.isFile() || stat.isSymbolicLink() ||
-        path.basename(canonical).toLowerCase() !== "c2c-execution-helper.exe" ||
-        path.resolve(canonical).toLowerCase() !== expectedHelper.toLowerCase()) {
-      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
-    }
+    const verifyArtifact = (candidate: string, expected: string, expectedName: string): Buffer => {
+      const stat = fs.lstatSync(candidate);
+      const canonical = fs.realpathSync.native(candidate);
+      if (!stat.isFile() || stat.isSymbolicLink() ||
+          path.basename(canonical).toLowerCase() !== expectedName.toLowerCase() ||
+          path.resolve(canonical).toLowerCase() !== expected.toLowerCase()) {
+        throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+      }
+      const bytes = fs.readFileSync(canonical);
+      if (bytes.byteLength < 0x40 || bytes.toString("ascii", 0, 2) !== "MZ") {
+        throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+      }
+      const peOffset = bytes.readUInt32LE(0x3c);
+      if (peOffset > bytes.byteLength - 4 || bytes.toString("binary", peOffset, peOffset + 4) !== "PE\0\0") {
+        throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+      }
+      return bytes;
+    };
     const metadataStat = fs.lstatSync(metadataPath);
     if (!metadataStat.isFile() || metadataStat.isSymbolicLink() ||
         path.resolve(fs.realpathSync.native(metadataPath)).toLowerCase() !== metadataPath.toLowerCase()) {
@@ -79,22 +120,22 @@ export function resolveExecutionHelperPath(options: {
     }
     const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as {
       version?: unknown; protocolVersion?: unknown; helperPath?: unknown; sha256?: unknown;
+      launcherPath?: unknown; launcherSha256?: unknown;
     };
-    if (metadata.version !== 1 || metadata.protocolVersion !== 5 ||
+    if (metadata.version !== 2 || metadata.protocolVersion !== 5 ||
         metadata.helperPath !== "build/native/c2c-execution-helper.exe" ||
-        typeof metadata.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.sha256)) {
+        typeof metadata.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.sha256) ||
+        metadata.launcherPath !== "build/native/c2c-execution-launcher.exe" ||
+        typeof metadata.launcherSha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.launcherSha256)) {
       throw new Error("EXECUTION_HELPER_UNAVAILABLE");
     }
-    const bytes = fs.readFileSync(canonical);
-    if (bytes.byteLength < 0x40 || bytes.toString("ascii", 0, 2) !== "MZ") {
+    const helperBytes = verifyArtifact(candidateHelper, expectedHelper, "c2c-execution-helper.exe");
+    const launcherBytes = verifyArtifact(candidateLauncher, expectedLauncher, "c2c-execution-launcher.exe");
+    if (createHash("sha256").update(helperBytes).digest("hex") !== metadata.sha256 ||
+        createHash("sha256").update(launcherBytes).digest("hex") !== metadata.launcherSha256) {
       throw new Error("EXECUTION_HELPER_UNAVAILABLE");
     }
-    const peOffset = bytes.readUInt32LE(0x3c);
-    if (peOffset > bytes.byteLength - 4 || bytes.toString("binary", peOffset, peOffset + 4) !== "PE\0\0" ||
-        createHash("sha256").update(bytes).digest("hex") !== metadata.sha256) {
-      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
-    }
-    return canonical;
+    return { helperPath: expectedHelper, launcherPath: expectedLauncher };
   } catch {
     throw new Error("EXECUTION_HELPER_UNAVAILABLE");
   }
@@ -105,16 +146,20 @@ export class WindowsNativeExecutionRunner {
   constructor(
     private readonly options: {
       helperPath?: string;
+      launcherPath?: string;
       moduleDirectory?: string;
       spawnImpl?: typeof spawn;
       runtimeResolver?: typeof resolveTrustedRuntime;
       beforeHelperRequestWrite?: (runtime: TrustedRuntime) => void;
+      launcherTestHoldMs?: number;
+      launcherEvidence?: (line: string) => void;
     } = {}
   ) {}
 
   start(request: NativeRunnerRequest, callbacks: NativeRunnerCallbacks): NativeRunnerHandle {
-    const helperPath = resolveExecutionHelperPath({
+    const launcherPath = resolveExecutionLauncherPath({
       helperPath: this.options.helperPath,
+      launcherPath: this.options.launcherPath,
       moduleDirectory: this.options.moduleDirectory,
     });
     const runtime = (this.options.runtimeResolver ?? resolveTrustedRuntime)(request.trustedCommand.packageManager);
@@ -136,6 +181,11 @@ export class WindowsNativeExecutionRunner {
       TEMP: jobTempDir,
       TMP: jobTempDir,
     };
+    if (this.options.launcherTestHoldMs !== undefined) {
+      const holdMs = Math.max(0, Math.min(3000, Math.trunc(this.options.launcherTestHoldMs)));
+      env.C2C_EXECUTION_LAUNCHER_TEST_EVIDENCE = "1";
+      env.C2C_EXECUTION_LAUNCHER_TEST_HOLD_MS = String(holdMs);
+    }
     const spawnImpl = this.options.spawnImpl ?? spawn;
     let input: Buffer;
     let child: ChildProcessWithoutNullStreams;
@@ -188,8 +238,8 @@ export class WindowsNativeExecutionRunner {
         gitEntryHash: request.repository.gitEntryHash,
         packageJsonHash: request.trustedCommand.packageJsonHash,
       });
-      child = spawnImpl(helperPath, [], {
-        cwd: request.repository.canonicalPath,
+      child = spawnImpl(launcherPath, [], {
+        cwd: path.dirname(launcherPath),
         env,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
@@ -218,6 +268,7 @@ export class WindowsNativeExecutionRunner {
     let cancelSent = false;
     let abandoned = false;
     let spawnError: Error | null = null;
+    let launcherEvidencePending = "";
 
     const completion = new Promise<NativeRunnerCompletion>((resolve, reject) => {
       child.stdout.on("data", (data: Buffer) => {
@@ -234,7 +285,16 @@ export class WindowsNativeExecutionRunner {
         }
       });
       child.stderr.on("data", (data: Buffer) => {
-        diagnostics = (diagnostics + Buffer.from(data).toString("utf8")).slice(-4096);
+        const chunk = Buffer.from(data).toString("utf8");
+        diagnostics = (diagnostics + chunk).slice(-4096);
+        if (this.options.launcherEvidence) {
+          launcherEvidencePending += chunk;
+          const lines = launcherEvidencePending.split(/\r?\n/);
+          launcherEvidencePending = lines.pop() ?? "";
+          for (const line of lines) {
+            if (line.startsWith("C2C_EXECUTION_LAUNCHER_EVIDENCE:")) this.options.launcherEvidence(line);
+          }
+        }
       });
       child.once("error", (error) => {
         spawnError = new Error("EXECUTION_HELPER_START_FAILED", { cause: error });

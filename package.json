@@ -11,6 +11,7 @@
     "bin/",
     "dist/",
     "build/native/c2c-execution-helper.exe",
+    "build/native/c2c-execution-launcher.exe",
     "README.md",
     "README.zh-CN.md",
     "docs/security.md",
@@ -20,8 +21,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "npm run build:execution-helper && tsc -p tsconfig.json && npm run build:helper-metadata",
+    "build": "npm run build:execution-helper && npm run build:execution-launcher && tsc -p tsconfig.json && npm run build:helper-metadata",
     "build:execution-helper": "pwsh -NoProfile -File tools/build-execution-helper.ps1",
+    "build:execution-launcher": "pwsh -NoProfile -File tools/build-execution-launcher.ps1",
     "build:helper-metadata": "pwsh -NoProfile -File tools/write-execution-helper-integrity.ps1",
     "prepack": "npm run build",
     "dev": "tsx src/cli/index.ts",
@@ -39,7 +41,10 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
+    "@types/body-parser": "^1.19.6",
+    "@types/express-serve-static-core": "^5.1.3",
     "@types/node": "^22.15.0",
+    "@types/serve-static": "^2.2.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
