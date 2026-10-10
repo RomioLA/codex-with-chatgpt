@@ -28,7 +28,7 @@
 | Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a salted workspace hash |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
-| Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
+| Execution output exposure | ChatGPT can start only a bounded recipe approved in C2C's local trusted-command policy. Per-stream sanitizers handle chunk boundaries, UTF-8 splits, token patterns, long values, and private-key blocks; stdout and stderr stay independent, so a secret split across both streams is not guaranteed to be detected. Output size is capped and restricted streams are listed without a body. |
 | Generated media handoff | `read_image` is a read-only inspection tool. The local executor imports the original browser download into a new workspace-relative path; signatures, size, containment and SVG active-content checks are enforced, and existing files are never overwritten. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
 
@@ -47,6 +47,28 @@ filtering continues to drop unknown names; a request with no supported scopes
 is rejected.
 Access tokens live for 1 hour. Refresh tokens live for 30 days and rotate on
 use. All tokens are bound to `workspace_id` and `client_id`.
+
+## Bounded execution
+
+The execution tools can start a named test, build, lint, typecheck, or package
+script recipe only when C2C's managed local trusted-command policy has approved
+that repository, target, package manager, and script material. MCP requests and
+model output cannot create or change that authority. Editing `package.json`
+does not approve a new recipe. The native helper locks the selected repository,
+Git/worktree identity, manifest, and fixed runtime paths while checking the
+approved hashes and starting the package manager. It fails closed if those
+identities or hashes no longer match.
+
+C2C does not expose an arbitrary Shell MCP or caller-supplied command string.
+Windows Job Objects contain the process tree lifetime; they are not a filesystem,
+network, privilege, or untrusted-code sandbox. An approved package script still
+executes project code with the local account's available access.
+
+Streaming sanitization treats stdout and stderr as separate streams to preserve
+stream identity and byte-offset pagination. It detects covered patterns across
+chunks within each stream, but it cannot promise detection when secret fragments
+are divided between stdout and stderr. V1.2's primary protection for secrets is
+minimal environment-variable exposure to the child process.
 
 ## Host Observation
 

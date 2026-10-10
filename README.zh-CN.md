@@ -1,7 +1,7 @@
 # C2C Local
 
 > 面向本地工作区的 ChatGPT ↔ Codex 桥接方案，带明确权限边界。
-> ChatGPT 负责推理、审查和经授权的文件操作；Codex 继续负责命令、构建和测试。
+> ChatGPT 负责推理和审查；通过 C2C Local，它也可以启动经本机操作者明确批准的 bounded execution recipe。
 
 [English](README.md) | **简体中文**
 
@@ -14,9 +14,12 @@
 - 在本机权限允许时创建、编辑、替换、移动文件，并提供受限制的删除能力。
 - 在策略允许时读取或修改 Workspace 外的普通文件，但不开放无限制主机文件系统。
 - 通过 `git_info(repository_path)`、`git_status(repository_path)`、`git_diff(repository_path)` 定位嵌套仓库和 Git worktree。
+- 通过 execution 工具启动由本机操作者明确批准的 bounded test/build/lint/typecheck 或具名 package-script recipe。
 - 提供受限、只读的 Windows Host Observation，可查看进程、监听端口、网络、DNS、路径和主机上下文。
 - 包含 Windows Bridge/Tunnel 状态恢复和自动启动相关能力。
-- **不提供**任意 Shell、任意命令执行、远程提权或任意 Git 命令通道。
+- **不提供**任意 Shell、调用方自带命令字符串、远程提权或任意 Git 命令通道。
+
+执行授权由 C2C 本机 trusted-command policy 管理。package script 只是执行材料；修改 `package.json` 不会自动批准新 recipe。Windows Job Object 只约束进程生命周期，不提供文件系统、网络、权限或不可信项目代码沙箱；经批准的 package script 仍会执行项目代码。
 
 ## 本机权限模型
 
@@ -105,15 +108,12 @@ ChatGPT 网页版
     v
 C2C Local Bridge  ---- Cloudflare Tunnel
     |
-    | 权限门控的 Workspace / Git / Host Observation
+    | 权限门控的 Workspace / Git / Host Observation / bounded execution
     v
-本地 Workspace
-    ^
-    | 命令、构建、测试
-Codex
+本地 Workspace  ---- C2C Native Helper ---- 本机已批准的 recipe
 ```
 
-ChatGPT 通过 C2C Local 检查和修改已经授权的文件；Shell、构建、测试和较大的实施流程仍由 Codex 执行。
+ChatGPT 可以通过 C2C Local 检查、修改已授权文件，并启动由本机操作者明确批准的 bounded recipe。C2C 不提供任意 Shell MCP 或调用方自带命令字符串。
 
 ## 安全边界
 
@@ -122,7 +122,7 @@ ChatGPT 通过 C2C Local 检查和修改已经授权的文件；Shell、构建�
 - 凭据、密钥、SSH、`.env*` 等敏感文件默认拒绝，`.env.example` 允许读取。
 - `.c2cignore` 可以增加项目自己的排除规则。
 - 文件修改必须同时满足 OAuth scope 和本机 permission mode。
-- MCP 不提供 Shell、任意命令、Git commit 或远程权限提升工具。
+- Execution 工具只接受 C2C 本机策略批准的具名 recipe；MCP 不提供 Shell、调用方自带命令字符串、Git commit 或远程权限提升工具。
 
 详细资料：[安全](docs/security.md) · [架构](docs/architecture.md) · [协议](docs/protocol.md) · [故障排查](docs/troubleshooting.md) · [本机权限](docs/local-permission-model-requirements.zh-CN.md)
 

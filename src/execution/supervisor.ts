@@ -12,6 +12,7 @@ import { findTrustedCommand, CommandNotApprovedError, type TrustedCommand } from
 import { ExecutionJobStore, MAX_JOBS_PER_WORKSPACE, type ReadJobOutputResult } from "./job-store.js";
 import { transitionExecutionJob } from "./state-machine.js";
 import { WindowsNativeExecutionRunner, type NativeRunnerHandle } from "./native-runner.js";
+import { ExecutionTempOwner } from "./execution-temp.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
 
 export const MAX_EXECUTION_TIMEOUT_SECONDS = 3600;
@@ -42,6 +43,7 @@ export type ExecutionServiceErrorCode =
   | "EXECUTABLE_UNAVAILABLE"
   | "EXECUTION_HELPER_UNAVAILABLE"
   | "JOB_STORE_FULL"
+  | "STORE_CORRUPT"
   | "IDEMPOTENCY_CONFLICT"
   | "NOT_FOUND"
   | "CANCEL_NOT_ALLOWED"
@@ -53,7 +55,7 @@ export type StartExecutionResult =
 
 export type CancelExecutionResult =
   | { ok: true; job: ExecutionJob }
-  | { ok: false; error: "NOT_FOUND" | "CANCEL_NOT_ALLOWED" };
+  | { ok: false; error: "NOT_FOUND" | "CANCEL_NOT_ALLOWED" | "STORE_CORRUPT" };
 
 export interface ExecutionRunner {
   start(request: {
@@ -62,6 +64,7 @@ export interface ExecutionRunner {
     trustedCommand: TrustedCommand;
     timeoutSeconds: number;
     stateDirectory: string;
+    tempOwner: ExecutionTempOwner;
   }, callbacks: {
     onOutput: (stream: OutputStream, data: Buffer) => void;
     onDiagnostic?: (message: string) => void;
@@ -105,6 +108,7 @@ function cleanCode(value: string): string {
 export class ExecutionSupervisor {
   readonly store: ExecutionJobStore;
   private readonly runner: ExecutionRunner;
+  private readonly tempOwner: ExecutionTempOwner;
   private readonly active = new Map<string, ActiveExecution>();
   private accepting = true;
   private closed = false;
@@ -121,6 +125,8 @@ export class ExecutionSupervisor {
     } = {}
   ) {
     this.store = options.store ?? new ExecutionJobStore(workspace.id);
+    this.tempOwner = new ExecutionTempOwner(this.store.directory, workspace.id);
+    if (!this.store.corruption) this.tempOwner.reconcileStaleTemps();
     this.runner = options.runner ?? new WindowsNativeExecutionRunner();
     this.permissionPollMs = options.permissionPollMs ?? EXECUTION_PERMISSION_POLL_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? EXECUTION_CANCEL_GRACE_MS;
@@ -136,6 +142,7 @@ export class ExecutionSupervisor {
 
   start(input: StartExecutionInput): StartExecutionResult {
     if (!this.accepting) return { ok: false, error: "SUPERVISOR_CLOSING" };
+    if (this.store.corruption) return { ok: false, error: "STORE_CORRUPT" };
     if (!input || typeof input !== "object" || !isExecutionKind(input.kind) || !validTarget(input.kind, input.target)) {
       return { ok: false, error: "INVALID_ARGUMENTS" };
     }
@@ -249,6 +256,7 @@ export class ExecutionSupervisor {
   }
 
   cancel(jobId: string, clientId: string): CancelExecutionResult {
+    if (this.store.corruption) return { ok: false, error: "STORE_CORRUPT" };
     const job = this.getForClient(jobId, clientId);
     if (!job) return { ok: false, error: "NOT_FOUND" };
     if (job.state === "queued") {
@@ -337,6 +345,7 @@ export class ExecutionSupervisor {
         trustedCommand,
         timeoutSeconds: job.timeoutSeconds,
         stateDirectory: this.store.directory,
+        tempOwner: this.tempOwner,
       }, {
         onOutput: (stream, data) => this.onOutput(job.jobId, stream, data, active),
       });
@@ -508,6 +517,13 @@ export class ExecutionSupervisor {
       if (job && !job.finishedAt) {
         active.handle.abandon();
         this.store.replace(transitionExecutionJob(job, "interrupted", { failureCode: "SHUTDOWN_UNCONFIRMED" }));
+      }
+    }
+    if (!this.store.corruption) {
+      try {
+        this.tempOwner.reconcileStaleTemps(new Set(this.active.keys()));
+      } catch {
+        /* unknown or replaced temp roots are preserved for conservative recovery */
       }
     }
     clearInterval(this.permissionTimer);

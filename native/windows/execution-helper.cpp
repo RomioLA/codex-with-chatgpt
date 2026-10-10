@@ -4,6 +4,7 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <cwchar>
 #include <iterator>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -34,8 +36,8 @@ constexpr BYTE kFrameStdout = 1;
 constexpr BYTE kFrameStderr = 2;
 constexpr BYTE kFrameResult = 3;
 
-constexpr BYTE kRequestMagic[8] = {'C', '2', 'C', 'J', 'O', 'B', '1', 0};
-constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '1', 0};
+constexpr BYTE kRequestMagic[8] = {'C', '2', 'C', 'J', 'O', 'B', '2', 0};
+constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '2', 0};
 
 struct UniqueHandle {
     HANDLE value = INVALID_HANDLE_VALUE;
@@ -77,10 +79,23 @@ struct Request {
     BYTE kind = 0;
     DWORD timeoutSeconds = 0;
     std::wstring cwd;
+    std::wstring gitDirectory;
+    std::wstring gitDirectoryFileIdentity;
+    std::wstring commonGitDirectory;
+    std::wstring commonGitDirectoryFileIdentity;
     std::wstring nodeExecutable;
+    std::wstring nodeFileIdentity;
     std::wstring managerCli;
+    std::wstring managerFileIdentity;
+    std::wstring managerHash;
     std::wstring target;
     std::wstring jobTempDir;
+    std::wstring jobTempFileIdentity;
+    std::wstring repositoryFileIdentity;
+    std::wstring gitEntryFileIdentity;
+    BYTE gitEntryType = 0;
+    std::wstring gitEntryHash;
+    std::wstring packageJsonHash;
 };
 
 enum class ControlEvent : int {
@@ -272,7 +287,7 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         return false;
     }
 
-    if (version != 1 || recipe != 1 || reservedByte != 0 || reservedWord != 0 ||
+    if (version != 2 || recipe != 1 || reservedByte != 0 || reservedWord != 0 ||
         (request.manager != 1 && request.manager != 2) ||
         request.kind < 1 || request.kind > 5 ||
         request.timeoutSeconds < 1 || request.timeoutSeconds > 3600) {
@@ -281,10 +296,29 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
     }
 
     if (!ReadString(input, kMaxFieldBytes, request.cwd, error) ||
+        !ReadString(input, kMaxFieldBytes, request.gitDirectory, error) ||
+        !ReadString(input, kMaxFieldBytes, request.gitDirectoryFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.commonGitDirectory, error) ||
+        !ReadString(input, kMaxFieldBytes, request.commonGitDirectoryFileIdentity, error) ||
         !ReadString(input, kMaxFieldBytes, request.nodeExecutable, error) ||
+        !ReadString(input, kMaxFieldBytes, request.nodeFileIdentity, error) ||
         !ReadString(input, kMaxFieldBytes, request.managerCli, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerHash, error) ||
         !ReadString(input, kMaxTargetBytes, request.target, error) ||
-        !ReadString(input, kMaxFieldBytes, request.jobTempDir, error)) {
+        !ReadString(input, kMaxFieldBytes, request.jobTempDir, error) ||
+        !ReadString(input, kMaxFieldBytes, request.jobTempFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.repositoryFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.gitEntryFileIdentity, error) ||
+        !ReadByte(input, request.gitEntryType, error) ||
+        !ReadString(input, kMaxFieldBytes, request.gitEntryHash, error) ||
+        !ReadString(input, kMaxFieldBytes, request.packageJsonHash, error)) {
+        return false;
+    }
+    if ((request.gitEntryType != 1 && request.gitEntryType != 2) ||
+        request.managerHash.size() != 64 || request.gitEntryHash.size() != 64 ||
+        request.packageJsonHash.size() != 64) {
+        error = ERROR_INVALID_DATA;
         return false;
     }
     return true;
@@ -443,6 +477,14 @@ bool ValidateRequestPaths(Request& request, DWORD& error) {
         return false;
     }
     request.cwd = std::move(canonical);
+    if (!ValidateCanonicalPath(request.gitDirectory, true, canonical, error)) {
+        return false;
+    }
+    request.gitDirectory = std::move(canonical);
+    if (!ValidateCanonicalPath(request.commonGitDirectory, true, canonical, error)) {
+        return false;
+    }
+    request.commonGitDirectory = std::move(canonical);
     if (!ValidateCanonicalPath(request.nodeExecutable, false, canonical, error)) {
         return false;
     }
@@ -451,10 +493,249 @@ bool ValidateRequestPaths(Request& request, DWORD& error) {
         return false;
     }
     request.managerCli = std::move(canonical);
+    if (!ValidateCanonicalPath(request.gitEntryType == 2
+                                   ? request.cwd + L"\\.git"
+                                   : request.cwd + L"\\.git",
+                               request.gitEntryType == 2, canonical, error)) {
+        return false;
+    }
     if (!ValidateCanonicalPath(request.jobTempDir, true, canonical, error)) {
         return false;
     }
     request.jobTempDir = std::move(canonical);
+    return true;
+}
+
+bool SameOrdinal(const std::wstring& left, const std::wstring& right) {
+    return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+bool FileIdentity(HANDLE handle, std::wstring& identity, DWORD& error) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(handle, &info)) {
+        error = GetLastError();
+        return false;
+    }
+    const std::uint64_t index =
+        (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    std::wostringstream value;
+    value << std::hex << std::nouppercase << info.dwVolumeSerialNumber << L":" << index;
+    identity = value.str();
+    return true;
+}
+
+bool DirectoryAttributes(HANDLE handle, DWORD& error) {
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &info, sizeof(info))) {
+        error = GetLastError();
+        return false;
+    }
+    if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        error = ERROR_REPARSE_TAG_INVALID;
+        return false;
+    }
+    if ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        error = ERROR_DIRECTORY;
+        return false;
+    }
+    return true;
+}
+
+bool OpenDirectoryLock(const std::wstring& path, const std::wstring* expectedIdentity,
+                       std::vector<UniqueHandle>& locks, DWORD& error) {
+    UniqueHandle handle(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                    nullptr));
+    if (!handle.valid()) {
+        error = GetLastError();
+        return false;
+    }
+    if (!DirectoryAttributes(handle.get(), error)) return false;
+    if (expectedIdentity != nullptr) {
+        std::wstring actual;
+        if (!FileIdentity(handle.get(), actual, error) || !SameOrdinal(actual, *expectedIdentity)) {
+            if (error == ERROR_SUCCESS) error = ERROR_FILE_INVALID;
+            return false;
+        }
+    }
+    locks.push_back(std::move(handle));
+    return true;
+}
+
+bool LockDirectoryPath(const std::wstring& path, const std::wstring* expectedIdentity,
+                       std::vector<UniqueHandle>& locks, DWORD& error) {
+    if (!IsAsciiDriveAbsolutePath(path)) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
+    std::wstring componentPath = path.substr(0, 3);
+    if (!OpenDirectoryLock(componentPath, nullptr, locks, error)) return false;
+    size_t cursor = 3;
+    while (cursor < path.size()) {
+        const size_t separator = path.find(L'\\', cursor);
+        const size_t end = separator == std::wstring::npos ? path.size() : separator;
+        componentPath += path.substr(cursor, end - cursor);
+        const bool finalComponent = end == path.size();
+        if (!OpenDirectoryLock(componentPath,
+                               finalComponent ? expectedIdentity : nullptr,
+                               locks, error)) {
+            return false;
+        }
+        if (!finalComponent) componentPath.push_back(L'\\');
+        cursor = end + 1;
+    }
+    return true;
+}
+
+bool Sha256(HANDLE file, std::wstring& hex, DWORD& error) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectLength = 0;
+    DWORD digestLength = 0;
+    DWORD resultLength = 0;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        error = ERROR_GEN_FAILURE;
+        return false;
+    }
+    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                               reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+                               &resultLength, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        error = ERROR_GEN_FAILURE;
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    status = BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+                               reinterpret_cast<PUCHAR>(&digestLength), sizeof(digestLength),
+                               &resultLength, 0);
+    if (!BCRYPT_SUCCESS(status) || digestLength != 32) {
+        error = ERROR_GEN_FAILURE;
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    std::vector<BYTE> object(objectLength);
+    std::vector<BYTE> digest(digestLength);
+    status = BCryptCreateHash(algorithm, &hash, object.data(), objectLength, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        error = ERROR_GEN_FAILURE;
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    LARGE_INTEGER beginning{};
+    if (!SetFilePointerEx(file, beginning, nullptr, FILE_BEGIN)) {
+        error = GetLastError();
+        BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    std::vector<BYTE> buffer(64 * 1024);
+    for (;;) {
+        DWORD received = 0;
+        if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &received, nullptr)) {
+            error = GetLastError();
+            BCryptDestroyHash(hash);
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return false;
+        }
+        if (received == 0) break;
+        status = BCryptHashData(hash, buffer.data(), received, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            error = ERROR_GEN_FAILURE;
+            BCryptDestroyHash(hash);
+            BCryptCloseAlgorithmProvider(algorithm, 0);
+            return false;
+        }
+    }
+    status = BCryptFinishHash(hash, digest.data(), digestLength, 0);
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        error = ERROR_GEN_FAILURE;
+        return false;
+    }
+    std::wostringstream value;
+    value << std::hex << std::nouppercase;
+    for (BYTE byte : digest) {
+        value.width(2);
+        value.fill(L'0');
+        value << static_cast<unsigned int>(byte);
+    }
+    hex = value.str();
+    return true;
+}
+
+bool OpenFileLock(const std::wstring& path, const std::wstring* expectedIdentity,
+                  const std::wstring* expectedHash, std::vector<UniqueHandle>& locks,
+                  DWORD& error) {
+    UniqueHandle handle(CreateFileW(path.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+                                    FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!handle.valid()) {
+        error = GetLastError();
+        return false;
+    }
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    if (!GetFileInformationByHandleEx(handle.get(), FileAttributeTagInfo,
+                                      &info, sizeof(info))) {
+        error = GetLastError();
+        return false;
+    }
+    if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        error = ERROR_REPARSE_TAG_INVALID;
+        return false;
+    }
+    if (expectedIdentity != nullptr) {
+        std::wstring actualIdentity;
+        if (!FileIdentity(handle.get(), actualIdentity, error) ||
+            !SameOrdinal(actualIdentity, *expectedIdentity)) {
+            if (error == ERROR_SUCCESS) error = ERROR_FILE_INVALID;
+            return false;
+        }
+    }
+    if (expectedHash != nullptr) {
+        std::wstring actualHash;
+        if (!Sha256(handle.get(), actualHash, error) || !SameOrdinal(actualHash, *expectedHash)) {
+            if (error == ERROR_SUCCESS) error = ERROR_CRC;
+            return false;
+        }
+    }
+    locks.push_back(std::move(handle));
+    return true;
+}
+
+bool LockExecutionMaterials(const Request& request, std::vector<UniqueHandle>& locks,
+                            DWORD& error) {
+    if (!LockDirectoryPath(request.cwd, &request.repositoryFileIdentity, locks, error) ||
+        !LockDirectoryPath(request.gitDirectory, &request.gitDirectoryFileIdentity, locks, error) ||
+        !LockDirectoryPath(request.commonGitDirectory, &request.commonGitDirectoryFileIdentity, locks, error) ||
+        !LockDirectoryPath(request.jobTempDir, &request.jobTempFileIdentity, locks, error)) {
+        return false;
+    }
+    const std::wstring gitEntryPath = request.cwd + L"\\.git";
+    if (request.gitEntryType == 2) {
+        if (!LockDirectoryPath(gitEntryPath, &request.gitEntryFileIdentity, locks, error)) return false;
+    } else if (!OpenFileLock(gitEntryPath, &request.gitEntryFileIdentity,
+                             &request.gitEntryHash, locks, error)) {
+        return false;
+    }
+
+    const std::wstring manifestPath = request.cwd + L"\\package.json";
+    if (!OpenFileLock(manifestPath, nullptr, &request.packageJsonHash, locks, error)) return false;
+
+    const auto parentDirectory = [](const std::wstring& file) {
+        const size_t separator = file.find_last_of(L'\\');
+        return separator == 2 ? file.substr(0, 3) : file.substr(0, separator);
+    };
+    if (!LockDirectoryPath(parentDirectory(request.nodeExecutable), nullptr, locks, error) ||
+        !LockDirectoryPath(parentDirectory(request.managerCli), nullptr, locks, error) ||
+        !OpenFileLock(request.nodeExecutable, &request.nodeFileIdentity, nullptr, locks, error) ||
+        !OpenFileLock(request.managerCli, &request.managerFileIdentity,
+                      &request.managerHash, locks, error)) {
+        return false;
+    }
     return true;
 }
 
@@ -684,7 +965,6 @@ bool BuildCommandLine(const Request& request, const ChildEnvironment& environmen
     } else {
         arguments.push_back(L"--config.userconfig=" + environment.userConfig);
         arguments.push_back(L"--config.globalconfig=" + environment.globalConfig);
-        arguments.push_back(L"--config.script-shell=" + environment.comSpec);
         arguments.push_back(L"--config.store-dir=" + environment.pnpmStore);
         arguments.push_back(L"--config.cache-dir=" + environment.pnpmCache);
         arguments.push_back(L"--config.node-options=");
@@ -1105,6 +1385,7 @@ int wmain(int argc, wchar_t**) {
     UniqueHandle nullInput;
     UniqueHandle process;
     UniqueHandle primaryThread;
+    std::vector<UniqueHandle> materialLocks;
     std::thread stdoutPump;
     std::thread stderrPump;
     bool processCreated = false;
@@ -1119,6 +1400,8 @@ int wmain(int argc, wchar_t**) {
             resultError = ERROR_INVALID_DATA;
         }
     } else if (!ValidateRequestPaths(request, resultError)) {
+        outcome = Outcome::HelperError;
+    } else if (!LockExecutionMaterials(request, materialLocks, resultError)) {
         outcome = Outcome::HelperError;
     } else if (!BuildEnvironment(request, environment, resultError)) {
         outcome = Outcome::HelperError;

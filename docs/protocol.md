@@ -134,7 +134,11 @@ is a separate opt-in: `execution_output` (`list` then `read`). Codex nominates
 the log; a **local sanitizer** decides whether ChatGPT may see the body
 (tokens/paths redacted; private keys withheld entirely; size/line caps).
 Restricted items appear in `list` with no body. Old records without output
-stay valid. Never paste logs into the control message.
+stay valid. Sanitizers process stdout and stderr independently and handle
+covered patterns across chunks within each stream. A secret split between
+stdout and stderr is not guaranteed to be detected; minimal child environment
+exposure remains the primary secret protection. Never paste logs into the
+control message.
 
 ### DONE / BLOCKED (ChatGPT → Codex)
 

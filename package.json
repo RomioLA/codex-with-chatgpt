@@ -7,12 +7,22 @@
   "bin": {
     "c2c": "./bin/c2c.js"
   },
+  "files": [
+    "bin/",
+    "dist/",
+    "build/native/c2c-execution-helper.exe",
+    "README.md",
+    "README.zh-CN.md",
+    "docs/security.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run build:execution-helper && tsc -p tsconfig.json",
     "build:execution-helper": "pwsh -NoProfile -File tools/build-execution-helper.ps1",
+    "prepack": "npm run build",
     "dev": "tsx src/cli/index.ts",
     "test": "tsc -p tsconfig.json && vitest run",
     "test:watch": "tsc -p tsconfig.json && vitest",

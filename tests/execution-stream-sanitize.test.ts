@@ -132,4 +132,16 @@ describe("StreamingSanitizer", () => {
     expect(sanitizer.finish()).toBe("short output");
     expect(sanitizer.finish()).toBe("");
   });
+
+  it("keeps stdout and stderr independent and does not claim cross-stream secret detection", () => {
+    const stdout = new StreamingSanitizer();
+    const stderr = new StreamingSanitizer();
+    const prefix = "ghp_123456789012345";
+    const suffix = "67890ABCDEFGHIJKLMNO";
+    const safeStdout = stdout.push(prefix) + stdout.finish();
+    const safeStderr = stderr.push(suffix) + stderr.finish();
+
+    expect(`${safeStdout}${safeStderr}`).toBe(`${prefix}${suffix}`);
+    expect(`${safeStdout}${safeStderr}`).toMatch(/ghp_[A-Za-z0-9]{20,}/);
+  });
 });

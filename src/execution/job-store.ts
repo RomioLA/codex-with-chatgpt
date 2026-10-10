@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { getStateDir, ensureDir, readJsonIfExists } from "../config/paths.js";
+import { getStateDir, ensureDir } from "../config/paths.js";
 import { isExecutionJobState, isExecutionKind, type ExecutionJob, type ExecutionStreamMeta, type OutputStream } from "./job-types.js";
 import { isTerminalExecutionState, transitionExecutionJob } from "./state-machine.js";
 
@@ -16,6 +16,11 @@ interface PersistedJobs {
   jobs: ExecutionJob[];
 }
 
+export interface JobStoreCorruption {
+  code: "STORE_CORRUPT";
+  reason: "read_failed" | "invalid_json" | "unsupported_schema" | "workspace_mismatch" | "invalid_record" | "duplicate_job_id";
+}
+
 export type ReadJobOutputResult =
   | {
       ok: true;
@@ -27,7 +32,24 @@ export type ReadJobOutputResult =
       truncated: boolean;
       text: string;
     }
-  | { ok: false; error: "NOT_FOUND" | "OUTPUT_RESTRICTED" | "INVALID_OFFSET" };
+  | { ok: false; error: "NOT_FOUND" | "OUTPUT_RESTRICTED" | "INVALID_OFFSET" | "STORE_CORRUPT" };
+
+function isUtf8ContinuationByte(value: number | undefined): boolean {
+  return value !== undefined && (value & 0xc0) === 0x80;
+}
+
+function isUtf8Boundary(data: Buffer, offset: number): boolean {
+  return offset <= 0 || offset >= data.byteLength || !isUtf8ContinuationByte(data[offset]);
+}
+
+function hasValidUtf8(data: Buffer): boolean {
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(data);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const EMPTY_STREAM: ExecutionStreamMeta = {
   totalBytes: 0,
@@ -91,6 +113,7 @@ export class ExecutionJobStore {
   readonly directory: string;
   private readonly file: string;
   private readonly jobs = new Map<string, ExecutionJob>();
+  corruption: JobStoreCorruption | null = null;
 
   constructor(readonly workspaceId: string, opts: { directory?: string } = {}) {
     this.directory = opts.directory ?? path.join(getStateDir(), "execution-jobs", workspaceId);
@@ -99,27 +122,74 @@ export class ExecutionJobStore {
     this.load();
   }
 
+  private markCorrupt(reason: JobStoreCorruption["reason"]): void {
+    this.corruption = { code: "STORE_CORRUPT", reason };
+    this.jobs.clear();
+  }
+
   private load(): void {
-    const raw = readJsonIfExists<unknown>(this.file);
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
-    const persisted = raw as Partial<PersistedJobs>;
-    if (persisted.version !== 1 || persisted.workspaceId !== this.workspaceId || !Array.isArray(persisted.jobs)) return;
-    for (const value of persisted.jobs) {
-      if (isValidJob(value, this.workspaceId)) this.jobs.set(value.jobId, value);
+    let bytes: Buffer;
+    try {
+      const stat = fs.lstatSync(this.file);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        this.markCorrupt("read_failed");
+        return;
+      }
+      bytes = fs.readFileSync(this.file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      this.markCorrupt("read_failed");
+      return;
     }
-    for (const [jobId, job] of this.jobs) {
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+    } catch {
+      this.markCorrupt("invalid_json");
+      return;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      this.markCorrupt("unsupported_schema");
+      return;
+    }
+    const persisted = raw as Partial<PersistedJobs>;
+    if (persisted.version !== 1 || !Array.isArray(persisted.jobs)) {
+      this.markCorrupt("unsupported_schema");
+      return;
+    }
+    if (persisted.workspaceId !== this.workspaceId) {
+      this.markCorrupt("workspace_mismatch");
+      return;
+    }
+
+    const loaded = new Map<string, ExecutionJob>();
+    for (const value of persisted.jobs) {
+      if (!isValidJob(value, this.workspaceId)) {
+        this.markCorrupt("invalid_record");
+        return;
+      }
+      if (loaded.has(value.jobId)) {
+        this.markCorrupt("duplicate_job_id");
+        return;
+      }
+      loaded.set(value.jobId, value);
+    }
+    for (const [jobId, job] of loaded) {
       if (job.state === "queued" || job.state === "running" || job.state === "cancelling") {
-        this.jobs.set(jobId, transitionExecutionJob(job, "interrupted", {
+        loaded.set(jobId, transitionExecutionJob(job, "interrupted", {
           failureCode: "BRIDGE_RESTARTED",
           finishedAt: new Date().toISOString(),
         }));
       }
     }
+    for (const [jobId, job] of loaded) this.jobs.set(jobId, job);
     this.prune();
     this.persist();
   }
 
   private persist(): void {
+    if (this.corruption) throw new Error("STORE_CORRUPT");
     const jobs = [...this.jobs.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     serializeAtomic(this.file, { version: 1, workspaceId: this.workspaceId, jobs } satisfies PersistedJobs);
   }
@@ -167,6 +237,7 @@ export class ExecutionJobStore {
   }
 
   create(job: ExecutionJob): void {
+    if (this.corruption) throw new Error("STORE_CORRUPT");
     if (job.workspaceId !== this.workspaceId || this.jobs.has(job.jobId)) throw new TypeError("Invalid execution job");
     this.prune();
     if (this.jobs.size >= MAX_JOBS_PER_WORKSPACE) throw new Error("JOB_STORE_FULL");
@@ -200,6 +271,7 @@ export class ExecutionJobStore {
   }
 
   replace(job: ExecutionJob): void {
+    if (this.corruption) throw new Error("STORE_CORRUPT");
     if (job.workspaceId !== this.workspaceId || !this.jobs.has(job.jobId)) throw new TypeError("Unknown execution job");
     this.jobs.set(job.jobId, job);
     this.persist();
@@ -235,7 +307,8 @@ export class ExecutionJobStore {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
       retained = bytes;
     }
-    const dropped = Math.max(0, retained.byteLength - MAX_OUTPUT_BYTES_PER_STREAM);
+    let dropped = Math.max(0, retained.byteLength - MAX_OUTPUT_BYTES_PER_STREAM);
+    while (dropped < retained.byteLength && isUtf8ContinuationByte(retained[dropped])) dropped += 1;
     if (dropped > 0) retained = retained.subarray(dropped);
     try {
       fs.writeFileSync(file, retained, { mode: 0o600 });
@@ -267,6 +340,7 @@ export class ExecutionJobStore {
   }
 
   readOutput(jobId: string, stream: OutputStream, requestedOffset = 0, requestedBytes = MAX_OUTPUT_READ_BYTES): ReadJobOutputResult {
+    if (this.corruption) return { ok: false, error: "STORE_CORRUPT" };
     const job = this.jobs.get(jobId);
     if (!job) return { ok: false, error: "NOT_FOUND" };
     if (!Number.isSafeInteger(requestedOffset) || requestedOffset < 0 || !Number.isSafeInteger(requestedBytes) || requestedBytes < 1) {
@@ -287,10 +361,13 @@ export class ExecutionJobStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { ok: false, error: "OUTPUT_RESTRICTED" };
     }
-    if (data.byteLength !== meta.retainedBytes) return { ok: false, error: "OUTPUT_RESTRICTED" };
+    if (data.byteLength !== meta.retainedBytes || !hasValidUtf8(data)) return { ok: false, error: "OUTPUT_RESTRICTED" };
     const relative = offset - meta.oldestAvailableOffset;
-    const byteCount = Math.min(requestedBytes, MAX_OUTPUT_READ_BYTES, Math.max(0, data.byteLength - relative));
-    const nextOffset = offset + byteCount;
+    if (!isUtf8Boundary(data, relative)) return { ok: false, error: "INVALID_OFFSET" };
+    const requestedCount = Math.min(requestedBytes, MAX_OUTPUT_READ_BYTES, Math.max(0, data.byteLength - relative));
+    let end = relative + requestedCount;
+    while (end < data.byteLength && isUtf8ContinuationByte(data[end])) end += 1;
+    const nextOffset = meta.oldestAvailableOffset + end;
     return {
       ok: true,
       stream,
@@ -299,7 +376,7 @@ export class ExecutionJobStore {
       oldestAvailableOffset: meta.oldestAvailableOffset,
       eof: isTerminalExecutionState(job.state) && nextOffset >= meta.totalBytes,
       truncated: meta.truncated || requestedOffset < meta.oldestAvailableOffset,
-      text: data.subarray(relative, relative + byteCount).toString("utf8"),
+      text: data.subarray(relative, end).toString("utf8"),
     };
   }
 }

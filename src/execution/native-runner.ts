@@ -8,6 +8,8 @@ import type { HelperRequest, HelperResultFrame } from "./helper-protocol.js";
 import { HelperOutputDecoder, HELPER_CANCEL_BYTE, serializeHelperRequest } from "./helper-protocol.js";
 import type { OutputStream } from "./job-types.js";
 import { redact } from "../logger/index.js";
+import type { ExecutionTempOwner } from "./execution-temp.js";
+import { resolveTrustedRuntime } from "./runtime-discovery.js";
 
 export interface NativeRunnerCallbacks {
   onOutput: (stream: OutputStream, data: Buffer) => void;
@@ -31,68 +33,39 @@ export interface NativeRunnerRequest {
   trustedCommand: TrustedCommand;
   timeoutSeconds: number;
   stateDirectory: string;
+  tempOwner: ExecutionTempOwner;
 }
 
-function helperCandidates(): string[] {
-  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
-  return [
-    path.resolve(moduleDirectory, "../../build/native/c2c-execution-helper.exe"),
-    path.resolve(moduleDirectory, "../../../build/native/c2c-execution-helper.exe"),
-  ];
-}
-
-export function resolveExecutionHelperPath(): string {
-  if (process.platform !== "win32") throw new Error("EXECUTION_HELPER_UNAVAILABLE");
-  for (const candidate of helperCandidates()) {
-    try {
-      const stat = fs.lstatSync(candidate);
-      if (!stat.isFile() || stat.isSymbolicLink()) continue;
-      const canonical = fs.realpathSync.native(candidate);
-      if (path.basename(canonical).toLowerCase() !== "c2c-execution-helper.exe") continue;
-      return canonical;
-    } catch {
-      /* try the other fixed package-relative location */
+export function resolveExecutionHelperPath(options: {
+  platform?: NodeJS.Platform;
+  architecture?: string;
+  moduleDirectory?: string;
+} = {}): string {
+  if ((options.platform ?? process.platform) !== "win32" ||
+      (options.architecture ?? process.arch) !== "x64") {
+    throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+  }
+  const moduleDirectory = options.moduleDirectory ?? path.dirname(fileURLToPath(import.meta.url));
+  const candidate = path.resolve(moduleDirectory, "../../build/native/c2c-execution-helper.exe");
+  try {
+    const absolute = path.resolve(candidate);
+    const parsed = path.parse(absolute);
+    let current = parsed.root;
+    for (const component of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, component);
+      if (fs.lstatSync(current).isSymbolicLink()) throw new Error("EXECUTION_HELPER_UNAVAILABLE");
     }
-  }
-  throw new Error("EXECUTION_HELPER_UNAVAILABLE");
-}
-
-function fixedNodeTools(packageManager: "npm" | "pnpm"): { nodeExecutable: string; managerCli: string } {
-  if (process.platform !== "win32") throw new Error("EXECUTABLE_UNAVAILABLE");
-  const nodeExecutable = fs.realpathSync.native(process.execPath);
-  if (path.basename(nodeExecutable).toLowerCase() !== "node.exe") throw new Error("EXECUTABLE_UNAVAILABLE");
-  const nodeDirectory = path.dirname(nodeExecutable);
-  const managerCli = packageManager === "npm"
-    ? path.join(nodeDirectory, "node_modules", "npm", "bin", "npm-cli.js")
-    : path.join(nodeDirectory, "node_modules", "pnpm", "bin", "pnpm.cjs");
-  let canonicalCli: string;
-  try {
-    const stat = fs.lstatSync(managerCli);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error();
-    canonicalCli = fs.realpathSync.native(managerCli);
+    const stat = fs.lstatSync(candidate);
+    const canonical = fs.realpathSync.native(candidate);
+    if (!stat.isFile() || stat.isSymbolicLink() ||
+        path.basename(canonical).toLowerCase() !== "c2c-execution-helper.exe" ||
+        path.resolve(canonical).toLowerCase() !== path.resolve(candidate).toLowerCase()) {
+      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    }
+    return canonical;
   } catch {
-    throw new Error("EXECUTABLE_UNAVAILABLE");
+    throw new Error("EXECUTION_HELPER_UNAVAILABLE");
   }
-  const relative = path.relative(nodeDirectory, canonicalCli);
-  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error("EXECUTABLE_UNAVAILABLE");
-  }
-  if (path.basename(canonicalCli).toLowerCase() !== (packageManager === "npm" ? "npm-cli.js" : "pnpm.cjs")) {
-    throw new Error("EXECUTABLE_UNAVAILABLE");
-  }
-  return { nodeExecutable, managerCli: canonicalCli };
-}
-
-function makeJobTempDir(stateDirectory: string, jobId: string): string {
-  const directory = path.join(stateDirectory, `tmp-${jobId}`);
-  try {
-    fs.mkdirSync(directory, { mode: 0o700 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const stat = fs.lstatSync(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("TEMP_DIRECTORY_INVALID");
-  }
-  return fs.realpathSync.native(directory);
 }
 
 /** Only the fixed C2C native helper can be launched by this adapter. */
@@ -106,18 +79,8 @@ export class WindowsNativeExecutionRunner {
 
   start(request: NativeRunnerRequest, callbacks: NativeRunnerCallbacks): NativeRunnerHandle {
     const helperPath = this.options.helperPath ?? resolveExecutionHelperPath();
-    const { nodeExecutable, managerCli } = fixedNodeTools(request.trustedCommand.packageManager);
-    const jobTempDir = makeJobTempDir(request.stateDirectory, request.jobId);
-    const input = serializeHelperRequest({
-      packageManager: request.trustedCommand.packageManager,
-      kind: request.trustedCommand.kind,
-      timeoutSeconds: request.timeoutSeconds,
-      cwd: request.repository.canonicalPath,
-      nodeExecutable,
-      managerCli,
-      target: request.trustedCommand.target,
-      jobTempDir,
-    });
+    const runtime = resolveTrustedRuntime(request.trustedCommand.packageManager);
+    const jobTempDir = request.tempOwner.create(request.jobId);
 
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
     const systemDirectory = path.join(systemRoot, "System32");
@@ -130,8 +93,32 @@ export class WindowsNativeExecutionRunner {
       TMP: jobTempDir,
     };
     const spawnImpl = this.options.spawnImpl ?? spawn;
+    let input: Buffer;
     let child: ChildProcessWithoutNullStreams;
     try {
+      input = serializeHelperRequest({
+        packageManager: request.trustedCommand.packageManager,
+        kind: request.trustedCommand.kind,
+        timeoutSeconds: request.timeoutSeconds,
+        cwd: request.repository.canonicalPath,
+        gitDirectory: request.repository.gitDirectory,
+        gitDirectoryFileIdentity: request.repository.fileIdentities.gitDirectory,
+        commonGitDirectory: request.repository.commonGitDirectory,
+        commonGitDirectoryFileIdentity: request.repository.fileIdentities.commonGitDirectory,
+        nodeExecutable: runtime.nodeExecutable,
+        nodeFileIdentity: runtime.nodeFileIdentity,
+        managerCli: runtime.managerCli,
+        managerFileIdentity: runtime.managerFileIdentity,
+        managerHash: runtime.managerHash,
+        target: request.trustedCommand.target,
+        jobTempDir,
+        jobTempFileIdentity: request.tempOwner.fileIdentity(request.jobId),
+        repositoryFileIdentity: request.repository.fileIdentities.repository,
+        gitEntryFileIdentity: request.repository.fileIdentities.gitEntry,
+        gitEntryType: request.repository.gitEntryType,
+        gitEntryHash: request.repository.gitEntryHash,
+        packageJsonHash: request.trustedCommand.packageJsonHash,
+      });
       child = spawnImpl(helperPath, [], {
         cwd: request.repository.canonicalPath,
         env,
@@ -140,6 +127,7 @@ export class WindowsNativeExecutionRunner {
         shell: false,
       }) as ChildProcessWithoutNullStreams;
     } catch (error) {
+      request.tempOwner.cleanup(request.jobId);
       throw new Error("EXECUTION_HELPER_START_FAILED", { cause: error });
     }
 
@@ -149,6 +137,7 @@ export class WindowsNativeExecutionRunner {
     let diagnostics = "";
     let cancelSent = false;
     let abandoned = false;
+    let spawnError: Error | null = null;
 
     const completion = new Promise<NativeRunnerCompletion>((resolve, reject) => {
       child.stdout.on("data", (data: Buffer) => {
@@ -167,8 +156,18 @@ export class WindowsNativeExecutionRunner {
       child.stderr.on("data", (data: Buffer) => {
         diagnostics = (diagnostics + Buffer.from(data).toString("utf8")).slice(-4096);
       });
-      child.once("error", (error) => reject(new Error("EXECUTION_HELPER_START_FAILED", { cause: error })));
+      child.once("error", (error) => {
+        spawnError = new Error("EXECUTION_HELPER_START_FAILED", { cause: error });
+      });
       child.once("close", (code) => {
+        if (!request.tempOwner.cleanup(request.jobId)) {
+          reject(new Error("EXECUTION_TEMP_CLEANUP_FAILED"));
+          return;
+        }
+        if (spawnError) {
+          reject(spawnError);
+          return;
+        }
         if (protocolError) {
           reject(new Error("EXECUTION_HELPER_PROTOCOL_FAILED", { cause: protocolError }));
           return;

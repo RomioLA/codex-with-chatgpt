@@ -1,7 +1,7 @@
 # C2C Local
 
 > Local-first ChatGPT ↔ Codex bridge with permissioned workspace access.
-> ChatGPT reasons, reviews, and works with authorized local files; Codex keeps command, build, and test execution.
+> ChatGPT reasons and reviews. Through C2C Local it can also start bounded execution recipes that a local operator explicitly approved.
 
 [简体中文](README.zh-CN.md)
 
@@ -15,8 +15,11 @@ This repository is **RomioLA's C2C Local fork** of [XiaoDuoYa/codex-with-chatgpt
 - Supports permitted reads/writes outside the workspace without exposing unrestricted host filesystem access.
 - Targets nested repositories and Git worktrees with `git_info(repository_path)`, `git_status(repository_path)`, and `git_diff(repository_path)`.
 - Exposes bounded, read-only Windows Host Observation for process, listener, network, DNS, path, and host context inspection.
+- Starts locally approved, bounded test/build/lint/typecheck or named package-script recipes through the execution tools.
 - Includes Windows bridge/tunnel state handling, recovery, and autostart support.
-- Does **not** expose an arbitrary shell, arbitrary command execution, remote permission elevation, or unrestricted Git commands.
+- Does **not** expose an arbitrary shell, caller-supplied command strings, remote permission elevation, or unrestricted Git commands.
+
+Execution approval is held in C2C's local trusted-command policy. A package script is execution material; changing `package.json` never approves a new recipe. Windows Job Objects contain process lifetime only. They do not sandbox filesystem, network, privileges, or untrusted project code; an approved package script still executes project code.
 
 ## Permission model
 
@@ -105,15 +108,12 @@ ChatGPT Web
     v
 C2C Local Bridge  ---- Cloudflare tunnel
     |
-    | permission-gated workspace / Git / host observation
+    | permission-gated workspace / Git / host observation / bounded execution
     v
-Local Workspace
-    ^
-    | commands, builds, tests
-Codex
+Local Workspace  ---- C2C native helper ---- locally approved recipe
 ```
 
-ChatGPT can inspect and modify authorized files through C2C Local. Codex remains the execution side for shell commands, builds, tests, and larger implementation workflows.
+ChatGPT can inspect and modify authorized files through C2C Local and start bounded recipes that a local operator explicitly approved. C2C exposes no arbitrary Shell MCP or caller-supplied command strings.
 
 ## Security boundaries
 
@@ -122,7 +122,7 @@ ChatGPT can inspect and modify authorized files through C2C Local. Codex remains
 - Sensitive files such as credentials, keys, SSH material, and `.env*` are denied by default, with `.env.example` allowed.
 - `.c2cignore` can add project-specific exclusions.
 - File mutation requires both OAuth scope and the local permission mode.
-- There is no MCP shell, arbitrary command tool, Git commit tool, or remote permission-elevation tool.
+- The execution tool accepts only a named recipe approved by C2C's local policy; there is no MCP shell, caller-supplied command string, Git commit tool, or remote permission-elevation tool.
 
 See [security](docs/security.md), [architecture](docs/architecture.md), [protocol](docs/protocol.md), [troubleshooting](docs/troubleshooting.md), and [local permission requirements](docs/local-permission-model-requirements.zh-CN.md).
 

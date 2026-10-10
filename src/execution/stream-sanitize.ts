@@ -3,7 +3,8 @@
  *
  * Instances are per stream. The private-key look-behind and token look-behind
  * are fixed size; open-ended secret values are consumed by state rather than
- * retained in a line-sized buffer.
+ * retained in a line-sized buffer. Separate stdout and stderr instances do not
+ * detect a secret split between those streams.
  */
 
 const PRIVATE_KEY_HEADER = /-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|-----BEGIN PGP PRIVATE KEY BLOCK-----/;

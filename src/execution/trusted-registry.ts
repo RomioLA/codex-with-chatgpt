@@ -15,6 +15,7 @@ export interface TrustedCommand {
   target: string;
   packageManager: PackageManager;
   scriptHash: string;
+  packageJsonHash: string;
   approvedAt: string;
   approvalSource: "local-cli";
 }
@@ -43,23 +44,36 @@ function validKindTarget(kind: ExecutionKind, target: string): boolean {
   return kind === "package_script";
 }
 
-function readPackageScript(canonicalRepositoryPath: string, target: string): string {
+interface PackageExecutionMaterial {
+  script: string;
+  packageJsonHash: string;
+}
+
+function readPackageExecutionMaterial(canonicalRepositoryPath: string, target: string): PackageExecutionMaterial {
   if (!TARGET_PATTERN.test(target)) throw new CommandNotApprovedError();
   const manifest = path.join(canonicalRepositoryPath, "package.json");
   try {
     if (fs.lstatSync(manifest).isSymbolicLink()) throw new CommandNotApprovedError();
     if (fs.realpathSync.native(manifest) !== manifest) throw new CommandNotApprovedError();
-    const root = JSON.parse(fs.readFileSync(manifest, "utf8")) as { scripts?: unknown };
+    const bytes = fs.readFileSync(manifest);
+    const root = JSON.parse(bytes.toString("utf8")) as { scripts?: unknown };
     if (!root.scripts || typeof root.scripts !== "object" || Array.isArray(root.scripts)) {
       throw new CommandNotApprovedError();
     }
     const script = (root.scripts as Record<string, unknown>)[target];
     if (typeof script !== "string" || script.trim() === "") throw new CommandNotApprovedError();
-    return script;
+    return {
+      script,
+      packageJsonHash: createHash("sha256").update(bytes).digest("hex"),
+    };
   } catch (error) {
     if (error instanceof CommandNotApprovedError) throw error;
     throw new CommandNotApprovedError();
   }
+}
+
+function readPackageScript(canonicalRepositoryPath: string, target: string): string {
+  return readPackageExecutionMaterial(canonicalRepositoryPath, target).script;
 }
 
 export function readPackageScriptForApproval(canonicalRepositoryPath: string, target: string): string {
@@ -112,7 +126,8 @@ export function approveTrustedCommand(input: {
     throw new CommandNotApprovedError();
   }
   if (input.packageManager !== "npm" && input.packageManager !== "pnpm") throw new CommandNotApprovedError();
-  const currentScriptHash = scriptHash(readPackageScript(input.canonicalRepositoryPath, input.target));
+  const material = readPackageExecutionMaterial(input.canonicalRepositoryPath, input.target);
+  const currentScriptHash = scriptHash(material.script);
   const entry: TrustedCommand = {
     workspaceId: input.workspaceId,
     repositoryIdentity: input.repositoryIdentity,
@@ -121,6 +136,7 @@ export function approveTrustedCommand(input: {
     target: input.target,
     packageManager: input.packageManager,
     scriptHash: currentScriptHash,
+    packageJsonHash: material.packageJsonHash,
     approvedAt: new Date().toISOString(),
     approvalSource: "local-cli",
   };
@@ -175,7 +191,9 @@ export function findTrustedCommand(input: {
     item.approvalSource === "local-cli"
   );
   if (!entry) throw new CommandNotApprovedError();
-  const currentHash = scriptHash(readPackageScript(input.canonicalRepositoryPath, input.target));
-  if (currentHash !== entry.scriptHash) throw new CommandNotApprovedError();
+  const material = readPackageExecutionMaterial(input.canonicalRepositoryPath, input.target);
+  if (scriptHash(material.script) !== entry.scriptHash || material.packageJsonHash !== entry.packageJsonHash) {
+    throw new CommandNotApprovedError();
+  }
   return entry;
 }

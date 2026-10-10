@@ -702,6 +702,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
       const denied = requireExecutionScope(extra.authInfo, "execution.run");
       if (denied) return denied;
       if (!ctx.executionSupervisor) return fail("EXECUTION_UNAVAILABLE", "The execution supervisor is unavailable.");
+      const storeCorrupt = ctx.executionSupervisor.store.corruption;
+      if (storeCorrupt) return fail(storeCorrupt.code, `Execution job store is corrupt (${storeCorrupt.reason}). The original evidence was preserved; old jobs were not attached or rerun.`);
       const result = ctx.executionSupervisor.start({
         repositoryPath: args.repository_path,
         kind: args.kind,
@@ -729,6 +731,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
       const denied = requireExecutionScope(extra.authInfo, "execution.jobs.read");
       if (denied) return denied;
       if (!ctx.executionSupervisor) return fail("EXECUTION_UNAVAILABLE", "The execution supervisor is unavailable.");
+      const storeCorrupt = ctx.executionSupervisor.store.corruption;
+      if (storeCorrupt) return fail(storeCorrupt.code, `Execution job store is corrupt (${storeCorrupt.reason}). The original evidence was preserved; old jobs were not attached or rerun.`);
       const job = ctx.executionSupervisor.getForClient(args.job_id, extra.authInfo!.clientId);
       if (!job) return fail("NOT_FOUND", "No execution job is available to this OAuth client.");
       return okStructured({ available: true, job: executionJobView(job) });
@@ -748,6 +752,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
       const denied = requireExecutionScope(extra.authInfo, "execution.jobs.read");
       if (denied) return denied;
       if (!ctx.executionSupervisor) return fail("EXECUTION_UNAVAILABLE", "The execution supervisor is unavailable.");
+      const storeCorrupt = ctx.executionSupervisor.store.corruption;
+      if (storeCorrupt) return fail(storeCorrupt.code, `Execution job store is corrupt (${storeCorrupt.reason}). The original evidence was preserved; old jobs were not attached or rerun.`);
       const jobs = ctx.executionSupervisor.listForClient(extra.authInfo!.clientId, args.limit)
         .map(executionJobView);
       return okStructured({ jobs });
@@ -780,6 +786,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
     async (args, extra) => {
       const denied = requireExecutionScope(extra.authInfo, "execution.jobs.read");
       if (denied) return denied;
+      const storeCorrupt = ctx.executionSupervisor?.store.corruption;
+      if (storeCorrupt) return fail(storeCorrupt.code, `Execution job store is corrupt (${storeCorrupt.reason}). The original evidence was preserved; old jobs were not attached or rerun.`);
       const result = ctx.executionSupervisor?.readOutputForClient(
         args.job_id,
         extra.authInfo!.clientId,
@@ -816,7 +824,10 @@ export function createMcpServer(ctx: McpContext): McpServer {
     async (args, extra) => {
       const denied = requireExecutionScope(extra.authInfo, "execution.cancel");
       if (denied) return denied;
-      const result = ctx.executionSupervisor?.cancel(args.job_id, extra.authInfo!.clientId);
+      if (!ctx.executionSupervisor) return fail("EXECUTION_UNAVAILABLE", "The execution supervisor is unavailable.");
+      const storeCorrupt = ctx.executionSupervisor.store.corruption;
+      if (storeCorrupt) return fail(storeCorrupt.code, `Execution job store is corrupt (${storeCorrupt.reason}). The original evidence was preserved; old jobs were not attached or rerun.`);
+      const result = ctx.executionSupervisor.cancel(args.job_id, extra.authInfo!.clientId);
       if (!result) return fail("EXECUTION_UNAVAILABLE", "The execution supervisor is unavailable.");
       if (!result.ok) return fail(result.error, result.error);
       return okStructured({ job: executionJobView(result.job) });

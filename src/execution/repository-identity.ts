@@ -13,6 +13,14 @@ export interface RepositoryIdentity {
   workspaceRelativePath: string;
   gitDirectory: string;
   commonGitDirectory: string;
+  gitEntryType: "file" | "directory";
+  gitEntryHash: string;
+  fileIdentities: {
+    repository: string;
+    gitDirectory: string;
+    commonGitDirectory: string;
+    gitEntry: string;
+  };
 }
 
 export class RepositoryIdentityError extends Error {
@@ -115,14 +123,43 @@ export function resolveRepositoryIdentity(workspace: Workspace, requestedPath: s
   }
   assertNoReparseComponents(workspace.root, canonicalTop);
 
+  const gitEntryPath = path.join(canonicalTop, ".git");
+  let gitEntryType: "file" | "directory";
+  let gitEntryHash = "0".repeat(64);
+  let gitEntryFileIdentity: string;
+  try {
+    const gitEntry = fs.lstatSync(gitEntryPath, { bigint: true });
+    if (gitEntry.isSymbolicLink()) throw new RepositoryIdentityError("REPARSE_POINT");
+    if (gitEntry.isDirectory()) {
+      gitEntryType = "directory";
+    } else if (gitEntry.isFile()) {
+      gitEntryType = "file";
+      gitEntryHash = createHash("sha256").update(fs.readFileSync(gitEntryPath)).digest("hex");
+    } else {
+      throw new RepositoryIdentityError("INVALID_REPOSITORY");
+    }
+    gitEntryFileIdentity = `${gitEntry.dev.toString(16)}:${gitEntry.ino.toString(16)}`;
+  } catch (error) {
+    if (error instanceof RepositoryIdentityError) throw error;
+    throw new RepositoryIdentityError("INVALID_REPOSITORY");
+  }
+  const fileIdentities = {
+    repository: directoryFileIdentity(canonicalTop),
+    gitDirectory: directoryFileIdentity(canonicalGitDir),
+    commonGitDirectory: directoryFileIdentity(canonicalCommon),
+    gitEntry: gitEntryFileIdentity,
+  };
   const material = JSON.stringify([
     workspace.id,
     normPath(canonicalTop),
     normPath(canonicalGitDir),
     normPath(canonicalCommon),
-    directoryFileIdentity(canonicalTop),
-    directoryFileIdentity(canonicalGitDir),
-    directoryFileIdentity(canonicalCommon),
+    fileIdentities.repository,
+    fileIdentities.gitDirectory,
+    fileIdentities.commonGitDirectory,
+    gitEntryType,
+    fileIdentities.gitEntry,
+    gitEntryHash,
   ]);
   const identity = createHash("sha256").update(material).digest("hex");
   return {
@@ -131,5 +168,8 @@ export function resolveRepositoryIdentity(workspace: Workspace, requestedPath: s
     workspaceRelativePath: selected.rel || ".",
     gitDirectory: canonicalGitDir,
     commonGitDirectory: canonicalCommon,
+    gitEntryType,
+    gitEntryHash,
+    fileIdentities,
   };
 }
