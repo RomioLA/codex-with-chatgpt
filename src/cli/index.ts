@@ -76,6 +76,7 @@ import {
   type AutostartStatus,
 } from "../autostart/registration.js";
 import { restoreRegisteredWorkspace } from "../autostart/restore.js";
+import { recordLaunchBreadcrumb } from "../autostart/launch-breadcrumb.js";
 import { WindowsAutostartAdapter, WindowsRunKeyAutostart, WindowsTaskScheduler } from "../autostart/windows-task.js";
 
 const program = new Command();
@@ -550,6 +551,7 @@ autostartCmd
   .requiredOption("--workspace <path>")
   .action(async (opts: { workspaceId: string; workspace: string }) => {
     if (process.platform !== "win32") return;
+    recordLaunchBreadcrumb("restore_handler_entered", opts.workspaceId);
     const workspaceRoot = path.resolve(opts.workspace);
     try {
       const service = createAutostartService();
@@ -1812,6 +1814,12 @@ function handleCliError(error: unknown, json: boolean): void {
   process.exitCode = 1;
 }
 
+// All CLI imports and command registrations have completed; parsing/dispatch has not.
+const autostartLaunchArgs = process.argv.slice(2);
+if (autostartLaunchArgs.length === 6 && autostartLaunchArgs[0] === "autostart"
+  && autostartLaunchArgs[1] === "restore" && autostartLaunchArgs[2] === "--workspace-id") {
+  recordLaunchBreadcrumb("cli_loaded", autostartLaunchArgs[3]);
+}
 program.parseAsync(process.argv).catch((error: Error) => {
   cross(error.message);
   process.exit(1);

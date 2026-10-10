@@ -222,20 +222,41 @@ export function buildHiddenPowerShellAction(input: {
   workingDirectory: string;
   environment: Record<string, string>;
   powershellPath: string;
+  diagnostics?: { stateDir: string; workspaceId: string; cliPath: string };
 }): ScheduledTaskAction {
+  if (input.diagnostics && !/^[a-f0-9]{12}$/i.test(input.diagnostics.workspaceId)) {
+    throw new Error("Invalid autostart workspace ID for Task diagnostics.");
+  }
   const payload = Buffer.from(JSON.stringify({
     nodePath: input.nodePath,
     arguments: quoteWindowsCommandLine(input.nodeArguments),
     workingDirectory: input.workingDirectory,
     environment: input.environment,
+    diagnostics: input.diagnostics ?? null,
   }), "utf8").toString("base64");
+  // The Task wrapper must not wait: Task Scheduler limits execution to three minutes.
+  // Only fixed diagnostic fields are persisted, never the environment or raw exceptions.
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
-    "foreach ($property in $payload.environment.PSObject.Properties) { [Environment]::SetEnvironmentVariable($property.Name, [string]$property.Value, 'Process') }",
-    "Start-Process -FilePath $payload.nodePath -ArgumentList $payload.arguments -WorkingDirectory $payload.workingDirectory -WindowStyle Hidden",
-    "exit 0",
-  ].join("; ");
+    "$diagnostics = $payload.diagnostics",
+    "$logFile = $null",
+    "if ($null -ne $diagnostics -and $diagnostics.workspaceId -match '^[a-fA-F0-9]{12}$') { try { $diagDir = Join-Path $diagnostics.stateDir 'autostart\\diagnostics'; [void][IO.Directory]::CreateDirectory($diagDir); $logFile = Join-Path $diagDir ($diagnostics.workspaceId + '.launch.log') } catch { $logFile = $null } }",
+    "function Write-C2CEvent { param([string]$Stage, [object]$NodePid = $null, [object]$Code = $null); if ($null -eq $logFile) { return }; try { $entry = [ordered]@{ stage = $Stage; workspaceId = [string]$diagnostics.workspaceId; checkedAt = [DateTime]::UtcNow.ToString('o'); wrapperPid = $PID; nodePid = $NodePid; exitCode = $Code; stateDir = [string]$diagnostics.stateDir; cwd = [string]$payload.workingDirectory; nodePath = [string]$payload.nodePath; cliPath = [string]$diagnostics.cliPath }; $json = ConvertTo-Json -InputObject $entry -Compress; [IO.File]::AppendAllText($logFile, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false)) } catch { } }",
+    "Write-C2CEvent 'wrapper_entered'",
+    "try {",
+    "  foreach ($property in $payload.environment.PSObject.Properties) { [Environment]::SetEnvironmentVariable($property.Name, [string]$property.Value, 'Process') }",
+    "  Write-C2CEvent 'node_launch_attempted'",
+    "  $node = Start-Process -FilePath $payload.nodePath -ArgumentList $payload.arguments -WorkingDirectory $payload.workingDirectory -WindowStyle Hidden -PassThru",
+    "  Write-C2CEvent 'node_launched' $node.Id",
+    "  Write-C2CEvent 'wrapper_exited' $node.Id 0",
+    "  exit 0",
+    "} catch {",
+    "  Write-C2CEvent 'node_launch_failed'",
+    "  Write-C2CEvent 'wrapper_exited' $null 1",
+    "  exit 1",
+    "}",
+  ].join("\n");
   const encodedScript = Buffer.from(script, "utf16le").toString("base64");
   return {
     command: input.powershellPath,
@@ -272,12 +293,18 @@ export function buildAutostartPowerShellAction(
   const shellPath = options.powershellPath ?? (systemRoot
     ? path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     : "powershell.exe");
+  const helperPath = path.resolve(path.dirname(path.resolve(cliModulePath)), "..", "autostart", "launch-breadcrumb.js");
+  const nodeArguments = restoreNodeArguments(cliModulePath, registration);
+  if (path.extname(path.resolve(cliModulePath)).toLowerCase() !== ".ts" && fs.existsSync(helperPath)) {
+    nodeArguments.unshift("--import", pathToFileURL(helperPath).href);
+  }
   return buildHiddenPowerShellAction({
     nodePath: options.nodePath ?? process.execPath,
-    nodeArguments: restoreNodeArguments(cliModulePath, registration),
+    nodeArguments,
     workingDirectory: packageRootForCli(cliModulePath),
     environment: { ...(options.environment ?? {}), C2C_STATE_DIR: stateDir },
     powershellPath: shellPath,
+    diagnostics: { stateDir, workspaceId: registration.workspaceId, cliPath: path.resolve(cliModulePath) },
   });
 }
 

@@ -4,6 +4,8 @@ import path from "node:path";
 export type LaunchBreadcrumbStage =
   | "node_started"
   | "node_exited"
+  | "cli_loaded"
+  | "restore_handler_entered"
   | "restore_entered"
   | "restore_completed"
   | "restore_failed"
