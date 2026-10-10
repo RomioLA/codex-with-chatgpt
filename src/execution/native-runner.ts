@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { TrustedCommand } from "./trusted-registry.js";
@@ -8,8 +9,9 @@ import type { HelperRequest, HelperResultFrame } from "./helper-protocol.js";
 import { HelperOutputDecoder, HELPER_CANCEL_BYTE, serializeHelperRequest } from "./helper-protocol.js";
 import type { OutputStream } from "./job-types.js";
 import { redact } from "../logger/index.js";
-import type { ExecutionTempOwner } from "./execution-temp.js";
-import { resolveTrustedRuntime } from "./runtime-discovery.js";
+import type { ExecutionTempLease } from "./execution-temp.js";
+import { resolveTrustedRuntime, type TrustedRuntime } from "./runtime-discovery.js";
+import { runExecutionTempCleanup } from "./execution-temp-cleanup.js";
 
 export interface NativeRunnerCallbacks {
   onOutput: (stream: OutputStream, data: Buffer) => void;
@@ -19,6 +21,7 @@ export interface NativeRunnerCallbacks {
 export interface NativeRunnerCompletion {
   result: HelperResultFrame;
   helperExitCode: number | null;
+  tempCleanupConfirmed?: boolean;
 }
 
 export interface NativeRunnerHandle {
@@ -33,33 +36,62 @@ export interface NativeRunnerRequest {
   trustedCommand: TrustedCommand;
   timeoutSeconds: number;
   stateDirectory: string;
-  tempOwner: ExecutionTempOwner;
+  tempLease: ExecutionTempLease;
 }
 
 export function resolveExecutionHelperPath(options: {
   platform?: NodeJS.Platform;
   architecture?: string;
   moduleDirectory?: string;
+  helperPath?: string;
 } = {}): string {
   if ((options.platform ?? process.platform) !== "win32" ||
       (options.architecture ?? process.arch) !== "x64") {
     throw new Error("EXECUTION_HELPER_UNAVAILABLE");
   }
   const moduleDirectory = options.moduleDirectory ?? path.dirname(fileURLToPath(import.meta.url));
-  const candidate = path.resolve(moduleDirectory, "../../build/native/c2c-execution-helper.exe");
+  const packageRoot = path.resolve(moduleDirectory, "../..");
+  const expectedHelper = path.resolve(packageRoot, "build/native/c2c-execution-helper.exe");
+  const candidate = options.helperPath ? path.resolve(options.helperPath) : expectedHelper;
+  const metadataPath = path.resolve(packageRoot, "dist/execution/c2c-execution-helper-integrity.json");
   try {
     const absolute = path.resolve(candidate);
-    const parsed = path.parse(absolute);
-    let current = parsed.root;
-    for (const component of absolute.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
-      current = path.join(current, component);
-      if (fs.lstatSync(current).isSymbolicLink()) throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    if (absolute.toLowerCase() !== expectedHelper.toLowerCase()) throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    for (const file of [metadataPath, absolute]) {
+      const parsed = path.parse(file);
+      let current = parsed.root;
+      for (const component of file.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+        current = path.join(current, component);
+        if (fs.lstatSync(current).isSymbolicLink()) throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+      }
     }
     const stat = fs.lstatSync(candidate);
     const canonical = fs.realpathSync.native(candidate);
     if (!stat.isFile() || stat.isSymbolicLink() ||
         path.basename(canonical).toLowerCase() !== "c2c-execution-helper.exe" ||
-        path.resolve(canonical).toLowerCase() !== path.resolve(candidate).toLowerCase()) {
+        path.resolve(canonical).toLowerCase() !== expectedHelper.toLowerCase()) {
+      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    }
+    const metadataStat = fs.lstatSync(metadataPath);
+    if (!metadataStat.isFile() || metadataStat.isSymbolicLink() ||
+        path.resolve(fs.realpathSync.native(metadataPath)).toLowerCase() !== metadataPath.toLowerCase()) {
+      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    }
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as {
+      version?: unknown; protocolVersion?: unknown; helperPath?: unknown; sha256?: unknown;
+    };
+    if (metadata.version !== 1 || metadata.protocolVersion !== 5 ||
+        metadata.helperPath !== "build/native/c2c-execution-helper.exe" ||
+        typeof metadata.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.sha256)) {
+      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    }
+    const bytes = fs.readFileSync(canonical);
+    if (bytes.byteLength < 0x40 || bytes.toString("ascii", 0, 2) !== "MZ") {
+      throw new Error("EXECUTION_HELPER_UNAVAILABLE");
+    }
+    const peOffset = bytes.readUInt32LE(0x3c);
+    if (peOffset > bytes.byteLength - 4 || bytes.toString("binary", peOffset, peOffset + 4) !== "PE\0\0" ||
+        createHash("sha256").update(bytes).digest("hex") !== metadata.sha256) {
       throw new Error("EXECUTION_HELPER_UNAVAILABLE");
     }
     return canonical;
@@ -73,14 +105,25 @@ export class WindowsNativeExecutionRunner {
   constructor(
     private readonly options: {
       helperPath?: string;
+      moduleDirectory?: string;
       spawnImpl?: typeof spawn;
+      runtimeResolver?: typeof resolveTrustedRuntime;
+      beforeHelperRequestWrite?: (runtime: TrustedRuntime) => void;
     } = {}
   ) {}
 
   start(request: NativeRunnerRequest, callbacks: NativeRunnerCallbacks): NativeRunnerHandle {
-    const helperPath = this.options.helperPath ?? resolveExecutionHelperPath();
-    const runtime = resolveTrustedRuntime(request.trustedCommand.packageManager);
-    const jobTempDir = request.tempOwner.create(request.jobId);
+    const helperPath = resolveExecutionHelperPath({
+      helperPath: this.options.helperPath,
+      moduleDirectory: this.options.moduleDirectory,
+    });
+    const runtime = (this.options.runtimeResolver ?? resolveTrustedRuntime)(request.trustedCommand.packageManager);
+    const jobTempDir = request.tempLease.directoryPath;
+    const stateRoot = path.resolve(request.tempLease.rootPath, "..", "..", "..");
+    const expectedTempRoot = path.join(stateRoot, "execution-jobs", request.tempLease.workspaceId, "execution-temp");
+    if (path.resolve(request.tempLease.rootPath).toLowerCase() !== path.resolve(expectedTempRoot).toLowerCase()) {
+      throw new Error("EXECUTION_TEMP_OWNERSHIP_INVALID");
+    }
 
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
     const systemDirectory = path.join(systemRoot, "System32");
@@ -89,6 +132,7 @@ export class WindowsNativeExecutionRunner {
       WINDIR: systemRoot,
       PATH: systemDirectory,
       ComSpec: path.join(systemDirectory, "cmd.exe"),
+      C2C_STATE_DIR: stateRoot,
       TEMP: jobTempDir,
       TMP: jobTempDir,
     };
@@ -107,12 +151,37 @@ export class WindowsNativeExecutionRunner {
         commonGitDirectoryFileIdentity: request.repository.fileIdentities.commonGitDirectory,
         nodeExecutable: runtime.nodeExecutable,
         nodeFileIdentity: runtime.nodeFileIdentity,
+        nodeHash: runtime.nodeHash,
         managerCli: runtime.managerCli,
         managerFileIdentity: runtime.managerFileIdentity,
         managerHash: runtime.managerHash,
+        managerLibCli: runtime.managerLibCli,
+        managerLibCliFileIdentity: runtime.managerLibCliFileIdentity,
+        managerLibCliHash: runtime.managerLibCliHash,
+        managerValidateEngines: runtime.managerValidateEngines,
+        managerValidateEnginesFileIdentity: runtime.managerValidateEnginesFileIdentity,
+        managerValidateEnginesHash: runtime.managerValidateEnginesHash,
+        managerMainEntry: runtime.managerMainEntry,
+        managerMainEntryFileIdentity: runtime.managerMainEntryFileIdentity,
+        managerMainEntryHash: runtime.managerMainEntryHash,
+        managerPackageJson: runtime.managerPackageJson,
+        managerPackageJsonFileIdentity: runtime.managerPackageJsonFileIdentity,
+        managerPackageJsonHash: runtime.managerPackageJsonHash,
+        managerExitHandler: runtime.managerExitHandler,
+        managerExitHandlerFileIdentity: runtime.managerExitHandlerFileIdentity,
+        managerExitHandlerHash: runtime.managerExitHandlerHash,
+        managerCore: runtime.managerCore,
+        managerCoreFileIdentity: runtime.managerCoreFileIdentity,
+        managerCoreHash: runtime.managerCoreHash,
         target: request.trustedCommand.target,
+        tempRootPath: request.tempLease.rootPath,
+        tempRootFileIdentity: request.tempLease.rootFileIdentity,
+        tempWorkspaceId: request.tempLease.workspaceId,
+        tempJobId: request.tempLease.jobId,
+        tempNonce: request.tempLease.nonce,
+        tempCreatedAtMs: request.tempLease.createdAtMs,
         jobTempDir,
-        jobTempFileIdentity: request.tempOwner.fileIdentity(request.jobId),
+        jobTempFileIdentity: request.tempLease.directoryFileIdentity,
         repositoryFileIdentity: request.repository.fileIdentities.repository,
         gitEntryFileIdentity: request.repository.fileIdentities.gitEntry,
         gitEntryType: request.repository.gitEntryType,
@@ -126,8 +195,19 @@ export class WindowsNativeExecutionRunner {
         windowsHide: true,
         shell: false,
       }) as ChildProcessWithoutNullStreams;
+      try {
+        this.options.beforeHelperRequestWrite?.(runtime);
+      } catch (error) {
+        child.stdin.destroy();
+        throw error;
+      }
     } catch (error) {
-      request.tempOwner.cleanup(request.jobId);
+      try {
+        runExecutionTempCleanup(request.tempLease, request.stateDirectory,
+          (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)));
+      } catch {
+        /* Keep the persisted ownership record for a later identity-checked recovery. */
+      }
       throw new Error("EXECUTION_HELPER_START_FAILED", { cause: error });
     }
 
@@ -160,7 +240,8 @@ export class WindowsNativeExecutionRunner {
         spawnError = new Error("EXECUTION_HELPER_START_FAILED", { cause: error });
       });
       child.once("close", (code) => {
-        if (!request.tempOwner.cleanup(request.jobId)) {
+        if (!runExecutionTempCleanup(request.tempLease, request.stateDirectory,
+          (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)))) {
           reject(new Error("EXECUTION_TEMP_CLEANUP_FAILED"));
           return;
         }
@@ -183,8 +264,12 @@ export class WindowsNativeExecutionRunner {
           reject(new Error("EXECUTION_HELPER_RESULT_MISSING"));
           return;
         }
-        if (diagnostics) callbacks.onDiagnostic?.(redact(diagnostics).slice(-512));
-        resolve({ result: frameResult, helperExitCode: code });
+        if (diagnostics || frameResult.outcome === 3) {
+          const resultDiagnostic = `helper outcome=${frameResult.outcome}; win32Error=${frameResult.win32Error}; ` +
+            `exitCode=${frameResult.exitCode}`;
+          callbacks.onDiagnostic?.(redact([diagnostics, resultDiagnostic].filter(Boolean).join("\n")).slice(-512));
+        }
+        resolve({ result: frameResult, helperExitCode: code, tempCleanupConfirmed: true });
       });
     });
 

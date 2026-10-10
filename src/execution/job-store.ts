@@ -78,6 +78,7 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     (job.finishedAt === null || typeof job.finishedAt === "string") &&
     Number.isSafeInteger(job.timeoutSeconds) && job.timeoutSeconds! >= 1 && job.timeoutSeconds! <= 3600 &&
     typeof job.idempotencyKeyHash === "string" && /^[a-f0-9]{64}$/.test(job.idempotencyKeyHash) &&
+    (job.tempOwnership === undefined || job.tempOwnership === null || isTempOwnership(job.tempOwnership)) &&
     (job.exitCode === null || Number.isInteger(job.exitCode)) &&
     (job.failureCode === null || typeof job.failureCode === "string") &&
     isStreamMeta(job.stdout) && isStreamMeta(job.stderr);
@@ -91,6 +92,15 @@ function isStreamMeta(value: unknown): value is ExecutionStreamMeta {
     Number.isSafeInteger(meta.oldestAvailableOffset) && meta.oldestAvailableOffset! >= 0 &&
     typeof meta.truncated === "boolean" &&
     (meta.restrictedReason === null || typeof meta.restrictedReason === "string");
+}
+
+function isTempOwnership(value: unknown): value is NonNullable<ExecutionJob["tempOwnership"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const ownership = value as Partial<NonNullable<ExecutionJob["tempOwnership"]>>;
+  return typeof ownership.rootFileIdentity === "string" && /^[a-f0-9]+:[a-f0-9]+$/i.test(ownership.rootFileIdentity) &&
+    typeof ownership.directoryFileIdentity === "string" && /^[a-f0-9]+:[a-f0-9]+$/i.test(ownership.directoryFileIdentity) &&
+    typeof ownership.nonce === "string" && /^[a-f0-9]{64}$/i.test(ownership.nonce) &&
+    Number.isSafeInteger(ownership.createdAtMs) && ownership.createdAtMs! >= 0;
 }
 
 function serializeAtomic(file: string, value: unknown): void {
@@ -173,7 +183,7 @@ export class ExecutionJobStore {
         this.markCorrupt("duplicate_job_id");
         return;
       }
-      loaded.set(value.jobId, value);
+      loaded.set(value.jobId, { ...value, tempOwnership: value.tempOwnership ?? null });
     }
     for (const [jobId, job] of loaded) {
       if (job.state === "queued" || job.state === "running" || job.state === "cancelling") {

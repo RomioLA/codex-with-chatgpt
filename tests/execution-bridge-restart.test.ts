@@ -47,6 +47,7 @@ function persistedRunningJob(workspaceId: string, repositoryIdentity: string, cl
     finishedAt: null,
     timeoutSeconds: 30,
     idempotencyKeyHash: "c".repeat(64),
+    tempOwnership: null,
     exitCode: null,
     failureCode: null,
     stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },

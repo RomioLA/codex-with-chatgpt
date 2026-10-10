@@ -14,6 +14,8 @@ import { transitionExecutionJob } from "./state-machine.js";
 import { WindowsNativeExecutionRunner, type NativeRunnerHandle } from "./native-runner.js";
 import { ExecutionTempOwner } from "./execution-temp.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
+import type { Logger } from "../logger/index.js";
+import { nullLogger } from "../logger/index.js";
 
 export const MAX_EXECUTION_TIMEOUT_SECONDS = 3600;
 export const MAX_GLOBAL_EXECUTIONS = 2;
@@ -64,7 +66,7 @@ export interface ExecutionRunner {
     trustedCommand: TrustedCommand;
     timeoutSeconds: number;
     stateDirectory: string;
-    tempOwner: ExecutionTempOwner;
+    tempLease: ReturnType<ExecutionTempOwner["create"]>;
   }, callbacks: {
     onOutput: (stream: OutputStream, data: Buffer) => void;
     onDiagnostic?: (message: string) => void;
@@ -109,6 +111,7 @@ export class ExecutionSupervisor {
   readonly store: ExecutionJobStore;
   private readonly runner: ExecutionRunner;
   private readonly tempOwner: ExecutionTempOwner;
+  private readonly logger: Logger;
   private readonly active = new Map<string, ActiveExecution>();
   private accepting = true;
   private closed = false;
@@ -122,11 +125,24 @@ export class ExecutionSupervisor {
       permissionPollMs?: number;
       cancelGraceMs?: number;
       now?: () => number;
+      logger?: Logger;
     } = {}
   ) {
+    this.logger = options.logger ?? nullLogger;
     this.store = options.store ?? new ExecutionJobStore(workspace.id);
     this.tempOwner = new ExecutionTempOwner(this.store.directory, workspace.id);
-    if (!this.store.corruption) this.tempOwner.reconcileStaleTemps();
+    if (!this.store.corruption) {
+      const records = this.store.listAll().flatMap((job) => job.tempOwnership
+        ? [{ jobId: job.jobId, ownership: job.tempOwnership }]
+        : []);
+      const recovery = this.tempOwner.reconcileStaleTemps(records);
+      if (recovery.skipped > 0) {
+        this.logger.warn("Execution temp recovery preserved unknown or unverified directories", {
+          workspaceId: workspace.id,
+          skipped: recovery.skipped,
+        });
+      }
+    }
     this.runner = options.runner ?? new WindowsNativeExecutionRunner();
     this.permissionPollMs = options.permissionPollMs ?? EXECUTION_PERMISSION_POLL_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? EXECUTION_CANCEL_GRACE_MS;
@@ -221,6 +237,7 @@ export class ExecutionSupervisor {
       finishedAt: null,
       timeoutSeconds: input.timeoutSeconds,
       idempotencyKeyHash,
+      tempOwnership: null,
       exitCode: null,
       failureCode: null,
       stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
@@ -339,15 +356,27 @@ export class ExecutionSupervisor {
     const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
     let active!: ActiveExecution;
     try {
+      const tempLease = this.tempOwner.create(job.jobId);
+      this.store.replace({ ...running, tempOwnership: {
+        rootFileIdentity: tempLease.rootFileIdentity,
+        directoryFileIdentity: tempLease.directoryFileIdentity,
+        nonce: tempLease.nonce,
+        createdAtMs: tempLease.createdAtMs,
+      } });
       const handle = this.runner.start({
         jobId: job.jobId,
         repository,
         trustedCommand,
         timeoutSeconds: job.timeoutSeconds,
         stateDirectory: this.store.directory,
-        tempOwner: this.tempOwner,
+        tempLease,
       }, {
         onOutput: (stream, data) => this.onOutput(job.jobId, stream, data, active),
+        onDiagnostic: (message) => this.logger.warn("Execution helper diagnostic", {
+          workspaceId: this.workspace.id,
+          jobId: job.jobId,
+          message,
+        }),
       });
       const timeoutTimer = setTimeout(() => this.requestTermination(job.jobId, active, "timed_out"), job.timeoutSeconds * 1000 + 1000);
       timeoutTimer.unref?.();
@@ -363,7 +392,7 @@ export class ExecutionSupervisor {
       };
       this.active.set(job.jobId, active);
       active.finished = handle.completion
-        .then((completion) => this.completeJob(job.jobId, active, completion.result))
+        .then((completion) => this.completeJob(job.jobId, active, completion.result, completion.tempCleanupConfirmed === true))
         .catch(() => this.failUnconfirmed(job.jobId, active, "HELPER_UNCONFIRMED"))
         .finally(() => this.releaseActive(job.jobId, active));
     } catch (error) {
@@ -404,7 +433,7 @@ export class ExecutionSupervisor {
     }
   }
 
-  private completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3; exitCode: number; win32Error: number }): void {
+  private completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3; exitCode: number; win32Error: number }, tempCleanupConfirmed: boolean): void {
     this.finishSanitizers(jobId, active);
     const job = this.store.get(jobId);
     if (!job || job.state === "interrupted" || job.finishedAt) return;
@@ -429,7 +458,10 @@ export class ExecutionSupervisor {
       terminal = "failed";
       failureCode = "NONZERO_EXIT";
     }
-    this.store.replace(transitionExecutionJob(job, terminal, { exitCode, failureCode }));
+    this.store.replace(transitionExecutionJob({
+      ...job,
+      tempOwnership: tempCleanupConfirmed ? null : job.tempOwnership,
+    }, terminal, { exitCode, failureCode }));
   }
 
   private failUnconfirmed(jobId: string, active: ActiveExecution, code: string): void {
@@ -521,7 +553,16 @@ export class ExecutionSupervisor {
     }
     if (!this.store.corruption) {
       try {
-        this.tempOwner.reconcileStaleTemps(new Set(this.active.keys()));
+        const records = this.store.listAll().flatMap((job) => job.tempOwnership
+          ? [{ jobId: job.jobId, ownership: job.tempOwnership }]
+          : []);
+        const recovery = this.tempOwner.reconcileStaleTemps(records, new Set(this.active.keys()));
+        if (recovery.skipped > 0) {
+          this.logger.warn("Execution temp cleanup preserved unknown or unverified directories", {
+            workspaceId: this.workspace.id,
+            skipped: recovery.skipped,
+          });
+        }
       } catch {
         /* unknown or replaced temp roots are preserved for conservative recovery */
       }

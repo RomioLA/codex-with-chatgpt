@@ -23,6 +23,13 @@ export interface ExecutionRecipe {
   scriptHash: string;
 }
 
+export interface ExecutionTempOwnership {
+  rootFileIdentity: string;
+  directoryFileIdentity: string;
+  nonce: string;
+  createdAtMs: number;
+}
+
 export interface ExecutionJob {
   jobId: string;
   workspaceId: string;
@@ -36,6 +43,7 @@ export interface ExecutionJob {
   finishedAt: string | null;
   timeoutSeconds: number;
   idempotencyKeyHash: string;
+  tempOwnership: ExecutionTempOwnership | null;
   exitCode: number | null;
   failureCode: string | null;
   stdout: ExecutionStreamMeta;

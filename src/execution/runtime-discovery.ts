@@ -9,9 +9,28 @@ export const PINNED_PNPM_VERSION = "11.24.0";
 export interface TrustedRuntime {
   nodeExecutable: string;
   managerCli: string;
+  managerLibCli: string;
+  managerValidateEngines: string;
+  managerMainEntry: string;
+  managerPackageJson: string;
+  managerExitHandler: string;
+  managerCore: string;
   nodeFileIdentity: string;
+  nodeHash: string;
   managerFileIdentity: string;
   managerHash: string;
+  managerLibCliFileIdentity: string;
+  managerLibCliHash: string;
+  managerValidateEnginesFileIdentity: string;
+  managerValidateEnginesHash: string;
+  managerMainEntryFileIdentity: string;
+  managerMainEntryHash: string;
+  managerPackageJsonFileIdentity: string;
+  managerPackageJsonHash: string;
+  managerExitHandlerFileIdentity: string;
+  managerExitHandlerHash: string;
+  managerCoreFileIdentity: string;
+  managerCoreHash: string;
 }
 
 export interface RuntimeDiscoveryOptions {
@@ -25,10 +44,32 @@ function normalized(value: string): string {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-function fileIdentity(file: string): string {
-  const stat = fs.statSync(file, { bigint: true });
-  if (!stat.isFile() || stat.dev === 0n || stat.ino === 0n) throw new Error("EXECUTABLE_UNAVAILABLE");
-  return `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
+function fileMaterial(file: string): { identity: string; hash: string } {
+  const handle = fs.openSync(file, "r");
+  try {
+    const before = fs.fstatSync(handle, { bigint: true });
+    if (!before.isFile() || before.dev === 0n || before.ino === 0n) throw new Error("EXECUTABLE_UNAVAILABLE");
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    for (;;) {
+      const received = fs.readSync(handle, buffer, 0, buffer.byteLength, position);
+      if (received === 0) break;
+      hash.update(buffer.subarray(0, received));
+      position += received;
+    }
+    const after = fs.fstatSync(handle, { bigint: true });
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
+        before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+      throw new Error("EXECUTABLE_UNAVAILABLE");
+    }
+    return {
+      identity: `${before.dev.toString(16)}:${before.ino.toString(16)}`,
+      hash: hash.digest("hex"),
+    };
+  } finally {
+    fs.closeSync(handle);
+  }
 }
 
 function assertNoReparseComponents(file: string): void {
@@ -72,21 +113,31 @@ function resolveTrustedFile(candidate: string, allowedRoot: string, expectedName
   return fs.realpathSync.native(absoluteCandidate);
 }
 
-function trustedNode(nodeInput: string): { file: string; directory: string; identity: string } {
+function trustedNode(nodeInput: string): { file: string; directory: string; identity: string; hash: string } {
   const file = fs.realpathSync.native(nodeInput);
   if (path.basename(file).toLowerCase() !== "node.exe") throw new Error("EXECUTABLE_UNAVAILABLE");
   assertNoReparseComponents(file);
-  const identity = fileIdentity(file);
-  return { file, directory: path.dirname(file), identity };
+  const material = fileMaterial(file);
+  return { file, directory: path.dirname(file), ...material };
 }
 
-function npmCli(nodeDirectory: string): string {
+type ManagerFiles = [string, string, string, string, string, string, string];
+
+function npmFiles(nodeDirectory: string): ManagerFiles {
   const packageDirectory = path.join(nodeDirectory, "node_modules", "npm");
   requirePackageVersion(packageDirectory, "npm");
-  return resolveTrustedFile(path.join(packageDirectory, "bin", "npm-cli.js"), nodeDirectory, "npm-cli.js");
+  return [
+    resolveTrustedFile(path.join(packageDirectory, "bin", "npm-cli.js"), nodeDirectory, "npm-cli.js"),
+    resolveTrustedFile(path.join(packageDirectory, "lib", "cli.js"), packageDirectory, "cli.js"),
+    resolveTrustedFile(path.join(packageDirectory, "lib", "cli", "validate-engines.js"), packageDirectory, "validate-engines.js"),
+    resolveTrustedFile(path.join(packageDirectory, "lib", "cli", "entry.js"), packageDirectory, "entry.js"),
+    resolveTrustedFile(path.join(packageDirectory, "package.json"), packageDirectory, "package.json"),
+    resolveTrustedFile(path.join(packageDirectory, "lib", "cli", "exit-handler.js"), packageDirectory, "exit-handler.js"),
+    resolveTrustedFile(path.join(packageDirectory, "lib", "npm.js"), packageDirectory, "npm.js"),
+  ];
 }
 
-function pnpmCli(nodeDirectory: string, homeDirectory: string): string {
+function pnpmFiles(nodeDirectory: string, homeDirectory: string): ManagerFiles {
   const candidates = [
     {
       file: path.join(nodeDirectory, "node_modules", "pnpm", "bin", "pnpm.cjs"),
@@ -102,7 +153,11 @@ function pnpmCli(nodeDirectory: string, homeDirectory: string): string {
   for (const candidate of candidates) {
     try {
       requirePackageVersion(candidate.packageDirectory, "pnpm", PINNED_PNPM_VERSION);
-      return resolveTrustedFile(candidate.file, candidate.root, "pnpm.cjs");
+      const cli = resolveTrustedFile(candidate.file, candidate.root, "pnpm.cjs");
+      const launcher = resolveTrustedFile(path.join(candidate.packageDirectory, "bin", "pnpm.mjs"), candidate.root, "pnpm.mjs");
+      const bundle = resolveTrustedFile(path.join(candidate.packageDirectory, "dist", "pnpm.mjs"), candidate.root, "pnpm.mjs");
+      const packageJson = resolveTrustedFile(path.join(candidate.packageDirectory, "package.json"), candidate.root, "package.json");
+      return [cli, launcher, bundle, bundle, packageJson, launcher, bundle];
     } catch {
       /* try only the next fixed, version-pinned runtime location */
     }
@@ -122,15 +177,38 @@ export function resolveTrustedRuntime(
   if ((options.platform ?? process.platform) !== "win32") throw new Error("EXECUTABLE_UNAVAILABLE");
   try {
     const node = trustedNode(options.nodeExecutable ?? process.execPath);
-    const cli = packageManager === "npm"
-      ? npmCli(node.directory)
-      : pnpmCli(node.directory, options.homeDirectory ?? os.homedir());
+    const [cli, libCli, validateEngines, mainEntry, packageJson, exitHandler, core] = packageManager === "npm"
+      ? npmFiles(node.directory)
+      : pnpmFiles(node.directory, options.homeDirectory ?? os.homedir());
+    const [manager, managerLibCli, managerValidateEngines, managerMainEntry] =
+      [cli, libCli, validateEngines, mainEntry].map(fileMaterial);
+    const [managerPackageJson, managerExitHandler, managerCore] =
+      [packageJson, exitHandler, core].map(fileMaterial);
     return {
       nodeExecutable: node.file,
       managerCli: cli,
+      managerLibCli: libCli,
+      managerValidateEngines: validateEngines,
+      managerMainEntry: mainEntry,
+      managerPackageJson: packageJson,
+      managerExitHandler: exitHandler,
+      managerCore: core,
       nodeFileIdentity: node.identity,
-      managerFileIdentity: fileIdentity(cli),
-      managerHash: createHash("sha256").update(fs.readFileSync(cli)).digest("hex"),
+      nodeHash: node.hash,
+      managerFileIdentity: manager.identity,
+      managerHash: manager.hash,
+      managerLibCliFileIdentity: managerLibCli.identity,
+      managerLibCliHash: managerLibCli.hash,
+      managerValidateEnginesFileIdentity: managerValidateEngines.identity,
+      managerValidateEnginesHash: managerValidateEngines.hash,
+      managerMainEntryFileIdentity: managerMainEntry.identity,
+      managerMainEntryHash: managerMainEntry.hash,
+      managerPackageJsonFileIdentity: managerPackageJson.identity,
+      managerPackageJsonHash: managerPackageJson.hash,
+      managerExitHandlerFileIdentity: managerExitHandler.identity,
+      managerExitHandlerHash: managerExitHandler.hash,
+      managerCoreFileIdentity: managerCore.identity,
+      managerCoreHash: managerCore.hash,
     };
   } catch {
     throw new Error("EXECUTABLE_UNAVAILABLE");

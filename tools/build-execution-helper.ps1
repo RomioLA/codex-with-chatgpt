@@ -4,6 +4,7 @@ $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $sourcePath = Join-Path $repoRoot 'native\windows\execution-helper.cpp'
 $buildDir = Join-Path $repoRoot 'build\native'
 $outputPath = Join-Path $buildDir 'c2c-execution-helper.exe'
+$stagingPath = Join-Path $buildDir 'c2c-execution-helper.build.exe'
 $objectPath = Join-Path $buildDir 'execution-helper.obj'
 
 function Remove-BuildObject {
@@ -28,7 +29,7 @@ $compileArguments = @(
     '/DWIN32_LEAN_AND_MEAN',
     '/DNOMINMAX',
     "/Fo$objectPath",
-    "/Fe$outputPath",
+    "/Fe$stagingPath",
     $sourcePath,
     '/link',
     'bcrypt.lib'
@@ -44,6 +45,7 @@ if ($null -ne $compiler) {
         exit $compileExitCode
     }
     Remove-BuildObject
+    Move-Item -LiteralPath $stagingPath -Destination $outputPath -Force
     Write-Output $outputPath
     exit 0
 }
@@ -78,7 +80,7 @@ if (-not (Test-Path -LiteralPath $devCommand -PathType Leaf)) {
 # VsDevCmd must initialize INCLUDE/LIB as well as PATH. Run the fixed compile
 # command in that environment; no request data is interpolated into this script.
 $clCommand = '/nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ' +
-             '/Fo"' + $objectPath + '" /Fe"' + $outputPath + '" "' + $sourcePath + '" /link bcrypt.lib'
+             '/Fo"' + $objectPath + '" /Fe"' + $stagingPath + '" "' + $sourcePath + '" /link bcrypt.lib'
 $command = 'call "' + $devCommand + '" -no_logo -arch=x64 -host_arch=x64 && cl.exe ' + $clCommand
 $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $processInfo.FileName = $env:ComSpec
@@ -95,5 +97,6 @@ if ($process.ExitCode -ne 0) {
 }
 
 Remove-BuildObject
+Move-Item -LiteralPath $stagingPath -Destination $outputPath -Force
 Write-Output $outputPath
 exit 0

@@ -20,8 +20,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "npm run build:execution-helper && tsc -p tsconfig.json",
+    "build": "npm run build:execution-helper && tsc -p tsconfig.json && npm run build:helper-metadata",
     "build:execution-helper": "pwsh -NoProfile -File tools/build-execution-helper.ps1",
+    "build:helper-metadata": "pwsh -NoProfile -File tools/write-execution-helper-integrity.ps1",
     "prepack": "npm run build",
     "dev": "tsx src/cli/index.ts",
     "test": "tsc -p tsconfig.json && vitest run",

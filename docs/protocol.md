@@ -137,7 +137,8 @@ Restricted items appear in `list` with no body. Old records without output
 stay valid. Sanitizers process stdout and stderr independently and handle
 covered patterns across chunks within each stream. A secret split between
 stdout and stderr is not guaranteed to be detected; minimal child environment
-exposure remains the primary secret protection. Never paste logs into the
+exposure reduces accidental disclosure. The sanitizer is not a malicious-code
+data-exfiltration boundary. Never paste logs into the
 control message.
 
 ### DONE / BLOCKED (ChatGPT → Codex)

@@ -256,7 +256,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // cannot strand a lock owned by this still-running process. Every Bridge,
   // including persistRuntime:false instances, must hold it before listening.
   const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id);
-  const supervisor = new ExecutionSupervisor(workspace, { runner: opts.executionRunner });
+  const supervisor = new ExecutionSupervisor(workspace, { runner: opts.executionRunner, logger });
   executionSupervisor = supervisor;
   const listening = await listen(app, host, opts.port ?? DEFAULT_PORT, workspace.id).catch(async (error: unknown) => {
     await supervisor.shutdown().catch(() => undefined);

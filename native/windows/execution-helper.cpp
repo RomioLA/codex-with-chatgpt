@@ -36,8 +36,9 @@ constexpr BYTE kFrameStdout = 1;
 constexpr BYTE kFrameStderr = 2;
 constexpr BYTE kFrameResult = 3;
 
-constexpr BYTE kRequestMagic[8] = {'C', '2', 'C', 'J', 'O', 'B', '2', 0};
-constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '2', 0};
+constexpr BYTE kRequestMagic[8] = {'C', '2', 'C', 'J', 'O', 'B', '5', 0};
+constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '5', 0};
+constexpr BYTE kTempCleanupMagic[8] = {'C', '2', 'C', 'T', 'M', 'P', '1', 0};
 
 struct UniqueHandle {
     HANDLE value = INVALID_HANDLE_VALUE;
@@ -85,10 +86,35 @@ struct Request {
     std::wstring commonGitDirectoryFileIdentity;
     std::wstring nodeExecutable;
     std::wstring nodeFileIdentity;
+    std::wstring nodeHash;
     std::wstring managerCli;
     std::wstring managerFileIdentity;
     std::wstring managerHash;
+    std::wstring managerLibCli;
+    std::wstring managerLibCliFileIdentity;
+    std::wstring managerLibCliHash;
+    std::wstring managerValidateEngines;
+    std::wstring managerValidateEnginesFileIdentity;
+    std::wstring managerValidateEnginesHash;
+    std::wstring managerMainEntry;
+    std::wstring managerMainEntryFileIdentity;
+    std::wstring managerMainEntryHash;
+    std::wstring managerPackageJson;
+    std::wstring managerPackageJsonFileIdentity;
+    std::wstring managerPackageJsonHash;
+    std::wstring managerExitHandler;
+    std::wstring managerExitHandlerFileIdentity;
+    std::wstring managerExitHandlerHash;
+    std::wstring managerCore;
+    std::wstring managerCoreFileIdentity;
+    std::wstring managerCoreHash;
     std::wstring target;
+    std::wstring tempRootPath;
+    std::wstring tempRootFileIdentity;
+    std::wstring tempWorkspaceId;
+    std::wstring tempJobId;
+    std::wstring tempNonce;
+    std::wstring tempCreatedAtMs;
     std::wstring jobTempDir;
     std::wstring jobTempFileIdentity;
     std::wstring repositoryFileIdentity;
@@ -96,6 +122,16 @@ struct Request {
     BYTE gitEntryType = 0;
     std::wstring gitEntryHash;
     std::wstring packageJsonHash;
+};
+
+struct TempCleanupRequest {
+    std::wstring rootPath;
+    std::wstring rootFileIdentity;
+    std::wstring directoryFileIdentity;
+    std::wstring workspaceId;
+    std::wstring jobId;
+    std::wstring nonce;
+    std::wstring createdAtMs;
 };
 
 enum class ControlEvent : int {
@@ -263,6 +299,10 @@ bool ReadString(HANDLE input, DWORD maximumBytes, std::wstring& output, DWORD& e
     return true;
 }
 
+bool IsHex(const std::wstring& value, size_t expectedLength);
+bool IsIdentity(const std::wstring& value);
+bool SameOrdinal(const std::wstring& left, const std::wstring& right);
+
 bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
     BYTE magic[8]{};
     if (!ReadExact(input, magic, static_cast<DWORD>(sizeof(magic)), error)) {
@@ -287,7 +327,7 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         return false;
     }
 
-    if (version != 2 || recipe != 1 || reservedByte != 0 || reservedWord != 0 ||
+    if (version != 5 || recipe != 1 || reservedByte != 0 || reservedWord != 0 ||
         (request.manager != 1 && request.manager != 2) ||
         request.kind < 1 || request.kind > 5 ||
         request.timeoutSeconds < 1 || request.timeoutSeconds > 3600) {
@@ -302,10 +342,35 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         !ReadString(input, kMaxFieldBytes, request.commonGitDirectoryFileIdentity, error) ||
         !ReadString(input, kMaxFieldBytes, request.nodeExecutable, error) ||
         !ReadString(input, kMaxFieldBytes, request.nodeFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.nodeHash, error) ||
         !ReadString(input, kMaxFieldBytes, request.managerCli, error) ||
         !ReadString(input, kMaxFieldBytes, request.managerFileIdentity, error) ||
         !ReadString(input, kMaxFieldBytes, request.managerHash, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerLibCli, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerLibCliFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerLibCliHash, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerValidateEngines, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerValidateEnginesFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerValidateEnginesHash, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerMainEntry, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerMainEntryFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerMainEntryHash, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerPackageJson, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerPackageJsonFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerPackageJsonHash, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerExitHandler, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerExitHandlerFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerExitHandlerHash, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerCore, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerCoreFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.managerCoreHash, error) ||
         !ReadString(input, kMaxTargetBytes, request.target, error) ||
+        !ReadString(input, kMaxFieldBytes, request.tempRootPath, error) ||
+        !ReadString(input, kMaxFieldBytes, request.tempRootFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.tempWorkspaceId, error) ||
+        !ReadString(input, kMaxFieldBytes, request.tempJobId, error) ||
+        !ReadString(input, kMaxFieldBytes, request.tempNonce, error) ||
+        !ReadString(input, kMaxFieldBytes, request.tempCreatedAtMs, error) ||
         !ReadString(input, kMaxFieldBytes, request.jobTempDir, error) ||
         !ReadString(input, kMaxFieldBytes, request.jobTempFileIdentity, error) ||
         !ReadString(input, kMaxFieldBytes, request.repositoryFileIdentity, error) ||
@@ -316,9 +381,46 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         return false;
     }
     if ((request.gitEntryType != 1 && request.gitEntryType != 2) ||
-        request.managerHash.size() != 64 || request.gitEntryHash.size() != 64 ||
-        request.packageJsonHash.size() != 64) {
+        !IsHex(request.nodeHash, 64) || !IsHex(request.managerHash, 64) ||
+        !IsHex(request.managerLibCliHash, 64) || !IsHex(request.managerValidateEnginesHash, 64) ||
+        !IsHex(request.managerMainEntryHash, 64) || !IsHex(request.managerPackageJsonHash, 64) ||
+        !IsHex(request.managerExitHandlerHash, 64) || !IsHex(request.managerCoreHash, 64) ||
+        !IsHex(request.gitEntryHash, 64) ||
+        !IsHex(request.packageJsonHash, 64) ||
+        !IsIdentity(request.nodeFileIdentity) || !IsIdentity(request.managerFileIdentity) ||
+        !IsIdentity(request.managerLibCliFileIdentity) ||
+        !IsIdentity(request.managerValidateEnginesFileIdentity) ||
+        !IsIdentity(request.managerMainEntryFileIdentity) ||
+        !IsIdentity(request.managerPackageJsonFileIdentity) ||
+        !IsIdentity(request.managerExitHandlerFileIdentity) ||
+        !IsIdentity(request.managerCoreFileIdentity)) {
         error = ERROR_INVALID_DATA;
+        return false;
+    }
+    return true;
+}
+
+bool ReadTempCleanupRequest(HANDLE input, TempCleanupRequest& request, DWORD& error) {
+    BYTE magic[8]{};
+    std::uint16_t version = 0;
+    BYTE reservedByte = 0;
+    std::uint16_t reservedWord = 0;
+    if (!ReadExact(input, magic, static_cast<DWORD>(sizeof(magic)), error) ||
+        !std::equal(std::begin(magic), std::end(magic), std::begin(kTempCleanupMagic)) ||
+        !ReadU16(input, version, error) || !ReadByte(input, reservedByte, error) ||
+        !ReadU16(input, reservedWord, error)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        return false;
+    }
+    if (version != 1 || reservedByte != 0 || reservedWord != 0 ||
+        !ReadString(input, kMaxFieldBytes, request.rootPath, error) ||
+        !ReadString(input, kMaxFieldBytes, request.rootFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.directoryFileIdentity, error) ||
+        !ReadString(input, kMaxFieldBytes, request.workspaceId, error) ||
+        !ReadString(input, kMaxFieldBytes, request.jobId, error) ||
+        !ReadString(input, kMaxFieldBytes, request.nonce, error) ||
+        !ReadString(input, kMaxFieldBytes, request.createdAtMs, error)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
         return false;
     }
     return true;
@@ -352,6 +454,11 @@ bool ValidateTarget(const Request& request) {
 std::wstring PathBasename(const std::wstring& path) {
     const size_t separator = path.find_last_of(L'\\');
     return separator == std::wstring::npos ? path : path.substr(separator + 1);
+}
+
+std::wstring ParentDirectory(const std::wstring& path) {
+    const size_t separator = path.find_last_of(L'\\');
+    return separator == 2 ? path.substr(0, 3) : path.substr(0, separator);
 }
 
 bool IsAsciiDriveAbsolutePath(const std::wstring& path) {
@@ -459,6 +566,102 @@ bool IsBasename(const std::wstring& path, const wchar_t* expected) {
     return CompareStringOrdinal(base.c_str(), -1, expected, -1, TRUE) == CSTR_EQUAL;
 }
 
+bool IsSafeLabel(const std::wstring& value, size_t maximumLength);
+bool ReadEnvironmentValue(const wchar_t* name, std::wstring& value, DWORD& error);
+
+bool ExpectedExecutionTempRoot(const std::wstring& workspaceId,
+                               std::wstring& expectedRoot, DWORD& error) {
+    if (!IsSafeLabel(workspaceId, 128)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::wstring stateRoot;
+    if (!ReadEnvironmentValue(L"C2C_STATE_DIR", stateRoot, error)) {
+        if (error != ERROR_SUCCESS) return false;
+        std::wstring localAppData;
+        if (!ReadEnvironmentValue(L"LOCALAPPDATA", localAppData, error)) {
+            if (error != ERROR_SUCCESS) return false;
+            std::wstring profile;
+            if (!ReadEnvironmentValue(L"USERPROFILE", profile, error) || error != ERROR_SUCCESS) {
+                if (error == ERROR_SUCCESS) error = ERROR_PATH_NOT_FOUND;
+                return false;
+            }
+            localAppData = profile + L"\\AppData\\Local";
+        }
+        stateRoot = localAppData + L"\\OpenAI\\c2c-local";
+    }
+
+    std::wstring canonicalStateRoot;
+    if (!ValidateCanonicalPath(stateRoot, true, canonicalStateRoot, error)) return false;
+    const std::wstring candidate = canonicalStateRoot + L"\\execution-jobs\\" +
+                                   workspaceId + L"\\execution-temp";
+    return ValidateCanonicalPath(candidate, true, expectedRoot, error);
+}
+
+bool IsHex(const std::wstring& value, size_t expectedLength) {
+    return value.size() == expectedLength && std::all_of(value.begin(), value.end(), [](wchar_t ch) {
+        return (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') ||
+               (ch >= L'A' && ch <= L'F');
+    });
+}
+
+bool IsIdentity(const std::wstring& value) {
+    const size_t separator = value.find(L':');
+    if (separator == std::wstring::npos || separator == 0 || separator + 1 >= value.size() ||
+        value.find(L':', separator + 1) != std::wstring::npos) return false;
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (i == separator) continue;
+        const wchar_t ch = value[i];
+        if (!((ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') ||
+              (ch >= L'A' && ch <= L'F'))) return false;
+    }
+    return true;
+}
+
+bool IsSafeLabel(const std::wstring& value, size_t maximumLength) {
+    return !value.empty() && value.size() <= maximumLength &&
+        std::all_of(value.begin(), value.end(), [](wchar_t ch) {
+            return IsAsciiAlphaNumeric(ch) || ch == L'_' || ch == L'-';
+        });
+}
+
+bool ReadEnvironmentValue(const wchar_t* name, std::wstring& value, DWORD& error) {
+    const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed == 0) {
+        const DWORD readError = GetLastError();
+        if (readError == ERROR_ENVVAR_NOT_FOUND || readError == ERROR_SUCCESS) {
+            error = ERROR_SUCCESS;
+            return false;
+        }
+        error = readError;
+        return false;
+    }
+    if (needed > 32760) {
+        error = ERROR_FILENAME_EXCED_RANGE;
+        return false;
+    }
+    std::vector<wchar_t> buffer(static_cast<size_t>(needed) + 1, L'\0');
+    const DWORD length = GetEnvironmentVariableW(name, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size()) {
+        error = length == 0 ? GetLastError() : ERROR_FILENAME_EXCED_RANGE;
+        return false;
+    }
+    value.assign(buffer.data(), length);
+    return true;
+}
+
+bool ParseUnsignedDecimal(const std::wstring& value, std::uint64_t& parsed) {
+    if (value.empty()) return false;
+    parsed = 0;
+    for (wchar_t ch : value) {
+        if (ch < L'0' || ch > L'9') return false;
+        const std::uint64_t digit = static_cast<std::uint64_t>(ch - L'0');
+        if (parsed > (UINT64_MAX - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    return true;
+}
+
 bool ValidateRequestPaths(Request& request, DWORD& error) {
     if (!ValidateTarget(request)) {
         error = ERROR_INVALID_DATA;
@@ -493,10 +696,94 @@ bool ValidateRequestPaths(Request& request, DWORD& error) {
         return false;
     }
     request.managerCli = std::move(canonical);
+    const auto parentDirectory = [](const std::wstring& file) {
+        const size_t separator = file.find_last_of(L'\\');
+        return separator == 2 ? file.substr(0, 3) : file.substr(0, separator);
+    };
+    const auto canonicalManagerPath = [&](std::wstring& file) {
+        if (!ValidateCanonicalPath(file, false, canonical, error)) return false;
+        file = std::move(canonical);
+        return true;
+    };
+    if (!canonicalManagerPath(request.managerLibCli) ||
+        !canonicalManagerPath(request.managerValidateEngines) ||
+        !canonicalManagerPath(request.managerMainEntry) ||
+        !canonicalManagerPath(request.managerPackageJson) ||
+        !canonicalManagerPath(request.managerExitHandler) ||
+        !canonicalManagerPath(request.managerCore)) return false;
+    if (request.manager == 1) {
+        const std::wstring npmRoot = parentDirectory(parentDirectory(request.managerCli));
+        const std::wstring expectedLibCli = npmRoot + L"\\lib\\cli.js";
+        const std::wstring expectedValidateEngines = npmRoot + L"\\lib\\cli\\validate-engines.js";
+        const std::wstring expectedMainEntry = npmRoot + L"\\lib\\cli\\entry.js";
+        const std::wstring expectedPackageJson = npmRoot + L"\\package.json";
+        const std::wstring expectedExitHandler = npmRoot + L"\\lib\\cli\\exit-handler.js";
+        const std::wstring expectedCore = npmRoot + L"\\lib\\npm.js";
+        if (CompareStringOrdinal(request.managerLibCli.c_str(), -1, expectedLibCli.c_str(), -1, TRUE) != CSTR_EQUAL ||
+            CompareStringOrdinal(request.managerValidateEngines.c_str(), -1, expectedValidateEngines.c_str(), -1, TRUE) != CSTR_EQUAL ||
+            CompareStringOrdinal(request.managerMainEntry.c_str(), -1, expectedMainEntry.c_str(), -1, TRUE) != CSTR_EQUAL ||
+            CompareStringOrdinal(request.managerPackageJson.c_str(), -1, expectedPackageJson.c_str(), -1, TRUE) != CSTR_EQUAL ||
+            CompareStringOrdinal(request.managerExitHandler.c_str(), -1, expectedExitHandler.c_str(), -1, TRUE) != CSTR_EQUAL ||
+            CompareStringOrdinal(request.managerCore.c_str(), -1, expectedCore.c_str(), -1, TRUE) != CSTR_EQUAL) {
+            error = ERROR_INVALID_NAME;
+            return false;
+        }
+    } else {
+        // pnpm 11's fixed CJS compatibility entry imports bin/pnpm.mjs,
+        // which in turn imports the bundled dist/pnpm.mjs implementation.
+        const std::wstring pnpmRoot = parentDirectory(parentDirectory(request.managerCli));
+        const std::wstring expectedCli = pnpmRoot + L"\\bin\\pnpm.cjs";
+        const std::wstring expectedLauncher = pnpmRoot + L"\\bin\\pnpm.mjs";
+        const std::wstring expectedBundle = pnpmRoot + L"\\dist\\pnpm.mjs";
+        if (!SameOrdinal(request.managerCli, expectedCli) ||
+            !SameOrdinal(request.managerLibCli, expectedLauncher) ||
+            !SameOrdinal(request.managerValidateEngines, expectedBundle) ||
+            !SameOrdinal(request.managerMainEntry, expectedBundle) ||
+            !SameOrdinal(request.managerPackageJson, pnpmRoot + L"\\package.json") ||
+            !SameOrdinal(request.managerExitHandler, expectedLauncher) ||
+            !SameOrdinal(request.managerCore, expectedBundle) ||
+            !SameOrdinal(request.managerLibCliFileIdentity, request.managerExitHandlerFileIdentity) ||
+            !SameOrdinal(request.managerLibCliHash, request.managerExitHandlerHash) ||
+            !SameOrdinal(request.managerValidateEnginesFileIdentity, request.managerMainEntryFileIdentity) ||
+            !SameOrdinal(request.managerValidateEnginesHash, request.managerMainEntryHash) ||
+            !SameOrdinal(request.managerValidateEnginesFileIdentity, request.managerCoreFileIdentity) ||
+            !SameOrdinal(request.managerValidateEnginesHash, request.managerCoreHash)) {
+            error = ERROR_INVALID_NAME;
+            return false;
+        }
+    }
     if (!ValidateCanonicalPath(request.gitEntryType == 2
                                    ? request.cwd + L"\\.git"
                                    : request.cwd + L"\\.git",
                                request.gitEntryType == 2, canonical, error)) {
+        return false;
+    }
+    if (!ValidateCanonicalPath(request.tempRootPath, true, canonical, error)) {
+        return false;
+    }
+    request.tempRootPath = std::move(canonical);
+    if (!IsBasename(request.tempRootPath, L"execution-temp") ||
+        !IsSafeLabel(request.tempWorkspaceId, 128) ||
+        !IsSafeLabel(request.tempJobId, 64) || request.tempJobId.size() < 24 ||
+        !IsHex(request.tempNonce, 64) || !IsIdentity(request.tempRootFileIdentity) ||
+        !IsIdentity(request.jobTempFileIdentity) || request.tempCreatedAtMs.empty() ||
+        request.tempCreatedAtMs.size() > 16 ||
+        !std::all_of(request.tempCreatedAtMs.begin(), request.tempCreatedAtMs.end(), [](wchar_t ch) {
+            return ch >= L'0' && ch <= L'9';
+        })) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::wstring expectedTempRoot;
+    if (!ExpectedExecutionTempRoot(request.tempWorkspaceId, expectedTempRoot, error) ||
+        !SameOrdinal(request.tempRootPath, expectedTempRoot)) {
+        if (error == ERROR_SUCCESS) error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    const std::wstring expectedTempPath = request.tempRootPath + L"\\tmp-" + request.tempJobId;
+    if (CompareStringOrdinal(request.jobTempDir.c_str(), -1,
+                             expectedTempPath.c_str(), -1, TRUE) != CSTR_EQUAL) {
+        error = ERROR_INVALID_NAME;
         return false;
     }
     if (!ValidateCanonicalPath(request.jobTempDir, true, canonical, error)) {
@@ -542,9 +829,12 @@ bool DirectoryAttributes(HANDLE handle, DWORD& error) {
 }
 
 bool OpenDirectoryLock(const std::wstring& path, const std::wstring* expectedIdentity,
-                       std::vector<UniqueHandle>& locks, DWORD& error) {
+                       std::vector<UniqueHandle>& locks, DWORD& error,
+                       bool blockConcurrentWrites) {
+    const DWORD shareMode = FILE_SHARE_READ |
+        (blockConcurrentWrites ? 0 : FILE_SHARE_WRITE);
     UniqueHandle handle(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
-                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                    shareMode, nullptr, OPEN_EXISTING,
                                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                                     nullptr));
     if (!handle.valid()) {
@@ -564,13 +854,14 @@ bool OpenDirectoryLock(const std::wstring& path, const std::wstring* expectedIde
 }
 
 bool LockDirectoryPath(const std::wstring& path, const std::wstring* expectedIdentity,
-                       std::vector<UniqueHandle>& locks, DWORD& error) {
+                       std::vector<UniqueHandle>& locks, DWORD& error,
+                       bool blockConcurrentWrites = false) {
     if (!IsAsciiDriveAbsolutePath(path)) {
         error = ERROR_INVALID_NAME;
         return false;
     }
     std::wstring componentPath = path.substr(0, 3);
-    if (!OpenDirectoryLock(componentPath, nullptr, locks, error)) return false;
+    if (!OpenDirectoryLock(componentPath, nullptr, locks, error, blockConcurrentWrites)) return false;
     size_t cursor = 3;
     while (cursor < path.size()) {
         const size_t separator = path.find(L'\\', cursor);
@@ -579,7 +870,7 @@ bool LockDirectoryPath(const std::wstring& path, const std::wstring* expectedIde
         const bool finalComponent = end == path.size();
         if (!OpenDirectoryLock(componentPath,
                                finalComponent ? expectedIdentity : nullptr,
-                               locks, error)) {
+                               locks, error, blockConcurrentWrites)) {
             return false;
         }
         if (!finalComponent) componentPath.push_back(L'\\');
@@ -706,14 +997,353 @@ bool OpenFileLock(const std::wstring& path, const std::wstring* expectedIdentity
     return true;
 }
 
+void WriteHelperFailureDiagnostic(const char* stage, DWORD error);
+
+bool AccessBlockedByMaterialLock(const std::wstring& path, DWORD& error) {
+    // Probe for the held read handle without requiring write permission on the
+    // runtime installation. Request data-read access (not just attributes) and
+    // omit FILE_SHARE_READ so the probe conflicts with the helper's live lock.
+    UniqueHandle probe(CreateFileW(path.c_str(), GENERIC_READ,
+                                  FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (probe.valid()) {
+        error = ERROR_SHARING_VIOLATION;
+        return false;
+    }
+    const DWORD openError = GetLastError();
+    if (openError == ERROR_SHARING_VIOLATION) return true;
+    error = openError;
+    return false;
+}
+
+bool VerifyRuntimeMaterialLocks(const Request& request, DWORD& error) {
+    const std::wstring* const paths[] = {
+        &request.nodeExecutable,
+        &request.managerCli,
+        &request.managerLibCli,
+        &request.managerValidateEngines,
+        &request.managerMainEntry,
+        &request.managerPackageJson,
+        &request.managerExitHandler,
+        &request.managerCore,
+    };
+    for (size_t index = 0; index < std::size(paths); ++index) {
+        if (!AccessBlockedByMaterialLock(*paths[index], error)) {
+            const std::string stage = "runtime-lock-probe-allowed-material-" + std::to_string(index);
+            WriteHelperFailureDiagnostic(stage.c_str(), error);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ToAscii(const std::wstring& value, std::string& output) {
+    output.clear();
+    output.reserve(value.size());
+    for (wchar_t ch : value) {
+        if (ch < 0 || ch > 0x7f) return false;
+        output.push_back(static_cast<char>(ch));
+    }
+    return true;
+}
+
+bool OpenMatchingMarkerFile(const std::wstring& path, const std::string& expected,
+                            DWORD desiredAccess, UniqueHandle& file, DWORD& error) {
+    file.reset(CreateFileW(path.c_str(), desiredAccess | FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!file.valid()) {
+        error = GetLastError();
+        return false;
+    }
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    LARGE_INTEGER size{};
+    if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo,
+                                      &attributes, sizeof(attributes)) ||
+        !GetFileSizeEx(file.get(), &size)) {
+        error = GetLastError();
+        return false;
+    }
+    if ((attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+        size.QuadPart < 0 || static_cast<std::uint64_t>(size.QuadPart) != expected.size()) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::string actual(expected.size(), '\0');
+    DWORD received = 0;
+    if (!ReadFile(file.get(), actual.data(), static_cast<DWORD>(actual.size()), &received, nullptr) ||
+        received != actual.size() || actual != expected) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        return false;
+    }
+    return true;
+}
+
+bool MatchesMarkerFile(const std::wstring& path, const std::string& expected, DWORD& error) {
+    UniqueHandle file;
+    return OpenMatchingMarkerFile(path, expected, GENERIC_READ, file, error);
+}
+
+bool MatchesTempRootMarker(const std::wstring& path, const std::string& workspaceId,
+                           const std::string& identity, DWORD& error) {
+    const std::string current = "C2C-EXECUTION-TEMP-ROOT-V2\n" + workspaceId + "\n" + identity + "\n";
+    if (MatchesMarkerFile(path, current, error)) return true;
+    if (error != ERROR_INVALID_DATA) return false;
+    // Existing V1 roots are accepted for upgrade compatibility. The root's
+    // current file identity and each job's persisted nonce/sidecar still bind
+    // every cleanup operation; V1 marker text alone grants no job ownership.
+    const std::string legacy = "C2C-EXECUTION-TEMP-ROOT-V1\n" + workspaceId + "\n";
+    return MatchesMarkerFile(path, legacy, error);
+}
+
+bool ValidateTempOwnershipMarkers(const Request& request, DWORD& error) {
+    std::string workspaceId;
+    std::string jobId;
+    std::string nonce;
+    std::string rootIdentity;
+    std::string directoryIdentity;
+    std::string createdAt;
+    if (!ToAscii(request.tempWorkspaceId, workspaceId) || !ToAscii(request.tempJobId, jobId) ||
+        !ToAscii(request.tempNonce, nonce) || !ToAscii(request.tempRootFileIdentity, rootIdentity) ||
+        !ToAscii(request.jobTempFileIdentity, directoryIdentity) ||
+        !ToAscii(request.tempCreatedAtMs, createdAt)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    const std::string jobMarker = "C2C-EXECUTION-TEMP-JOB-V2\n" + workspaceId + "\n" + jobId + "\n" +
+        nonce + "\n" + rootIdentity + "\n" + directoryIdentity + "\n" + createdAt + "\n";
+    const std::string authorityMarker = "C2C-EXECUTION-TEMP-AUTHORITY-V1\n" + workspaceId + "\n" + jobId + "\n" +
+        nonce + "\n" + rootIdentity + "\n" + directoryIdentity + "\n" + createdAt + "\n";
+    const size_t separator = request.tempRootPath.find_last_of(L'\\');
+    if (separator == std::wstring::npos) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
+    const std::wstring authorityPath = request.tempRootPath.substr(0, separator) +
+        L"\\.c2c-execution-temp-job-" + request.tempJobId;
+    return MatchesTempRootMarker(request.tempRootPath + L"\\.c2c-execution-temp-owner",
+                                 workspaceId, rootIdentity, error) &&
+           MatchesMarkerFile(request.jobTempDir + L"\\.c2c-job-owner", jobMarker, error) &&
+           MatchesMarkerFile(authorityPath, authorityMarker, error);
+}
+
+bool MarkHandleForDeletion(HANDLE handle, DWORD& error) {
+    FILE_DISPOSITION_INFO_EX disposition{};
+    disposition.Flags = FILE_DISPOSITION_FLAG_DELETE |
+                       FILE_DISPOSITION_FLAG_POSIX_SEMANTICS |
+                       FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+    if (SetFileInformationByHandle(handle, FileDispositionInfoEx,
+                                   &disposition, sizeof(disposition))) return true;
+    const DWORD extendedError = GetLastError();
+    if (extendedError != ERROR_INVALID_PARAMETER && extendedError != ERROR_NOT_SUPPORTED) {
+        error = extendedError;
+        return false;
+    }
+    FILE_DISPOSITION_INFO basic{};
+    basic.DeleteFile = TRUE;
+    if (!SetFileInformationByHandle(handle, FileDispositionInfo, &basic, sizeof(basic))) {
+        error = GetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool DeleteOwnedDirectoryContents(HANDLE directory, const std::wstring& directoryPath,
+                                  DWORD& error) {
+    BY_HANDLE_FILE_INFORMATION parentInfo{};
+    if (!GetFileInformationByHandle(directory, &parentInfo)) {
+        error = GetLastError();
+        return false;
+    }
+    std::vector<BYTE> buffer(64 * 1024);
+    for (;;) {
+        if (!GetFileInformationByHandleEx(directory, FileIdBothDirectoryRestartInfo,
+                                          buffer.data(), static_cast<DWORD>(buffer.size()))) {
+            const DWORD queryError = GetLastError();
+            if (queryError == ERROR_NO_MORE_FILES) return true;
+            error = queryError;
+            return false;
+        }
+        FILE_ID_BOTH_DIR_INFO* entry = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(buffer.data());
+        std::wstring childName;
+        std::uint64_t enumeratedFileId = 0;
+        while (entry != nullptr) {
+            childName.assign(entry->FileName, entry->FileNameLength / sizeof(WCHAR));
+            if (childName != L"." && childName != L"..") {
+                enumeratedFileId = static_cast<std::uint64_t>(entry->FileId.QuadPart);
+                break;
+            }
+            if (entry->NextEntryOffset == 0) entry = nullptr;
+            else entry = reinterpret_cast<FILE_ID_BOTH_DIR_INFO*>(
+                reinterpret_cast<BYTE*>(entry) + entry->NextEntryOffset);
+        }
+        if (entry == nullptr) return true;
+
+        const std::wstring childPath = directoryPath + L"\\" + childName;
+        UniqueHandle child(CreateFileW(childPath.c_str(), GENERIC_READ | DELETE,
+                                       FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                       nullptr));
+        if (!child.valid()) {
+            error = GetLastError();
+            return false;
+        }
+        BY_HANDLE_FILE_INFORMATION childInfo{};
+        if (!GetFileInformationByHandle(child.get(), &childInfo)) {
+            error = GetLastError();
+            return false;
+        }
+        const std::uint64_t openedFileId =
+            (static_cast<std::uint64_t>(childInfo.nFileIndexHigh) << 32) | childInfo.nFileIndexLow;
+        if (childInfo.dwVolumeSerialNumber != parentInfo.dwVolumeSerialNumber ||
+            enumeratedFileId == 0 || openedFileId != enumeratedFileId) {
+            error = ERROR_FILE_INVALID;
+            return false;
+        }
+        FILE_ATTRIBUTE_TAG_INFO attributes{};
+        if (!GetFileInformationByHandleEx(child.get(), FileAttributeTagInfo,
+                                          &attributes, sizeof(attributes))) {
+            error = GetLastError();
+            return false;
+        }
+        const bool reparse = (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        const bool isDirectory = (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!reparse && isDirectory &&
+            !DeleteOwnedDirectoryContents(child.get(), childPath, error)) return false;
+        if (!MarkHandleForDeletion(child.get(), error)) return false;
+    }
+}
+
+bool CleanupOwnedExecutionTemp(const TempCleanupRequest& request, DWORD& error) {
+    if (!IsSafeLabel(request.workspaceId, 128) || request.jobId.size() < 24 ||
+        request.jobId.size() > 64 || !IsSafeLabel(request.jobId, 64) ||
+        !IsHex(request.nonce, 64) || !IsIdentity(request.rootFileIdentity) ||
+        !IsIdentity(request.directoryFileIdentity) || request.createdAtMs.empty() ||
+        request.createdAtMs.size() > 16 ||
+        !std::all_of(request.createdAtMs.begin(), request.createdAtMs.end(), [](wchar_t ch) {
+            return ch >= L'0' && ch <= L'9';
+        })) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::wstring canonicalRoot;
+    if (!ValidateCanonicalPath(request.rootPath, true, canonicalRoot, error) ||
+        !IsBasename(canonicalRoot, L"execution-temp")) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_NAME;
+        return false;
+    }
+    std::wstring expectedRoot;
+    if (!ExpectedExecutionTempRoot(request.workspaceId, expectedRoot, error) ||
+        !SameOrdinal(canonicalRoot, expectedRoot)) {
+        if (error == ERROR_SUCCESS) error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+
+    std::vector<UniqueHandle> rootLocks;
+    if (!LockDirectoryPath(canonicalRoot, &request.rootFileIdentity, rootLocks, error, true)) return false;
+    std::string workspaceId;
+    std::string jobId;
+    std::string nonce;
+    std::string rootIdentity;
+    std::string directoryIdentity;
+    std::string createdAt;
+    if (!ToAscii(request.workspaceId, workspaceId) || !ToAscii(request.jobId, jobId) ||
+        !ToAscii(request.nonce, nonce) || !ToAscii(request.rootFileIdentity, rootIdentity) ||
+        !ToAscii(request.directoryFileIdentity, directoryIdentity) || !ToAscii(request.createdAtMs, createdAt)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    if (!MatchesTempRootMarker(canonicalRoot + L"\\.c2c-execution-temp-owner",
+                               workspaceId, rootIdentity, error)) return false;
+
+    const std::wstring storeDirectory = ParentDirectory(canonicalRoot);
+    const std::wstring authorityPath = storeDirectory + L"\\.c2c-execution-temp-job-" + request.jobId;
+    const std::string expectedAuthority = "C2C-EXECUTION-TEMP-AUTHORITY-V1\n" + workspaceId + "\n" + jobId + "\n" +
+        nonce + "\n" + rootIdentity + "\n" + directoryIdentity + "\n" + createdAt + "\n";
+    UniqueHandle authority;
+    if (!OpenMatchingMarkerFile(authorityPath, expectedAuthority, GENERIC_READ | DELETE, authority, error)) return false;
+
+    const std::wstring targetPath = canonicalRoot + L"\\tmp-" + request.jobId;
+    UniqueHandle target(CreateFileW(targetPath.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | DELETE,
+                                    FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                    nullptr));
+    if (!target.valid()) {
+        const DWORD openError = GetLastError();
+        error = openError;
+        return false;
+    }
+    if (!DirectoryAttributes(target.get(), error)) return false;
+    std::wstring actualIdentity;
+    if (!FileIdentity(target.get(), actualIdentity, error) ||
+        !SameOrdinal(actualIdentity, request.directoryFileIdentity)) {
+        if (error == ERROR_SUCCESS) error = ERROR_FILE_INVALID;
+        return false;
+    }
+    FILE_BASIC_INFO targetBasicInfo{};
+    std::uint64_t expectedCreatedAtMs = 0;
+    if (!GetFileInformationByHandleEx(target.get(), FileBasicInfo,
+                                      &targetBasicInfo, sizeof(targetBasicInfo)) ||
+        !ParseUnsignedDecimal(request.createdAtMs, expectedCreatedAtMs)) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        return false;
+    }
+    constexpr std::uint64_t kWindowsEpochOffsetMs = 11644473600000ULL;
+    const std::uint64_t creationTicks = static_cast<std::uint64_t>(targetBasicInfo.CreationTime.QuadPart);
+    const std::uint64_t actualCreatedAtMs = creationTicks / 10000ULL;
+    if (actualCreatedAtMs < kWindowsEpochOffsetMs ||
+        actualCreatedAtMs - kWindowsEpochOffsetMs != expectedCreatedAtMs) {
+        error = ERROR_FILE_INVALID;
+        return false;
+    }
+    const std::string expectedJobMarker = "C2C-EXECUTION-TEMP-JOB-V2\n" + workspaceId + "\n" + jobId + "\n" +
+        nonce + "\n" + rootIdentity + "\n" + directoryIdentity + "\n" + createdAt + "\n";
+    if (!MatchesMarkerFile(targetPath + L"\\.c2c-job-owner", expectedJobMarker, error)) return false;
+    if (!DeleteOwnedDirectoryContents(target.get(), targetPath, error)) return false;
+    if (!MarkHandleForDeletion(target.get(), error)) return false;
+    if (!MarkHandleForDeletion(authority.get(), error)) return false;
+    return true;
+}
+
+int RunTempCleanup(HANDLE input) {
+    DWORD error = ERROR_SUCCESS;
+    TempCleanupRequest request;
+    if (!ReadTempCleanupRequest(input, request, error) || !CleanupOwnedExecutionTemp(request, error)) {
+        if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
+        const std::string diagnostic = "EXECUTION_TEMP_CLEANUP_WIN32_ERROR:" + std::to_string(error) + "\n";
+        DWORD written = 0;
+        HANDLE output = GetStdHandle(STD_ERROR_HANDLE);
+        if (output != nullptr && output != INVALID_HANDLE_VALUE) {
+            WriteFile(output, diagnostic.data(), static_cast<DWORD>(diagnostic.size()), &written, nullptr);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+void WriteHelperFailureDiagnostic(const char* stage, DWORD error) {
+    if (stage == nullptr || error == ERROR_SUCCESS) return;
+    const std::string diagnostic = "EXECUTION_HELPER_FAILURE:" + std::string(stage) + ":" +
+                                   std::to_string(error) + "\n";
+    DWORD written = 0;
+    HANDLE output = GetStdHandle(STD_ERROR_HANDLE);
+    if (output != nullptr && output != INVALID_HANDLE_VALUE) {
+        WriteFile(output, diagnostic.data(), static_cast<DWORD>(diagnostic.size()), &written, nullptr);
+    }
+}
+
 bool LockExecutionMaterials(const Request& request, std::vector<UniqueHandle>& locks,
                             DWORD& error) {
     if (!LockDirectoryPath(request.cwd, &request.repositoryFileIdentity, locks, error) ||
         !LockDirectoryPath(request.gitDirectory, &request.gitDirectoryFileIdentity, locks, error) ||
         !LockDirectoryPath(request.commonGitDirectory, &request.commonGitDirectoryFileIdentity, locks, error) ||
+        !LockDirectoryPath(request.tempRootPath, &request.tempRootFileIdentity, locks, error) ||
         !LockDirectoryPath(request.jobTempDir, &request.jobTempFileIdentity, locks, error)) {
         return false;
     }
+    if (!ValidateTempOwnershipMarkers(request, error)) return false;
     const std::wstring gitEntryPath = request.cwd + L"\\.git";
     if (request.gitEntryType == 2) {
         if (!LockDirectoryPath(gitEntryPath, &request.gitEntryFileIdentity, locks, error)) return false;
@@ -731,9 +1361,28 @@ bool LockExecutionMaterials(const Request& request, std::vector<UniqueHandle>& l
     };
     if (!LockDirectoryPath(parentDirectory(request.nodeExecutable), nullptr, locks, error) ||
         !LockDirectoryPath(parentDirectory(request.managerCli), nullptr, locks, error) ||
-        !OpenFileLock(request.nodeExecutable, &request.nodeFileIdentity, nullptr, locks, error) ||
+        !LockDirectoryPath(parentDirectory(request.managerLibCli), nullptr, locks, error) ||
+        !LockDirectoryPath(parentDirectory(request.managerValidateEngines), nullptr, locks, error) ||
+        !LockDirectoryPath(parentDirectory(request.managerMainEntry), nullptr, locks, error) ||
+        !LockDirectoryPath(parentDirectory(request.managerPackageJson), nullptr, locks, error) ||
+        !LockDirectoryPath(parentDirectory(request.managerExitHandler), nullptr, locks, error) ||
+        !LockDirectoryPath(parentDirectory(request.managerCore), nullptr, locks, error) ||
+        !OpenFileLock(request.nodeExecutable, &request.nodeFileIdentity,
+                      &request.nodeHash, locks, error) ||
         !OpenFileLock(request.managerCli, &request.managerFileIdentity,
-                      &request.managerHash, locks, error)) {
+                      &request.managerHash, locks, error) ||
+        !OpenFileLock(request.managerLibCli, &request.managerLibCliFileIdentity,
+                      &request.managerLibCliHash, locks, error) ||
+        !OpenFileLock(request.managerValidateEngines, &request.managerValidateEnginesFileIdentity,
+                      &request.managerValidateEnginesHash, locks, error) ||
+        !OpenFileLock(request.managerMainEntry, &request.managerMainEntryFileIdentity,
+                      &request.managerMainEntryHash, locks, error) ||
+        !OpenFileLock(request.managerPackageJson, &request.managerPackageJsonFileIdentity,
+                      &request.managerPackageJsonHash, locks, error) ||
+        !OpenFileLock(request.managerExitHandler, &request.managerExitHandlerFileIdentity,
+                      &request.managerExitHandlerHash, locks, error) ||
+        !OpenFileLock(request.managerCore, &request.managerCoreFileIdentity,
+                      &request.managerCoreHash, locks, error)) {
         return false;
     }
     return true;
@@ -1340,9 +1989,14 @@ void SetFirstError(DWORD candidate, DWORD& error) {
 
 } // namespace
 
-int wmain(int argc, wchar_t**) {
+int wmain(int argc, wchar_t** argv) {
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (argc == 2 && argv != nullptr &&
+        CompareStringOrdinal(argv[1], -1, L"--cleanup-temp", -1, FALSE) == CSTR_EQUAL) {
+        if (input == nullptr || input == INVALID_HANDLE_VALUE) return 1;
+        return RunTempCleanup(input);
+    }
     if (output == nullptr || output == INVALID_HANDLE_VALUE) {
         return 2;
     }
@@ -1377,6 +2031,7 @@ int wmain(int argc, wchar_t**) {
     Outcome outcome = Outcome::HelperError;
     DWORD childExitCode = 0;
     DWORD resultError = ERROR_SUCCESS;
+    const char* failureStage = nullptr;
     UniqueHandle job;
     UniqueHandle stdoutRead;
     UniqueHandle stdoutWrite;
@@ -1400,10 +2055,13 @@ int wmain(int argc, wchar_t**) {
             resultError = ERROR_INVALID_DATA;
         }
     } else if (!ValidateRequestPaths(request, resultError)) {
+        failureStage = "validate-paths";
         outcome = Outcome::HelperError;
     } else if (!LockExecutionMaterials(request, materialLocks, resultError)) {
+        failureStage = "lock-execution-materials";
         outcome = Outcome::HelperError;
     } else if (!BuildEnvironment(request, environment, resultError)) {
+        failureStage = "build-environment";
         outcome = Outcome::HelperError;
     } else if (control.state() != ControlEvent::None) {
         const ControlEvent event = control.state();
@@ -1412,11 +2070,13 @@ int wmain(int argc, wchar_t**) {
             resultError = event == ControlEvent::OwnerLost ? ERROR_BROKEN_PIPE : ERROR_INVALID_DATA;
         }
     } else if (!CreateJob(job, resultError)) {
+        failureStage = "create-job";
         outcome = Outcome::HelperError;
     } else if (!CreateSuspendedChild(request, environment, job.get(),
                                      stdoutRead, stdoutWrite, stderrRead,
                                      stderrWrite, nullInput, process,
                                      primaryThread, resultError)) {
+        failureStage = "create-suspended-child";
         outcome = Outcome::HelperError;
     } else {
         processCreated = true;
@@ -1440,6 +2100,7 @@ int wmain(int argc, wchar_t**) {
         };
 
         if (!VerifyChildInJob(process.get(), job.get(), resultError)) {
+            failureStage = "verify-child-in-job";
             // Do not resume unless the atomic JOB_LIST assignment is verified.
             jobZeroConfirmed = terminateTree(ERROR_PROCESS_ABORTED);
             if (!jobZeroConfirmed) {
@@ -1512,11 +2173,19 @@ int wmain(int argc, wchar_t**) {
                             outcome = Outcome::HelperError;
                         }
                     } else {
-                        const DWORD previousSuspendCount = ResumeThread(primaryThread.get());
+                        const bool materialLocksVerified =
+                            VerifyRuntimeMaterialLocks(request, resultError);
+                        if (!materialLocksVerified) failureStage = "verify-runtime-material-locks";
+                        const DWORD previousSuspendCount = materialLocksVerified
+                            ? ResumeThread(primaryThread.get())
+                            : static_cast<DWORD>(-1);
                         if (previousSuspendCount != 1) {
-                            resultError = previousSuspendCount == static_cast<DWORD>(-1)
-                                              ? GetLastError()
-                                              : ERROR_INVALID_STATE;
+                            if (materialLocksVerified) {
+                                resultError = previousSuspendCount == static_cast<DWORD>(-1)
+                                                  ? GetLastError()
+                                                  : ERROR_INVALID_STATE;
+                                failureStage = "resume-child";
+                            }
                             jobZeroConfirmed = terminateTree(ERROR_PROCESS_ABORTED);
                             outcome = Outcome::HelperError;
                         } else {
@@ -1665,6 +2334,7 @@ int wmain(int argc, wchar_t**) {
     } else if (resultError == ERROR_SUCCESS && outcome == Outcome::HelperError) {
         resultError = ERROR_GEN_FAILURE;
     }
+    if (outcome == Outcome::HelperError) WriteHelperFailureDiagnostic(failureStage, resultError);
     const bool resultEmitted = EmitResult(output, outcome, childExitCode, resultError);
     if (!resultEmitted) {
         // This one-shot helper must exit even when the owner has already

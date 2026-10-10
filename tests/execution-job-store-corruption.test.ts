@@ -23,6 +23,7 @@ function makeJob(workspaceId: string): ExecutionJob {
     finishedAt: null,
     timeoutSeconds: 60,
     idempotencyKeyHash: "c".repeat(64),
+    tempOwnership: null,
     exitCode: null,
     failureCode: null,
     stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
@@ -94,7 +95,7 @@ describe("ExecutionJobStore corruption handling", () => {
       expect(supervisor.cancel(job.jobId, job.oauthClientId)).toEqual({ ok: false, error: "STORE_CORRUPT" });
       expect(fs.readFileSync(file, "utf8")).toBe(original);
       expect(supervisor.store.listAll()).toEqual([]);
-      expect(fs.existsSync(staleTemp)).toBe(true);
+      expect(fs.existsSync(staleTemp.directoryPath)).toBe(true);
     } finally {
       await supervisor.shutdown();
     }

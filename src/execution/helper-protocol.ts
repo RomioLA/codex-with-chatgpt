@@ -1,7 +1,7 @@
 import type { ExecutionKind, PackageManager, OutputStream } from "./job-types.js";
 
-const REQUEST_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x32, 0x00]); // C2CJOB2\0
-const RESPONSE_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x32, 0x00]); // C2COUT2\0
+const REQUEST_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x35, 0x00]); // C2CJOB5\0
+const RESPONSE_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x35, 0x00]); // C2COUT5\0
 export const HELPER_CANCEL_BYTE = 0x01;
 export const MAX_HELPER_STRING_BYTES = 128 * 1024;
 export const MAX_HELPER_FRAME_BYTES = 64 * 1024;
@@ -27,10 +27,35 @@ export interface HelperRequest {
   commonGitDirectoryFileIdentity: string;
   nodeExecutable: string;
   nodeFileIdentity: string;
+  nodeHash: string;
   managerCli: string;
   managerFileIdentity: string;
   managerHash: string;
+  managerLibCli: string;
+  managerLibCliFileIdentity: string;
+  managerLibCliHash: string;
+  managerValidateEngines: string;
+  managerValidateEnginesFileIdentity: string;
+  managerValidateEnginesHash: string;
+  managerMainEntry: string;
+  managerMainEntryFileIdentity: string;
+  managerMainEntryHash: string;
+  managerPackageJson: string;
+  managerPackageJsonFileIdentity: string;
+  managerPackageJsonHash: string;
+  managerExitHandler: string;
+  managerExitHandlerFileIdentity: string;
+  managerExitHandlerHash: string;
+  managerCore: string;
+  managerCoreFileIdentity: string;
+  managerCoreHash: string;
   target: string;
+  tempRootPath: string;
+  tempRootFileIdentity: string;
+  tempWorkspaceId: string;
+  tempJobId: string;
+  tempNonce: string;
+  tempCreatedAtMs: number;
   jobTempDir: string;
   jobTempFileIdentity: string;
   repositoryFileIdentity: string;
@@ -38,6 +63,39 @@ export interface HelperRequest {
   gitEntryType: "file" | "directory";
   gitEntryHash: string;
   packageJsonHash: string;
+}
+
+export interface TempCleanupRequest {
+  rootPath: string;
+  rootFileIdentity: string;
+  directoryFileIdentity: string;
+  workspaceId: string;
+  jobId: string;
+  nonce: string;
+  createdAtMs: number;
+}
+
+export function serializeTempCleanupRequest(request: TempCleanupRequest): Buffer {
+  if (!/^[A-Za-z0-9_-]{24,64}$/.test(request.jobId) ||
+      !/^[a-f0-9]{64}$/i.test(request.nonce) ||
+      !Number.isSafeInteger(request.createdAtMs) || request.createdAtMs < 0 ||
+      !/^[a-f0-9]+:[a-f0-9]+$/i.test(request.rootFileIdentity) ||
+      !/^[a-f0-9]+:[a-f0-9]+$/i.test(request.directoryFileIdentity) ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(request.workspaceId)) {
+    throw new TypeError("Invalid execution temp ownership");
+  }
+  const magic = Buffer.from([0x43, 0x32, 0x43, 0x54, 0x4d, 0x50, 0x31, 0x00]); // C2CTMP1\0
+  const version = Buffer.from([1, 0, 0, 0, 0]);
+  const fields = [
+    request.rootPath,
+    request.rootFileIdentity,
+    request.directoryFileIdentity,
+    request.workspaceId,
+    request.jobId,
+    request.nonce,
+    String(request.createdAtMs),
+  ].map(encodeString);
+  return Buffer.concat([magic, version, ...fields]);
 }
 
 export interface HelperResultFrame {
@@ -69,16 +127,28 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
     throw new TypeError("Invalid execution target");
   }
   for (const value of [request.nodeFileIdentity, request.managerFileIdentity,
+    request.managerLibCliFileIdentity, request.managerValidateEnginesFileIdentity,
+    request.managerMainEntryFileIdentity, request.managerPackageJsonFileIdentity,
+    request.managerExitHandlerFileIdentity, request.managerCoreFileIdentity,
     request.repositoryFileIdentity, request.gitEntryFileIdentity,
     request.gitDirectoryFileIdentity, request.commonGitDirectoryFileIdentity,
-    request.jobTempFileIdentity]) {
+    request.jobTempFileIdentity, request.tempRootFileIdentity]) {
     if (!/^[a-f0-9]+:[a-f0-9]+$/i.test(value)) throw new TypeError("Invalid execution file identity");
   }
-  for (const value of [request.managerHash, request.gitEntryHash, request.packageJsonHash]) {
+  for (const value of [request.nodeHash, request.managerHash, request.managerLibCliHash,
+    request.managerValidateEnginesHash, request.managerMainEntryHash,
+    request.managerPackageJsonHash, request.managerExitHandlerHash, request.managerCoreHash,
+    request.gitEntryHash, request.packageJsonHash]) {
     if (!/^[a-f0-9]{64}$/i.test(value)) throw new TypeError("Invalid execution material hash");
   }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(request.tempWorkspaceId) ||
+      !/^[A-Za-z0-9_-]{24,64}$/.test(request.tempJobId) ||
+      !/^[a-f0-9]{64}$/i.test(request.tempNonce) ||
+      !Number.isSafeInteger(request.tempCreatedAtMs) || request.tempCreatedAtMs < 0) {
+    throw new TypeError("Invalid execution temp ownership");
+  }
   const fixed = Buffer.alloc(4);
-  fixed.writeUInt16LE(2, 0); // protocol version
+  fixed.writeUInt16LE(5, 0); // protocol version
   fixed.writeUInt8(1, 2); // fixed package-script recipe
   fixed.writeUInt8(MANAGER_CODE[request.packageManager], 3);
   const tail = Buffer.alloc(8);
@@ -98,10 +168,35 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
     encodeString(request.commonGitDirectoryFileIdentity),
     encodeString(request.nodeExecutable),
     encodeString(request.nodeFileIdentity),
+    encodeString(request.nodeHash),
     encodeString(request.managerCli),
     encodeString(request.managerFileIdentity),
     encodeString(request.managerHash),
+    encodeString(request.managerLibCli),
+    encodeString(request.managerLibCliFileIdentity),
+    encodeString(request.managerLibCliHash),
+    encodeString(request.managerValidateEngines),
+    encodeString(request.managerValidateEnginesFileIdentity),
+    encodeString(request.managerValidateEnginesHash),
+    encodeString(request.managerMainEntry),
+    encodeString(request.managerMainEntryFileIdentity),
+    encodeString(request.managerMainEntryHash),
+    encodeString(request.managerPackageJson),
+    encodeString(request.managerPackageJsonFileIdentity),
+    encodeString(request.managerPackageJsonHash),
+    encodeString(request.managerExitHandler),
+    encodeString(request.managerExitHandlerFileIdentity),
+    encodeString(request.managerExitHandlerHash),
+    encodeString(request.managerCore),
+    encodeString(request.managerCoreFileIdentity),
+    encodeString(request.managerCoreHash),
     encodeString(request.target),
+    encodeString(request.tempRootPath),
+    encodeString(request.tempRootFileIdentity),
+    encodeString(request.tempWorkspaceId),
+    encodeString(request.tempJobId),
+    encodeString(request.tempNonce),
+    encodeString(String(request.tempCreatedAtMs)),
     encodeString(request.jobTempDir),
     encodeString(request.jobTempFileIdentity),
     encodeString(request.repositoryFileIdentity),

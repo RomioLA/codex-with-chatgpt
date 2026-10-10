@@ -1,12 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
+import { Logger } from "../src/logger/index.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supervisor.js";
 import { resolveExecutionHelperPath, WindowsNativeExecutionRunner } from "../src/execution/native-runner.js";
 import { ExecutionTempOwner } from "../src/execution/execution-temp.js";
+import { resolveTrustedRuntime } from "../src/execution/runtime-discovery.js";
 import { resolveRepositoryIdentity } from "../src/execution/repository-identity.js";
 import { approveTrustedCommand } from "../src/execution/trusted-registry.js";
 import { setPermission } from "../src/permission/store.js";
@@ -14,6 +18,10 @@ import { Workspace } from "../src/workspace/manager.js";
 import { isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function makeSystemTempDir(name: string): string {
+  return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `c2c-${name}-`)));
+}
 
 function processExists(pid: number): boolean {
   try {
@@ -118,6 +126,7 @@ function createRealSupervisor(
   workspaceRoot: string,
   runner?: ExecutionRunner,
   packageManager: "npm" | "pnpm" = "npm",
+  logger?: Logger,
 ): { supervisor: ExecutionSupervisor; workspace: Workspace } {
   isolateStateDir();
   const workspace = new Workspace(workspaceRoot);
@@ -132,13 +141,104 @@ function createRealSupervisor(
     packageManager,
     localApproval: true,
   });
-  return { supervisor: new ExecutionSupervisor(workspace, { runner }), workspace };
+  return { supervisor: new ExecutionSupervisor(workspace, { runner, logger }), workspace };
 }
 
 function expectNoOwnedJobTemps(supervisor: ExecutionSupervisor): void {
   const tempRoot = path.join(supervisor.store.directory, "execution-temp");
   const leftovers = fs.readdirSync(tempRoot).filter((name) => name.startsWith("tmp-"));
   expect(leftovers).toEqual([]);
+}
+
+function runtimeFixture(root: string, started: string, executed: string): {
+  node: string;
+  npmCli: string;
+  npmLibCli: string;
+  npmValidateEngines: string;
+  npmMainEntry: string;
+  npmPackageJson: string;
+  npmExitHandler: string;
+  npmCore: string;
+  pnpmCli: string;
+  pnpmLauncher: string;
+  pnpmBundle: string;
+} {
+  const runtimeDirectory = path.join(root, "runtime");
+  const node = path.join(runtimeDirectory, "node.exe");
+  const npmRoot = path.join(runtimeDirectory, "node_modules", "npm");
+  const npmCli = path.join(npmRoot, "bin", "npm-cli.js");
+  const npmLibCli = path.join(npmRoot, "lib", "cli.js");
+  const npmValidateEngines = path.join(npmRoot, "lib", "cli", "validate-engines.js");
+  const npmMainEntry = path.join(npmRoot, "lib", "cli", "entry.js");
+  const npmPackageJson = path.join(npmRoot, "package.json");
+  const npmExitHandler = path.join(npmRoot, "lib", "cli", "exit-handler.js");
+  const npmCore = path.join(npmRoot, "lib", "npm.js");
+  const pnpmRoot = path.join(runtimeDirectory, "node_modules", "pnpm");
+  const pnpmCli = path.join(pnpmRoot, "bin", "pnpm.cjs");
+  const pnpmLauncher = path.join(pnpmRoot, "bin", "pnpm.mjs");
+  const pnpmBundle = path.join(pnpmRoot, "dist", "pnpm.mjs");
+  fs.mkdirSync(path.dirname(node), { recursive: true });
+  fs.mkdirSync(path.dirname(npmMainEntry), { recursive: true });
+  fs.mkdirSync(path.dirname(npmCli), { recursive: true });
+  fs.mkdirSync(path.dirname(pnpmBundle), { recursive: true });
+  fs.mkdirSync(path.dirname(pnpmCli), { recursive: true });
+  fs.copyFileSync(process.execPath, node);
+  fs.writeFileSync(npmPackageJson, JSON.stringify({ name: "npm", version: "11.12.1", type: "commonjs" }));
+  fs.writeFileSync(npmCli, "require('../lib/cli.js')(process);\n");
+  fs.writeFileSync(npmLibCli, "require('./cli/validate-engines.js')(process, () => require('./cli/entry.js'));\n");
+  fs.writeFileSync(npmValidateEngines, "require('../../package.json'); module.exports = (_process, run) => run();\n");
+  fs.writeFileSync(npmMainEntry, "require('./exit-handler.js'); require('../npm.js');\n");
+  fs.writeFileSync(npmExitHandler, "module.exports = () => undefined;\n");
+  fs.writeFileSync(npmCore, [
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(started)}, 'started');`,
+    `setTimeout(() => fs.writeFileSync(${JSON.stringify(executed)}, 'original'), 2500);`,
+  ].join("\n"));
+  fs.writeFileSync(path.join(pnpmRoot, "package.json"), JSON.stringify({ name: "pnpm", version: "11.24.0" }));
+  fs.writeFileSync(pnpmCli, "import('./pnpm.mjs');\n");
+  fs.writeFileSync(pnpmLauncher, "await import('../dist/pnpm.mjs');\n");
+  fs.writeFileSync(pnpmBundle, [
+    "import fs from 'node:fs';",
+    `fs.writeFileSync(${JSON.stringify(started)}, 'started');`,
+    `setTimeout(() => fs.writeFileSync(${JSON.stringify(executed)}, 'original'), 2500);`,
+  ].join("\n"));
+  return {
+    node, npmCli, npmLibCli, npmValidateEngines, npmMainEntry, npmPackageJson, npmExitHandler, npmCore,
+    pnpmCli, pnpmLauncher, pnpmBundle,
+  };
+}
+
+function makeDirectNativeRequest(root: string, jobId: string, packageManager: "npm" | "pnpm" = "npm"): {
+  request: Parameters<WindowsNativeExecutionRunner["start"]>[0];
+  owner: ExecutionTempOwner;
+} {
+  makeGitRepo(root);
+  write(root, "package.json", JSON.stringify({ name: "runtime-integrity-fixture", scripts: { test: "node approved.mjs" } }));
+  const workspace = new Workspace(root);
+  const repository = resolveRepositoryIdentity(workspace, ".");
+  const trustedCommand = approveTrustedCommand({
+    workspaceId: workspace.id, repositoryIdentity: repository.identity,
+    canonicalRepositoryPath: repository.canonicalPath, kind: "test", target: "test",
+    packageManager, localApproval: true,
+  });
+  const stateRoot = makeSystemTempDir("windows-runtime-integrity-state");
+  const stateDirectory = path.join(stateRoot, "execution-jobs", workspace.id);
+  fs.mkdirSync(stateDirectory, { recursive: true });
+  const owner = new ExecutionTempOwner(stateDirectory, workspace.id);
+  const tempLease = owner.create(jobId);
+  return {
+    owner,
+    request: { jobId, repository, trustedCommand, timeoutSeconds: 20, stateDirectory, tempLease },
+  };
+}
+
+function winFileIdentity(file: string): string {
+  const stat = fs.statSync(file, { bigint: true });
+  return `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
+}
+
+function sha256File(file: string): string {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
 async function stopRaceWorker(worker: Worker | null, onAttempts: (count: number) => void): Promise<void> {
@@ -271,7 +371,7 @@ describe("Windows execution lifecycle acceptance", () => {
     const marker = `${root}.approved`;
     write(root, "package.json", JSON.stringify({ name: "normal-execution-fixture", scripts: { test: "node approved.mjs" } }));
     write(root, "approved.mjs", `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(marker)}, 'approved');\n`);
-    const { supervisor } = createRealSupervisor(root);
+    const { supervisor } = createRealSupervisor(root, undefined, "npm", new Logger({ file: null, console: true, level: "debug" }));
     try {
       const started = supervisor.start({
         repositoryPath: ".", kind: "test", target: "test", timeoutSeconds: 30,
@@ -280,8 +380,18 @@ describe("Windows execution lifecycle acceptance", () => {
       });
       expect(started.ok).toBe(true);
       if (!started.ok) throw new Error(started.error);
-      await waitUntil(() => supervisor.store.get(started.job.jobId)?.state === "succeeded", 30_000,
-        "The approved native recipe did not succeed.");
+      await waitUntil(() => {
+        const state = supervisor.store.get(started.job.jobId)?.state;
+        return state === "succeeded" || state === "failed" || state === "interrupted";
+      }, 30_000, "The approved native recipe did not settle.");
+      const completed = supervisor.store.get(started.job.jobId);
+      if (completed?.state !== "succeeded") {
+        const stdout = supervisor.store.readOutput(started.job.jobId, "stdout");
+        const stderr = supervisor.store.readOutput(started.job.jobId, "stderr");
+        throw new Error(`The approved native recipe did not succeed; state=${completed?.state ?? "missing"}; ` +
+          `failure=${completed?.failureCode ?? "none"}; stdout=${stdout.ok ? stdout.text : stdout.error}; ` +
+          `stderr=${stderr.ok ? stderr.text : stderr.error}`);
+      }
       expect(fs.readFileSync(marker, "utf8")).toBe("approved");
       expectNoOwnedJobTemps(supervisor);
     } finally {
@@ -354,11 +464,15 @@ describe("Windows execution lifecycle acceptance", () => {
       canonicalRepositoryPath: repository.canonicalPath, kind: "test", target: "test",
       packageManager: "npm", localApproval: true,
     });
-    const stateDirectory = makeTmpDir("windows-helper-failure-state");
+    const stateRoot = makeSystemTempDir("windows-helper-failure-state");
+    const stateDirectory = path.join(stateRoot, "execution-jobs", workspace.id);
+    fs.mkdirSync(stateDirectory, { recursive: true });
     const owner = new ExecutionTempOwner(stateDirectory, workspace.id);
+    const jobId = "start-failure-job-00000001";
+    const tempLease = owner.create(jobId);
     const request = {
-      jobId: "start-failure-job-00000001", repository, trustedCommand,
-      timeoutSeconds: 10, stateDirectory, tempOwner: owner,
+      jobId, repository, trustedCommand,
+      timeoutSeconds: 10, stateDirectory, tempLease,
     };
     const callbacks = { onOutput: () => undefined };
     const validHelper = resolveExecutionHelperPath();
@@ -367,22 +481,384 @@ describe("Windows execution lifecycle acceptance", () => {
     expect(() => new WindowsNativeExecutionRunner({ helperPath: validHelper, spawnImpl: throwingSpawn }).start(request, callbacks))
       .toThrow("EXECUTION_HELPER_START_FAILED");
     expect(fs.readdirSync(owner.root).filter((name) => name.startsWith("tmp-")).length).toBe(0);
-
-    const corrupt = path.join(stateDirectory, "corrupt-helper.exe");
-    fs.writeFileSync(corrupt, "not a Windows executable");
-    for (const [index, helperPath] of [path.join(stateDirectory, "missing-helper.exe"), corrupt].entries()) {
-      let handle: ReturnType<WindowsNativeExecutionRunner["start"]> | null = null;
-      try {
-        handle = new WindowsNativeExecutionRunner({ helperPath }).start({
-          ...request, jobId: `helper-failure-job-${String(index).padStart(8, "0")}`,
-        }, callbacks);
-      } catch (error) {
-        expect(error).toMatchObject({ message: "EXECUTION_HELPER_START_FAILED" });
-      }
-      if (handle) await expect(handle.completion).rejects.toThrow("EXECUTION_HELPER_START_FAILED");
-      expect(fs.readdirSync(owner.root).filter((name) => name.startsWith("tmp-")).length).toBe(0);
-    }
   }, 45_000);
+
+  it.skipIf(process.platform !== "win32")("VALID_BUT_UNTRUSTED_HELPER_REJECTED before helper or recipe code can run", () => {
+    const root = makeSystemTempDir("windows-untrusted-valid-helper");
+    const moduleDirectory = path.join(root, "dist", "execution");
+    const candidate = path.join(root, "build", "native", "c2c-execution-helper.exe");
+    fs.mkdirSync(moduleDirectory, { recursive: true });
+    fs.mkdirSync(path.dirname(candidate), { recursive: true });
+    const systemWhere = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "where.exe");
+    fs.copyFileSync(systemWhere, candidate);
+    const candidateBytes = fs.readFileSync(candidate);
+    expect(candidateBytes.toString("ascii", 0, 2)).toBe("MZ");
+    expect(candidateBytes.toString("binary", candidateBytes.readUInt32LE(0x3c), candidateBytes.readUInt32LE(0x3c) + 4))
+      .toBe("PE\0\0");
+    const trustedHelperHash = createHash("sha256").update(fs.readFileSync(resolveExecutionHelperPath())).digest("hex");
+    fs.writeFileSync(path.join(moduleDirectory, "c2c-execution-helper-integrity.json"), JSON.stringify({
+      version: 1,
+      protocolVersion: 5,
+      helperPath: "build/native/c2c-execution-helper.exe",
+      sha256: trustedHelperHash,
+    }));
+    let spawnCalls = 0;
+    const spawnImpl = (() => { spawnCalls += 1; throw new Error("candidate should never be started"); }) as never;
+    const workspaceId = "untrusted-helper-workspace";
+    const stateRoot = makeSystemTempDir("windows-untrusted-helper-state");
+    const stateDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(stateDirectory, { recursive: true });
+    const owner = new ExecutionTempOwner(stateDirectory, workspaceId);
+    const jobId = "untrusted-helper-job-00000001";
+    const lease = owner.create(jobId);
+    const rootRepo = makeSystemTempDir("windows-untrusted-helper-repo");
+    makeGitRepo(rootRepo);
+    write(rootRepo, "package.json", JSON.stringify({ name: "untrusted-helper-fixture", scripts: { test: "node -e \"process.exit(0)\"" } }));
+    const workspace = new Workspace(rootRepo);
+    const repository = resolveRepositoryIdentity(workspace, ".");
+    const trustedCommand = approveTrustedCommand({
+      workspaceId: workspace.id, repositoryIdentity: repository.identity,
+      canonicalRepositoryPath: repository.canonicalPath, kind: "test", target: "test",
+      packageManager: "npm", localApproval: true,
+    });
+
+    let rejected = false;
+    try {
+      new WindowsNativeExecutionRunner({ moduleDirectory, spawnImpl }).start({
+        jobId, repository, trustedCommand, timeoutSeconds: 10,
+        stateDirectory, tempLease: lease,
+      }, { onOutput: () => undefined });
+    } catch (error) {
+      rejected = (error as Error).message === "EXECUTION_HELPER_UNAVAILABLE";
+    }
+    const evidence = {
+      validPe: candidateBytes.toString("ascii", 0, 2) === "MZ" &&
+        candidateBytes.toString("binary", candidateBytes.readUInt32LE(0x3c), candidateBytes.readUInt32LE(0x3c) + 4) === "PE\0\0",
+      rejectedBeforeSpawn: rejected && spawnCalls === 0,
+      authorizedHash: trustedHelperHash,
+      replacementHash: sha256File(candidate),
+      replacementExecuted: spawnCalls > 0,
+    };
+    console.info("VALID_BUT_UNTRUSTED_HELPER_REJECTED", JSON.stringify(evidence));
+    expect(evidence.validPe).toBe(true);
+    expect(evidence.rejectedBeforeSpawn).toBe(true);
+    expect(evidence.authorizedHash).not.toBe(evidence.replacementHash);
+    expect(evidence.replacementExecuted).toBe(false);
+    expect(sha256File(candidate)).not.toBe(trustedHelperHash);
+    expect(owner.cleanup(jobId, lease)).toBe(true);
+    expect(fs.existsSync(lease.directoryPath)).toBe(false);
+  }, 45_000);
+
+  for (const attack of [
+    "node-in-place", "node-replacement",
+    "manager-in-place", "manager-replacement",
+    "manager-lib-cli-in-place", "manager-lib-cli-replacement",
+    "manager-validate-engines-in-place", "manager-validate-engines-replacement",
+    "manager-main-entry-in-place", "manager-main-entry-replacement",
+    "manager-package-json-in-place", "manager-package-json-replacement",
+    "manager-exit-handler-in-place", "manager-exit-handler-replacement",
+    "manager-core-in-place", "manager-core-replacement",
+    "pnpm-shim-in-place", "pnpm-shim-replacement",
+    "pnpm-launcher-in-place", "pnpm-launcher-replacement",
+    "pnpm-bundle-in-place", "pnpm-bundle-replacement",
+    "pnpm-package-json-in-place", "pnpm-package-json-replacement",
+  ] as const) {
+    it.skipIf(process.platform !== "win32")(`${attack} after discovery fails closed before unauthorized material executes`, async () => {
+      const root = makeSystemTempDir(`windows-${attack}`);
+      const started = path.join(root, "runtime-started.txt");
+      const executed = path.join(root, "runtime-executed.txt");
+      const denied = path.join(root, "unauthorized-runtime.txt");
+      const runtime = runtimeFixture(root, started, executed);
+      const systemWhere = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "where.exe");
+      const replacementBytes = fs.readFileSync(systemWhere);
+      const packageManager = attack.startsWith("pnpm-") ? "pnpm" : "npm";
+      const managerMaterial = attack.startsWith("pnpm-shim-") ? runtime.pnpmCli
+        : attack.startsWith("pnpm-launcher-") ? runtime.pnpmLauncher
+          : attack.startsWith("pnpm-bundle-") ? runtime.pnpmBundle
+            : attack.startsWith("pnpm-package-json-") ? path.join(path.dirname(runtime.pnpmCli), "..", "package.json")
+              : attack.startsWith("manager-package-json-") ? runtime.npmPackageJson
+                : attack.startsWith("manager-exit-handler-") ? runtime.npmExitHandler
+                  : attack.startsWith("manager-core-") ? runtime.npmCore
+            : attack.startsWith("manager-lib-cli-") ? runtime.npmLibCli
+        : attack.startsWith("manager-validate-engines-") ? runtime.npmValidateEngines
+          : attack.startsWith("manager-main-entry-") ? runtime.npmMainEntry : runtime.npmCli;
+      const targetMaterial = attack.startsWith("node-") ? runtime.node : managerMaterial;
+      const initialIdentity = winFileIdentity(targetMaterial);
+      const initialHash = sha256File(targetMaterial);
+      const jobId = `runtime-integrity-${attack}-0001`;
+      const { owner, request } = makeDirectNativeRequest(makeSystemTempDir(`runtime-repo-${attack}`), jobId, packageManager);
+      let attempted = 0;
+      let blockedBySharing = 0;
+      let replacementSucceeded = false;
+      let replacementFailed = false;
+      const beforeHelperRequestWrite = () => {
+        attempted += 1;
+        const target = attack.startsWith("node-") ? runtime.node : managerMaterial;
+        const malicious = Buffer.from(`import('node:fs').then((fs) => fs.writeFileSync(${JSON.stringify(denied)}, 'ran'));\n`);
+        try {
+          if (attack.endsWith("in-place")) {
+            fs.writeFileSync(target, attack.startsWith("node-") ? replacementBytes : malicious);
+            replacementSucceeded = true;
+          } else {
+            const displaced = `${target}.unapproved`;
+            fs.renameSync(target, displaced);
+            fs.writeFileSync(target, attack.startsWith("node-") ? replacementBytes : malicious);
+            replacementSucceeded = true;
+          }
+        } catch (error) {
+          replacementFailed = true;
+          if (["EPERM", "EBUSY", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) blockedBySharing += 1;
+          else throw error;
+        }
+      };
+      const runner = new WindowsNativeExecutionRunner({
+        runtimeResolver: (manager) => resolveTrustedRuntime(manager, {
+          platform: "win32", nodeExecutable: runtime.node, homeDirectory: root,
+        }),
+        beforeHelperRequestWrite,
+      });
+      const handle = runner.start(request, { onOutput: () => undefined });
+      const completion = await handle.completion;
+      const finalMaterial = attack.startsWith("node-") ? runtime.node : managerMaterial;
+      const result = {
+        attempted,
+        blockedBySharing,
+        replacementSucceeded,
+        replacementFailed,
+        executionObserved: fs.existsSync(executed) || fs.existsSync(denied),
+        finalIdentity: winFileIdentity(finalMaterial),
+        finalHash: sha256File(finalMaterial),
+      };
+      console.info("RUNTIME_MATERIAL_ATTACK_EVIDENCE", JSON.stringify({ attack, ...result }));
+      expect(result.attempted).toBe(1);
+      expect(result.blockedBySharing).toBe(0);
+      expect(result.replacementSucceeded).toBe(true);
+      expect(completion.result.outcome).toBe(3);
+      expect(result.executionObserved).toBe(false);
+      if (attack.endsWith("in-place")) {
+        expect(result.finalIdentity).toBe(initialIdentity);
+        expect(result.finalHash).not.toBe(initialHash);
+      } else {
+        expect(result.finalIdentity).not.toBe(initialIdentity);
+      }
+      expect(fs.existsSync(started)).toBe(false);
+      expect(fs.existsSync(request.tempLease.directoryPath)).toBe(false);
+    }, 45_000);
+  }
+
+  it.skipIf(process.platform !== "win32")("runtime mutation after discovery is blocked or fails closed before code runs", async () => {
+    const root = makeSystemTempDir("windows-runtime-lock-window");
+    const started = path.join(root, "runtime-started.txt");
+    const executed = path.join(root, "runtime-executed.txt");
+    const denied = path.join(root, "unauthorized-runtime.txt");
+    const runtime = runtimeFixture(root, started, executed);
+    fs.writeFileSync(runtime.npmCli, [
+      "const fs = require('node:fs');",
+      `fs.writeFileSync(${JSON.stringify(started)}, 'started');`,
+      `fs.writeFileSync(${JSON.stringify(executed)}, 'approved');`,
+    ].join("\n"));
+    const nodeBytes = fs.readFileSync(runtime.node);
+    const managerBytes = fs.readFileSync(runtime.npmCli);
+    const managerMainEntryBytes = fs.readFileSync(runtime.npmMainEntry);
+    const managerAttackBytes = Buffer.from(
+      `require('node:fs').writeFileSync(${JSON.stringify(denied)}, 'ran');\n`,
+    );
+    const nodeAttackBytes = fs.readFileSync(path.join(
+      process.env.SystemRoot ?? "C:\\Windows", "System32", "where.exe",
+    ));
+    const initial = {
+      nodeIdentity: winFileIdentity(runtime.node),
+      nodeHash: sha256File(runtime.node),
+      managerIdentity: winFileIdentity(runtime.npmCli),
+      managerHash: sha256File(runtime.npmCli),
+      managerMainEntryIdentity: winFileIdentity(runtime.npmMainEntry),
+      managerMainEntryHash: sha256File(runtime.npmMainEntry),
+    };
+    const jobId = "runtime-lock-window-job-0001";
+    const { owner, request } = makeDirectNativeRequest(makeSystemTempDir("runtime-lock-window-repo"), jobId);
+    const discoveredRuntime = resolveTrustedRuntime("npm", {
+      platform: "win32", nodeExecutable: runtime.node, homeDirectory: root,
+    });
+    const attackState: { worker: Worker | null; evidencePromise: Promise<{
+      attempted: Record<string, number>;
+      blockedBySharing: Record<string, number>;
+      mutationSucceeded: Record<string, number>;
+      errorCodes: Record<string, number>;
+      replacementSucceeded: { node: boolean; manager: boolean; managerMain: boolean };
+      replacementFailed: { node: number; manager: number; managerMain: number };
+    }> | null } = { worker: null, evidencePromise: null };
+    const runner = new WindowsNativeExecutionRunner({
+      runtimeResolver: () => discoveredRuntime,
+      beforeHelperRequestWrite: () => {
+        attackState.worker = new Worker(`
+          const { parentPort, workerData } = require('node:worker_threads');
+          const fs = require('node:fs');
+          const evidence = {
+            attempted: { nodeWrite: 0, nodeReplace: 0, managerWrite: 0, managerReplace: 0, managerMainWrite: 0, managerMainReplace: 0 },
+            blockedBySharing: { nodeWrite: 0, nodeReplace: 0, managerWrite: 0, managerReplace: 0, managerMainWrite: 0, managerMainReplace: 0 },
+            mutationSucceeded: { nodeWrite: 0, managerWrite: 0, managerMainWrite: 0 },
+            errorCodes: {},
+            replacementSucceeded: { node: false, manager: false, managerMain: false },
+            replacementFailed: { node: 0, manager: 0, managerMain: 0 },
+          };
+          const recordError = (key, error) => {
+            const code = error.code || 'UNKNOWN';
+            evidence.errorCodes[key + ':' + code] = (evidence.errorCodes[key + ':' + code] || 0) + 1;
+          };
+          const denied = (error) => ['EPERM', 'EBUSY', 'EACCES'].includes(error.code || '');
+          const mutate = (key, file, firstByte) => {
+            evidence.attempted[key]++;
+            let handle;
+            let changed = false;
+            try {
+              handle = fs.openSync(file, 'r+');
+              fs.writeSync(handle, Buffer.from([firstByte ^ 1]), 0, 1, 0);
+              changed = true;
+              evidence.mutationSucceeded[key]++;
+            } catch (error) {
+              recordError(key, error);
+              if (denied(error)) evidence.blockedBySharing[key]++;
+            } finally {
+              if (changed) {
+                try { fs.writeSync(handle, Buffer.from([firstByte]), 0, 1, 0); }
+                catch (error) { recordError(key + '.restore', error); }
+              }
+              if (handle !== undefined) fs.closeSync(handle);
+            }
+          };
+          const replace = (key, file, kind, attackBytes) => {
+            evidence.attempted[key]++;
+            const displaced = file + '.race-displaced'; let moved = false;
+            try {
+              fs.renameSync(file, displaced); moved = true;
+              fs.writeFileSync(file, attackBytes);
+              evidence.replacementSucceeded[kind] = true;
+              fs.unlinkSync(file);
+              fs.renameSync(displaced, file); moved = false;
+            } catch (error) {
+              evidence.replacementFailed[kind]++;
+              recordError(key, error);
+              if (denied(error)) evidence.blockedBySharing[key]++;
+              if (moved && fs.existsSync(displaced)) {
+                try {
+                  if (fs.existsSync(file)) fs.unlinkSync(file);
+                  fs.renameSync(displaced, file);
+                } catch (restoreError) { recordError(key + '.restore', restoreError); }
+              }
+            }
+          };
+          const deadline = Date.now() + 1200;
+          const pauseView = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+          while (Date.now() < deadline && !fs.existsSync(workerData.started)) {
+            mutate('nodeWrite', workerData.node, workerData.nodeFirstByte);
+            mutate('managerWrite', workerData.manager, workerData.managerFirstByte);
+            replace('nodeReplace', workerData.node, 'node', workerData.nodeAttackBytes);
+            replace('managerReplace', workerData.manager, 'manager', workerData.managerAttackBytes);
+            mutate('managerMainWrite', workerData.managerMainEntry, workerData.managerMainEntryFirstByte);
+            replace('managerMainReplace', workerData.managerMainEntry, 'managerMain', workerData.managerAttackBytes);
+            Atomics.wait(pauseView, 0, 0, 1);
+          }
+          parentPort.postMessage(evidence);
+          parentPort.close();
+        `, { eval: true, workerData: {
+          node: runtime.node, manager: runtime.npmCli,
+          managerMainEntry: runtime.npmMainEntry,
+          started,
+          nodeFirstByte: nodeBytes[0],
+          managerFirstByte: managerBytes[0],
+          managerMainEntryFirstByte: managerMainEntryBytes[0],
+          nodeAttackBytes: Uint8Array.from(nodeAttackBytes),
+          managerAttackBytes: Uint8Array.from(managerAttackBytes),
+        } });
+        const worker = attackState.worker;
+        if (!worker) throw new Error("Runtime attack worker was not created.");
+        attackState.evidencePromise = new Promise((resolve, reject) => {
+          worker.once("message", resolve);
+          worker.once("error", reject);
+        });
+      },
+    });
+    const output: Buffer[] = [];
+    const diagnostics: string[] = [];
+    const handle = runner.start(request, {
+      onOutput: (_stream, data) => output.push(Buffer.from(data)),
+      onDiagnostic: (message) => diagnostics.push(message),
+    });
+    const attacker = attackState.worker;
+    const evidencePromise = attackState.evidencePromise;
+    if (!attacker || !evidencePromise) throw new Error("Runtime attack worker was not started.");
+    const evidence = await evidencePromise;
+    const completion = await handle.completion;
+    await new Promise<void>((resolve) => {
+      if (attacker?.threadId === -1) resolve();
+      else attacker?.once("exit", () => resolve());
+    });
+    for (const [file, bytes] of [
+      [runtime.node, nodeBytes],
+      [runtime.npmCli, managerBytes],
+      [runtime.npmMainEntry, managerMainEntryBytes],
+    ] as const) {
+      const displaced = `${file}.race-displaced`;
+      if (fs.existsSync(displaced)) {
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+        fs.renameSync(displaced, file);
+      }
+      if (!fs.existsSync(file) || sha256File(file) !== createHash("sha256").update(bytes).digest("hex")) {
+        fs.writeFileSync(file, bytes);
+      }
+    }
+    const final = {
+      nodeIdentity: winFileIdentity(runtime.node),
+      nodeHash: sha256File(runtime.node),
+      managerIdentity: winFileIdentity(runtime.npmCli),
+      managerHash: sha256File(runtime.npmCli),
+      managerMainEntryIdentity: winFileIdentity(runtime.npmMainEntry),
+      managerMainEntryHash: sha256File(runtime.npmMainEntry),
+      started: fs.existsSync(started),
+      executionObserved: fs.existsSync(executed),
+      unauthorizedExecutionObserved: fs.existsSync(denied),
+    };
+    console.info("RUNTIME_TOCTOU_EVIDENCE", JSON.stringify({
+      attempted: evidence.attempted,
+      blockedBySharing: evidence.blockedBySharing,
+      mutationSucceeded: evidence.mutationSucceeded,
+      replacementSucceeded: evidence.replacementSucceeded,
+      replacementFailed: evidence.replacementFailed,
+      errorCodes: evidence.errorCodes,
+      outcome: completion.result.outcome,
+      win32Error: completion.result.win32Error,
+      exitCode: completion.result.exitCode,
+      diagnostics,
+      output: Buffer.concat(output).toString("utf8").slice(-1024),
+      final,
+    }));
+    expect(evidence.attempted.nodeWrite + evidence.attempted.nodeReplace).toBeGreaterThan(0);
+    expect(evidence.attempted.managerWrite + evidence.attempted.managerReplace).toBeGreaterThan(0);
+    expect(evidence.attempted.managerMainWrite + evidence.attempted.managerMainReplace).toBeGreaterThan(0);
+    const allBlockedBySharing = [
+      evidence.blockedBySharing.nodeWrite,
+      evidence.blockedBySharing.nodeReplace,
+      evidence.blockedBySharing.managerWrite,
+      evidence.blockedBySharing.managerReplace,
+      evidence.blockedBySharing.managerMainWrite,
+      evidence.blockedBySharing.managerMainReplace,
+    ].every((count) => count > 0);
+    const failedClosedBeforeCode = completion.result.outcome === 3 && !final.started && !final.executionObserved;
+    expect(allBlockedBySharing || failedClosedBeforeCode, JSON.stringify({ evidence, final, completion })).toBe(true);
+    expect(final.unauthorizedExecutionObserved, JSON.stringify({ evidence, final })).toBe(false);
+    expect(final).toMatchObject(initial);
+    if (completion.result.outcome === 0) {
+      expect(allBlockedBySharing).toBe(true);
+      expect(final.started).toBe(true);
+      expect(final.executionObserved).toBe(true);
+    } else {
+      expect(completion.result.outcome).toBe(3);
+      expect(final.started).toBe(false);
+      expect(final.executionObserved).toBe(false);
+    }
+    expect(fs.existsSync(request.tempLease.directoryPath)).toBe(false);
+    expect(owner.rootFileIdentity).toBeTruthy();
+  }, 60_000);
 
   it.skipIf(process.platform !== "win32")("package.json replacement race never runs an unapproved script", async () => {
     const root = makeTmpDir("windows-package-race");
@@ -393,9 +869,11 @@ describe("Windows execution lifecycle acceptance", () => {
     write(root, "approved.mjs", `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(approvedMarker)}, 'approved');\nawait new Promise((resolve) => setTimeout(resolve, 1800));\n`);
     write(root, "unauthorized.mjs", `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(deniedMarker)}, 'unauthorized');\n`);
     write(root, "package.json", JSON.stringify({ name: "package-race-fixture", scripts: { test: "node approved.mjs" } }));
+    const approvedManifestHash = sha256File(manifestPath);
 
-    let attacker: Worker | null = null;
+    const attackerState: { current: Worker | null } = { current: null };
     let attackAttempts = 0;
+    const attackEvidenceState: { current: { attempted: number; blockedBySharing: number; replacementSucceeded: number; replacementFailed: number; errorCodes: Record<string, number> } | null } = { current: null };
     const nativeRunner = new WindowsNativeExecutionRunner();
     const runner: ExecutionRunner = {
       start: (request, callbacks) => {
@@ -403,24 +881,51 @@ describe("Windows execution lifecycle acceptance", () => {
           const fs = require('node:fs');
           const path = require('node:path');
           const { parentPort, workerData } = require('node:worker_threads');
-          let running = true; let attempts = 0;
+          let running = true;
+          const evidence = { attempted: 0, blockedBySharing: 0, replacementSucceeded: 0, replacementFailed: 0, errorCodes: {} };
+          const recordError = (error) => {
+            const code = error.code || 'UNKNOWN';
+            evidence.errorCodes[code] = (evidence.errorCodes[code] || 0) + 1;
+            if (['EPERM', 'EBUSY', 'EACCES'].includes(code)) evidence.blockedBySharing++;
+          };
           parentPort.on('message', () => { running = false; });
           const wait = () => new Promise((resolve) => setTimeout(resolve, 2));
           (async () => {
             const swap = workerData.manifest + '.race-swap';
+            const backup = workerData.manifest + '.race-original';
             while (running) {
-              const command = attempts % 2 ? 'node unauthorized.mjs' : 'node approved.mjs';
+              evidence.attempted++;
+              const command = evidence.attempted % 2 ? 'node unauthorized.mjs' : 'node approved.mjs';
+              let moved = false;
               try {
                 fs.writeFileSync(swap, JSON.stringify({ name: 'package-race-fixture', scripts: { test: command } }));
+                fs.renameSync(workerData.manifest, backup); moved = true;
                 fs.renameSync(swap, workerData.manifest);
-              } catch {}
-              attempts++; if (attempts === 1 || attempts % 100 === 0) parentPort.postMessage({ attempts }); await wait();
+                evidence.replacementSucceeded++;
+              } catch (error) {
+                evidence.replacementFailed++;
+                recordError(error);
+              } finally {
+                if (moved && fs.existsSync(backup)) {
+                  try {
+                    if (fs.existsSync(workerData.manifest)) fs.unlinkSync(workerData.manifest);
+                    fs.renameSync(backup, workerData.manifest);
+                  } catch (error) { recordError(error); }
+                }
+                if (fs.existsSync(swap)) {
+                  try { fs.unlinkSync(swap); } catch (error) { recordError(error); }
+                }
+              }
+              if (evidence.attempted === 1 || evidence.attempted % 100 === 0) parentPort.postMessage({ attempts: evidence.attempted, evidence }); await wait();
             }
-            parentPort.postMessage({ attempts, done: true });
+            parentPort.postMessage({ attempts: evidence.attempted, evidence, done: true });
           })();
         `;
-        attacker = new Worker(attackerSource, { eval: true, workerData: { manifest: manifestPath } });
-        attacker.on("message", (value: { attempts?: number }) => { attackAttempts = value.attempts ?? attackAttempts; });
+        attackerState.current = new Worker(attackerSource, { eval: true, workerData: { manifest: manifestPath } });
+        attackerState.current.on("message", (value: { attempts?: number; evidence?: { attempted: number; blockedBySharing: number; replacementSucceeded: number; replacementFailed: number; errorCodes: Record<string, number> } }) => {
+          attackAttempts = value.attempts ?? attackAttempts;
+          attackEvidenceState.current = value.evidence ?? attackEvidenceState.current;
+        });
         return nativeRunner.start(request, callbacks);
       },
     };
@@ -437,14 +942,24 @@ describe("Windows execution lifecycle acceptance", () => {
         const state = supervisor.store.get(started.job.jobId)?.state;
         return state === "succeeded" || state === "failed" || state === "interrupted";
       }, 30_000, "The package manifest race did not settle.");
-      await stopRaceWorker(attacker, (count) => { attackAttempts = Math.max(attackAttempts, count); });
-      expect(attackAttempts).toBeGreaterThan(0);
-      expect(fs.existsSync(deniedMarker)).toBe(false);
+      await stopRaceWorker(attackerState.current, (count) => { attackAttempts = Math.max(attackAttempts, count); });
+      const finalManifestHash = sha256File(manifestPath);
       const finalJob = supervisor.store.get(started.job.jobId);
+      const attackEvidence = attackEvidenceState.current;
+      console.info("PACKAGE_MANIFEST_TOCTOU_EVIDENCE", JSON.stringify({
+        ...attackEvidence, attackAttempts, finalManifestHash, approvedManifestHash,
+        executionObserved: fs.existsSync(approvedMarker), unauthorizedExecutionObserved: fs.existsSync(deniedMarker),
+        finalState: finalJob?.state,
+      }));
+      expect(attackEvidence?.attempted ?? attackAttempts).toBeGreaterThan(0);
+      expect((attackEvidence?.replacementSucceeded ?? 0) + (attackEvidence?.blockedBySharing ?? 0)).toBeGreaterThan(0);
+      expect(finalManifestHash).toBe(approvedManifestHash);
+      expect(fs.existsSync(deniedMarker)).toBe(false);
       if (finalJob?.state === "succeeded") expect(fs.readFileSync(approvedMarker, "utf8")).toBe("approved");
+      else expect(fs.existsSync(approvedMarker)).toBe(false);
       expectNoOwnedJobTemps(supervisor);
     } finally {
-      await attacker?.terminate();
+      await attackerState.current?.terminate();
       await supervisor.shutdown();
     }
   }, 45_000);
@@ -463,21 +978,29 @@ describe("Windows execution lifecycle acceptance", () => {
       write(external, "package.json", manifest);
       write(external, "unauthorized.mjs", `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(deniedMarker)}, 'unauthorized');\n`);
 
-      let attacker: Worker | null = null;
+      const attackerState: { current: Worker | null } = { current: null };
       let attackAttempts = 0;
+      const attackEvidenceState: { current: { attempted: number; blockedBySharing: number; replacementSucceeded: number; replacementFailed: number; errorCodes: Record<string, number> } | null } = { current: null };
       const nativeRunner = new WindowsNativeExecutionRunner();
       const runner: ExecutionRunner = {
         start: (request, callbacks) => {
           const source = `
             const fs = require('node:fs');
             const { parentPort, workerData } = require('node:worker_threads');
-            let running = true; let attempts = 0;
+            let running = true;
+            const evidence = { attempted: 0, blockedBySharing: 0, replacementSucceeded: 0, replacementFailed: 0, errorCodes: {} };
+            const recordError = (error) => {
+              const code = error.code || 'UNKNOWN';
+              evidence.errorCodes[code] = (evidence.errorCodes[code] || 0) + 1;
+              if (['EPERM', 'EBUSY', 'EACCES'].includes(code)) evidence.blockedBySharing++;
+            };
             parentPort.on('message', () => { running = false; });
             const wait = () => new Promise((resolve) => setTimeout(resolve, 2));
             (async () => {
               const backup = workerData.root + '.race-original';
               while (running) {
                 try {
+                  evidence.attempted++;
                   if (!fs.existsSync(backup) && fs.existsSync(workerData.root)) fs.renameSync(workerData.root, backup);
                   if (!fs.existsSync(workerData.root)) {
                     if (workerData.mode === 'junction') fs.symlinkSync(workerData.external, workerData.root, 'junction');
@@ -486,18 +1009,22 @@ describe("Windows execution lifecycle acceptance", () => {
                       fs.writeFileSync(workerData.root + '/package.json', workerData.manifest);
                       fs.writeFileSync(workerData.root + '/unauthorized.mjs', workerData.script);
                     }
+                    evidence.replacementSucceeded++;
                   }
-                } catch {}
-                attempts++; if (attempts === 1 || attempts % 100 === 0) parentPort.postMessage({ attempts }); await wait();
+                } catch (error) { evidence.replacementFailed++; recordError(error); }
+                if (evidence.attempted === 1 || evidence.attempted % 100 === 0) parentPort.postMessage({ attempts: evidence.attempted, evidence }); await wait();
               }
-              parentPort.postMessage({ attempts, done: true });
+              parentPort.postMessage({ attempts: evidence.attempted, evidence, done: true });
             })();
           `;
-          attacker = new Worker(source, { eval: true, workerData: {
+          attackerState.current = new Worker(source, { eval: true, workerData: {
             root, external, mode, manifest,
             script: `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(deniedMarker)}, 'unauthorized');\n`,
           } });
-          attacker.on("message", (value: { attempts?: number }) => { attackAttempts = value.attempts ?? attackAttempts; });
+          attackerState.current.on("message", (value: { attempts?: number; evidence?: { attempted: number; blockedBySharing: number; replacementSucceeded: number; replacementFailed: number; errorCodes: Record<string, number> } }) => {
+            attackAttempts = value.attempts ?? attackAttempts;
+            attackEvidenceState.current = value.evidence ?? attackEvidenceState.current;
+          });
           return nativeRunner.start(request, callbacks);
         },
       };
@@ -520,12 +1047,16 @@ describe("Windows execution lifecycle acceptance", () => {
           const state = supervisor.store.get(started.job.jobId)?.state;
           return state === "succeeded" || state === "failed" || state === "interrupted";
         }, 30_000, `The ${mode} repository race did not settle.`);
-        await stopRaceWorker(attacker, (count) => { attackAttempts = Math.max(attackAttempts, count); });
-        expect(attackAttempts).toBeGreaterThan(0);
+        await stopRaceWorker(attackerState.current, (count) => { attackAttempts = Math.max(attackAttempts, count); });
+        const attackEvidence = attackEvidenceState.current;
+        console.info("REPOSITORY_TOCTOU_EVIDENCE", JSON.stringify({ mode, ...attackEvidence, attackAttempts,
+          unauthorizedExecutionObserved: fs.existsSync(deniedMarker), finalState: supervisor.store.get(started.job.jobId)?.state }));
+        expect(attackEvidence?.attempted ?? attackAttempts).toBeGreaterThan(0);
+        expect((attackEvidence?.replacementSucceeded ?? 0) + (attackEvidence?.blockedBySharing ?? 0)).toBeGreaterThan(0);
         expect(fs.existsSync(deniedMarker)).toBe(false);
         expectNoOwnedJobTemps(supervisor);
       } finally {
-        await attacker?.terminate();
+        await attackerState.current?.terminate();
         await supervisor.shutdown();
       }
     }
