@@ -100,6 +100,60 @@ async function exchangeToken(
 }
 
 describe("discovery metadata", () => {
+  it("uses the configured public tunnel authority for incremental auth and discovery", async () => {
+    const publicUrl = "https://trusted-tunnel.example";
+    const publicBridge = await startBridge({
+      workspaceRoot: makeTmpDir("oauth-public-ws"),
+      port: 0,
+      persistRuntime: false,
+      authStoreFile: path.join(makeTmpDir("oauth-public-auth"), "store.json"),
+      tunnelProvider: {
+        name: "isolated-test",
+        start: async () => publicUrl,
+        restart: async () => publicUrl,
+        stop: async () => {},
+        status: () => ({ running: true, url: publicUrl, provider: "isolated-test" }),
+        getPublicUrl: () => publicUrl,
+        doctor: async () => ({ provider: "isolated-test", binaryFound: true, binaryPath: null, running: true, url: publicUrl, problems: [] }),
+      },
+    });
+    try {
+      const local = publicBridge.localBaseUrl();
+      const start = await fetch(`${local}/admin/tunnel/start`, { method: "POST", headers: { authorization: `Bearer ${publicBridge.adminToken}` } });
+      expect(start.status).toBe(200);
+      const metadata = await fetch(`${local}/.well-known/oauth-protected-resource/mcp`, { headers: { host: "attacker.invalid" } });
+      expect(await metadata.json()).toMatchObject({ resource: `${publicUrl}/mcp`, authorization_servers: [publicUrl] });
+      const old = publicBridge.authStore.issueTokens({ clientId: "public-test-client", scopes: [...DEFAULT_SCOPES] });
+      const call = await fetch(`${local}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${old.accessToken}`, host: "attacker.invalid", "x-forwarded-proto": "http" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 52, method: "tools/call", params: { name: "execution_list", arguments: { limit: 1 } } }),
+      });
+      expect(call.status).toBe(200);
+      const rpc = await call.json() as { result: { _meta: Record<string, string[]> } };
+      expect(rpc.result._meta["mcp/www_authenticate"][0]).toContain(`resource_metadata="${publicUrl}/.well-known/oauth-protected-resource/mcp"`);
+      expect(JSON.stringify(rpc)).not.toContain("attacker.invalid");
+    } finally {
+      await publicBridge.close();
+    }
+  });
+
+  it("keeps discovery and HTTP auth challenges independent of request Host/proxy headers", async () => {
+    const headers = { host: "attacker.invalid", "x-forwarded-host": "attacker.invalid", "x-forwarded-proto": "https" };
+    const metadata = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`, { headers });
+    const resource = await metadata.json() as { resource: string; authorization_servers: string[] };
+    expect(resource.resource).toBe(`${base}/mcp`);
+    expect(resource.authorization_servers).toEqual([base]);
+    const discovery = await fetch(`${base}/.well-known/oauth-authorization-server`, { headers });
+    const issuer = await discovery.json() as { issuer: string; authorization_endpoint: string };
+    expect(issuer.issuer).toBe(base);
+    expect(issuer.authorization_endpoint).toBe(`${base}/oauth/authorize`);
+    const denied = await fetch(`${base}/mcp`, { method: "POST", headers });
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get("www-authenticate")).toContain(`resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`);
+    expect(denied.headers.get("www-authenticate")).not.toContain("attacker.invalid");
+  });
+
   it("serves protected resource metadata", async () => {
     const response = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`);
     expect(response.status).toBe(200);
@@ -131,12 +185,65 @@ describe("discovery metadata", () => {
 });
 
 describe("explicit OAuth capabilities", () => {
+  it("upgrades only through explicit authorization and leaves old access/refresh grants unchanged", async () => {
+    const executionScopes = ["execution.jobs.read", "execution.run", "execution.cancel"];
+    const clientId = await registerClient();
+    const oldPkce = pkceVerifierAndChallenge();
+    const oldAuthorization = await authorizeWithPairing(clientId, oldPkce.challenge, bridge.pairing.create().code, "old-grant", null);
+    const old = await exchangeToken(clientId, oldAuthorization.code!, oldPkce.verifier);
+    expect(old.status).toBe(200);
+    expect(old.body.scope.split(" ")).toEqual([...DEFAULT_SCOPES]);
+
+    const listJobs = async (token: string) => {
+      const response = await fetch(`${base}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "execution_list", arguments: { limit: 1 } } }),
+      });
+      expect(response.status).toBe(200);
+      return (await response.json()) as { result: { isError?: boolean; content: { text: string }[]; structuredContent?: unknown; _meta?: Record<string, unknown> } };
+    };
+    const denied = (await listJobs(old.body.access_token)).result;
+    expect(denied.isError).toBe(true);
+    expect(JSON.parse(denied.content[0].text).error).toBe("INSUFFICIENT_SCOPE");
+    expect(denied._meta?.["mcp/www_authenticate"]).toEqual([`Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp", error="insufficient_scope", error_description="This operation requires the 'execution.jobs.read' scope.", scope="execution.jobs.read"`]);
+
+    const refreshedResponse = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: old.body.refresh_token, client_id: clientId, scope: [...DEFAULT_SCOPES, ...executionScopes].join(" ") }),
+    });
+    expect(refreshedResponse.status).toBe(200);
+    const refreshed = await refreshedResponse.json() as Record<string, string>;
+    expect(refreshed.scope.split(" ")).toEqual([...DEFAULT_SCOPES]);
+    expect((await listJobs(refreshed.access_token)).result.isError).toBe(true);
+
+    const newPkce = pkceVerifierAndChallenge();
+    const requested = [...DEFAULT_SCOPES, ...executionScopes];
+    const explicit = await authorizeWithPairing(clientId, newPkce.challenge, bridge.pairing.create().code, "explicit-execution", requested.join(" "));
+    for (const label of ["View execution job status", "Start execution jobs", "Cancel execution jobs"]) expect(explicit.page).toContain(label);
+    expect(new URL(explicit.location!).searchParams.get("state")).toBe("explicit-execution");
+    const upgraded = await exchangeToken(clientId, explicit.code!, newPkce.verifier);
+    expect(upgraded.status).toBe(200);
+    expect(upgraded.body.scope.split(" ")).toEqual(requested);
+    const listed = (await listJobs(upgraded.body.access_token)).result;
+    expect(listed.isError ?? false).toBe(false);
+    expect(listed.structuredContent).toEqual({ jobs: [] });
+    for (const token of [old.body.access_token, refreshed.access_token]) {
+      const verdict = bridge.authStore.verifyAccessToken(token);
+      expect(verdict.ok && verdict.record.scopes).toEqual([...DEFAULT_SCOPES]);
+    }
+  });
+
   const newCapabilities = [
     { scope: "workspace.write", label: "Create and modify files in this workspace", mutation: true },
     { scope: "workspace.delete", label: "Delete files in this workspace", mutation: true },
     { scope: "filesystem.external.read", label: "Read permitted files outside this workspace", mutation: false },
     { scope: "filesystem.external.write", label: "Create and modify permitted files outside this workspace", mutation: true },
     { scope: "system.read", label: "Read limited host system diagnostics", mutation: false },
+    { scope: "execution.jobs.read", label: "View execution job status", mutation: false },
+    { scope: "execution.run", label: "Start execution jobs", mutation: true },
+    { scope: "execution.cancel", label: "Cancel execution jobs", mutation: true },
   ];
 
   it.each([
@@ -408,6 +515,10 @@ describe("refresh token rotation", () => {
     ["filesystem.external.read", "offline_access"],
     ["filesystem.external.write", "offline_access"],
     ["system.read", "offline_access"],
+    [...DEFAULT_SCOPES, "workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write"],
+    ["execution.jobs.read", "offline_access"],
+    ["execution.run", "offline_access"],
+    ["execution.cancel", "offline_access"],
   ])("cannot gain capabilities through refresh: %j", async (...scopes) => {
     const clientId = await registerClient();
     const { verifier, challenge } = pkceVerifierAndChallenge();

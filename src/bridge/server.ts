@@ -117,12 +117,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   app.set("trust proxy", true);
   app.disable("x-powered-by");
 
-  const getBaseUrl = (req: Request): string => {
-    if (publicBaseUrl) return publicBaseUrl;
-    const proto = req.protocol;
-    const hostHeader = req.get("host") ?? `${host}:${port}`;
-    return `${proto}://${hostHeader}`;
-  };
+  const localBaseUrl = (): string => `http://${host === "::1" ? "[::1]" : host}:${port}`;
+  // OAuth discovery and challenges share the trusted tunnel/bind authority.
+  // Request Host/proxy headers must not choose an authorization server.
+  const getBaseUrl = (): string => publicBaseUrl ?? localBaseUrl();
 
   // ---- Health (public but minimal) ---------------------------------------
 
@@ -146,7 +144,12 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   let executionSupervisor: ExecutionSupervisor | null = null;
   const mcpHandler = createMcpHttpHandler(
-    () => createMcpServer({ workspace, logger, executionSupervisor: executionSupervisor ?? undefined }),
+    () => createMcpServer({
+      workspace,
+      logger,
+      executionSupervisor: executionSupervisor ?? undefined,
+      oauthResourceMetadataUri: `${getBaseUrl()}/.well-known/oauth-protected-resource/mcp`,
+    }),
     logger
   );
   app.all(
@@ -313,7 +316,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     tunnel,
     executionSupervisor: supervisor,
     getPublicBaseUrl: () => publicBaseUrl,
-    localBaseUrl: () => `http://${host}:${port}`,
+    localBaseUrl,
     close: shutdown,
   };
 }

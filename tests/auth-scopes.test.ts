@@ -53,6 +53,7 @@ describe("OAuth scope filtering", () => {
 describe("persisted OAuth scopes", () => {
   it.each([
     V1_SCOPES,
+    [...V1_SCOPES, ...NEW_SCOPES],
     ["workspace.read", "offline_access"],
     ...NEW_SCOPES.map((scope) => ["workspace.read", scope, "offline_access"]),
     ...EXECUTION_SCOPES.map((scope) => ["workspace.read", scope, "offline_access"]),

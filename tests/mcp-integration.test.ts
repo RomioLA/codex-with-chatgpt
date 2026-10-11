@@ -131,6 +131,59 @@ afterAll(async () => {
 });
 
 describe("MCP tools over Streamable HTTP", () => {
+  const executionPolicies = [
+    { name: "execution_start", scope: "execution.run", args: { repository_path: ".", kind: "test", target: "test", timeout_seconds: 30, idempotency_key: "oauth-scope-test-00001" } },
+    { name: "execution_status", scope: "execution.jobs.read", args: { job_id: "a".repeat(24) } },
+    { name: "execution_job_output", scope: "execution.jobs.read", args: { job_id: "a".repeat(24), stream: "stdout" } },
+    { name: "execution_cancel", scope: "execution.cancel", args: { job_id: "a".repeat(24) } },
+    { name: "execution_list", scope: "execution.jobs.read", args: { limit: 1 } },
+  ];
+
+  it("publishes execution OAuth policies on the actual tools/list wire response", async () => {
+    // SDK 1.30's client ToolSchema strips unknown top-level fields, so inspect
+    // the real HTTP result as well as the SDK-visible compatibility mirror.
+    const response = await fetch(`${bridge.localBaseUrl()}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 41, method: "tools/list", params: {} }),
+    });
+    expect(response.status).toBe(200);
+    const rpc = await response.json() as { result: { tools: { name: string; securitySchemes?: unknown; _meta?: Record<string, unknown> }[] } };
+    const sdk = await client.listTools();
+    for (const { name, scope } of executionPolicies) {
+      const schemes = [{ type: "oauth2", scopes: [scope] }];
+      const tool = rpc.result.tools.find((tool) => tool.name === name);
+      expect(tool?.securitySchemes).toEqual(schemes);
+      expect(tool?._meta?.securitySchemes).toEqual(schemes);
+      expect(sdk.tools.find((tool) => tool.name === name)?._meta?.securitySchemes).toEqual(schemes);
+    }
+  });
+
+  it.each(executionPolicies)("returns a scope-specific OAuth challenge for old-token $name", async ({ name, scope, args }) => {
+    const denied = await client.callTool({ name, arguments: args });
+    expect(denied.isError).toBe(true);
+    expect(jsonOf(denied)).toMatchObject({ error: "INSUFFICIENT_SCOPE" });
+    expect(denied._meta?.["mcp/www_authenticate"]).toEqual([
+      `Bearer resource_metadata="${bridge.localBaseUrl()}/.well-known/oauth-protected-resource/mcp", error="insufficient_scope", error_description="This operation requires the '${scope}' scope.", scope="${scope}"`,
+    ]);
+    expect(textOf(denied)).not.toContain("EXECUTION_UNAVAILABLE");
+    const verdict = bridge.authStore.verifyAccessToken(accessToken);
+    expect(verdict.ok && verdict.record.scopes).toEqual(["workspace.read", "workspace.search", "git.read", "execution.read"]);
+  });
+
+  it("uses trusted resource metadata even with forged Host and forwarded headers", async () => {
+    const response = await fetch(`${bridge.localBaseUrl()}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${accessToken}`, host: "attacker.invalid", "x-forwarded-host": "attacker.invalid", "x-forwarded-proto": "https" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 42, method: "tools/call", params: { name: "execution_list", arguments: { limit: 1 } } }),
+    });
+    expect(response.status).toBe(200);
+    const rpc = await response.json() as { result: { isError: boolean; _meta: Record<string, string[]> } };
+    expect(rpc.result.isError).toBe(true);
+    expect(rpc.result._meta["mcp/www_authenticate"][0]).toContain(`resource_metadata="${bridge.localBaseUrl()}/.well-known/oauth-protected-resource/mcp"`);
+    expect(JSON.stringify(rpc)).not.toContain("attacker.invalid");
+  });
+
   it("lists read-only tools and explicitly separated permission-gated file tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
