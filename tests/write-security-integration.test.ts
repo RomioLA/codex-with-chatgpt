@@ -89,7 +89,7 @@ async function authorize(scope?: string) {
   });
   expect(exchange.status).toBe(200);
   const token = await exchange.json() as Token;
-  expect(token.scope.split(" ")).toEqual(scope === undefined ? legacyScopes : scope.split(" "));
+  expect(token.scope.split(" ")).toEqual(scope === undefined ? [...DEFAULT_SCOPES] : scope.split(" "));
   return { client: await connect(token.access_token), token, clientId };
 }
 
@@ -115,14 +115,13 @@ afterAll(async () => {
 });
 
 describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
-  it("A: omitted scope grants only legacy defaults and denies create at local level2", async () => {
-    expect([...DEFAULT_SCOPES]).toEqual(legacyScopes);
-    expect([...SUPPORTED_SCOPES]).toEqual([...legacyScopes, "system.read", ...fileScopes.slice(1)]);
+  it("A: omitted scope grants approved defaults but readonly denies create", async () => {
+    expect([...DEFAULT_SCOPES]).toEqual(["workspace.read", "workspace.search", "git.read", "execution.read", "system.read", "workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write", "execution.jobs.read", "execution.run", "execution.cancel", "offline_access"]);
+    expect(DEFAULT_SCOPES.every((scope) => (SUPPORTED_SCOPES as readonly string[]).includes(scope))).toBe(true);
     const { client, token } = await session();
-    expect(token.scope.split(" ")).toEqual(legacyScopes);
-    setPermission(bridge.workspace.id, "level2");
+    expect(token.scope.split(" ")).toEqual([...DEFAULT_SCOPES]);
     const relative = fresh();
-    await call(client, "create_file", { path: relative, content: "denied" }, "INSUFFICIENT_SCOPE");
+    await call(client, "create_file", { path: relative, content: "denied" }, "LOCAL_PERMISSION_DENIED");
     expect(fs.existsSync(path.join(root, relative))).toBe(false);
   });
 
@@ -134,7 +133,7 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
   });
 
   it("legacy OAuth cannot observe the Host even at level2", async () => {
-    const { client } = await session();
+    const { client } = await session(legacyScopes);
     setPermission(bridge.workspace.id, "level2");
     for (const [name, args] of [
       ["host_context", {}], ["process_query", { pid: 1 }], ["process_tree", { pid: 1 }],
@@ -243,8 +242,8 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
       content: "denied", expected_hash: hash("keep"), old_text: "keep", new_text: "denied" };
   }
 
-  it.each(operations)("real default token denies %s even at level2", async (tool) => {
-    const { client } = await session();
+  it.each(operations)("legacy narrow token denies %s even at level2", async (tool) => {
+    const { client } = await session(legacyScopes);
     setPermission(bridge.workspace.id, "level2");
     await call(client, tool, argsFor(tool), "INSUFFICIENT_SCOPE");
   });

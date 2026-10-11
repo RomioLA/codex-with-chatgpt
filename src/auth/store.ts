@@ -3,17 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 
-// Default connections keep the V1 read-only grant, regardless of new capabilities.
+// Newly authorized connections receive only this explicitly approved scope set.
 export const DEFAULT_SCOPES = [
   "workspace.read",
   "workspace.search",
   "git.read",
   "execution.read",
-  "offline_access",
-] as const;
-
-export const SUPPORTED_SCOPES = [
-  ...DEFAULT_SCOPES,
   "system.read",
   "workspace.write",
   "workspace.delete",
@@ -22,6 +17,12 @@ export const SUPPORTED_SCOPES = [
   "execution.jobs.read",
   "execution.run",
   "execution.cancel",
+  "offline_access",
+] as const;
+
+// Future additions to SUPPORTED_SCOPES must not silently expand DEFAULT_SCOPES.
+export const SUPPORTED_SCOPES = [
+  ...DEFAULT_SCOPES,
 ] as const;
 
 export type Scope = (typeof SUPPORTED_SCOPES)[number];

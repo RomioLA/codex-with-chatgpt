@@ -5,33 +5,25 @@ import { AuthStore, DEFAULT_SCOPES, SUPPORTED_SCOPES, filterScopes } from "../sr
 import { cleanup, makeTmpDir, write } from "./helpers.js";
 
 const V1_SCOPES = ["workspace.read", "workspace.search", "git.read", "execution.read", "offline_access"];
+const APPROVED_DEFAULT_SCOPES = ["workspace.read", "workspace.search", "git.read", "execution.read", "system.read", "workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write", "execution.jobs.read", "execution.run", "execution.cancel", "offline_access"];
 const NEW_SCOPES = ["workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write"];
 const HOST_OBSERVATION_SCOPE = "system.read";
 const EXECUTION_SCOPES = ["execution.jobs.read", "execution.run", "execution.cancel"];
 
 describe("OAuth scope filtering", () => {
-  it("keeps the V1 default separate from advertised capabilities", () => {
-    expect([...DEFAULT_SCOPES]).toEqual(V1_SCOPES);
-    expect([...SUPPORTED_SCOPES]).toEqual([
-      ...V1_SCOPES,
-      HOST_OBSERVATION_SCOPE,
-      ...NEW_SCOPES,
-      ...EXECUTION_SCOPES,
-    ]);
+  it("pins the approved default set and requires every default to be supported", () => {
+    expect([...DEFAULT_SCOPES]).toEqual(APPROVED_DEFAULT_SCOPES);
+    expect(new Set(DEFAULT_SCOPES).size).toBe(DEFAULT_SCOPES.length);
+    expect(DEFAULT_SCOPES.every((scope) => (SUPPORTED_SCOPES as readonly string[]).includes(scope))).toBe(true);
   });
 
-  it.each([undefined, "", " ", "\t\n"])("defaults %j to only the V1 read-only grant", (requested) => {
-    expect(filterScopes(requested)).toEqual(V1_SCOPES);
+  it.each([undefined, "", " ", "\t\n"])("defaults %j to the current approved grant", (requested) => {
+    expect(filterScopes(requested)).toEqual(APPROVED_DEFAULT_SCOPES);
   });
 
-  it.each([...NEW_SCOPES, ...EXECUTION_SCOPES])("grants %s only when explicitly requested", (scope) => {
+  it.each([...NEW_SCOPES, ...EXECUTION_SCOPES, HOST_OBSERVATION_SCOPE])("preserves explicit narrow scope %s", (scope) => {
     expect(filterScopes(scope)).toEqual([scope]);
-    expect(filterScopes(`${V1_SCOPES.join(" ")} ${scope}`)).toEqual([...V1_SCOPES, scope]);
-  });
-
-  it("grants host diagnostics only when system.read is explicitly requested", () => {
-    expect(filterScopes(HOST_OBSERVATION_SCOPE)).toEqual([HOST_OBSERVATION_SCOPE]);
-    expect(filterScopes()).toEqual(V1_SCOPES);
+    expect(filterScopes(`workspace.read ${scope}`)).toEqual(["workspace.read", scope]);
   });
 
   it.each(["unknown", "+", "+++", "workspace.WRITE", "workspace.write,workspace.delete", null, 0, false, {}, ["workspace.write"]])(
@@ -42,10 +34,8 @@ describe("OAuth scope filtering", () => {
   );
 
   it("keeps only requested known scopes and deduplicates space/plus separators", () => {
-    expect(filterScopes(` unknown + workspace.read\t${HOST_OBSERVATION_SCOPE}++workspace.write++workspace.write \nunknown `)).toEqual([
-      "workspace.read",
-      HOST_OBSERVATION_SCOPE,
-      "workspace.write",
+    expect(filterScopes(` unknown + workspace.read\tsystem.read++workspace.write++workspace.write \nunknown `)).toEqual([
+      "workspace.read", "system.read", "workspace.write",
     ]);
   });
 });

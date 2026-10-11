@@ -123,7 +123,7 @@ describe("discovery metadata", () => {
       expect(start.status).toBe(200);
       const metadata = await fetch(`${local}/.well-known/oauth-protected-resource/mcp`, { headers: { host: "attacker.invalid" } });
       expect(await metadata.json()).toMatchObject({ resource: `${publicUrl}/mcp`, authorization_servers: [publicUrl] });
-      const old = publicBridge.authStore.issueTokens({ clientId: "public-test-client", scopes: [...DEFAULT_SCOPES] });
+      const old = publicBridge.authStore.issueTokens({ clientId: "public-test-client", scopes: ["workspace.read", "offline_access"] });
       const call = await fetch(`${local}/mcp`, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${old.accessToken}`, host: "attacker.invalid", "x-forwarded-proto": "http" },
@@ -187,12 +187,13 @@ describe("discovery metadata", () => {
 describe("explicit OAuth capabilities", () => {
   it("upgrades only through explicit authorization and leaves old access/refresh grants unchanged", async () => {
     const executionScopes = ["execution.jobs.read", "execution.run", "execution.cancel"];
+    const legacyScopes = ["workspace.read", "workspace.search", "git.read", "execution.read", "offline_access"];
     const clientId = await registerClient();
     const oldPkce = pkceVerifierAndChallenge();
-    const oldAuthorization = await authorizeWithPairing(clientId, oldPkce.challenge, bridge.pairing.create().code, "old-grant", null);
+    const oldAuthorization = await authorizeWithPairing(clientId, oldPkce.challenge, bridge.pairing.create().code, "old-grant", legacyScopes.join(" "));
     const old = await exchangeToken(clientId, oldAuthorization.code!, oldPkce.verifier);
     expect(old.status).toBe(200);
-    expect(old.body.scope.split(" ")).toEqual([...DEFAULT_SCOPES]);
+    expect(old.body.scope.split(" ")).toEqual(legacyScopes);
 
     const listJobs = async (token: string) => {
       const response = await fetch(`${base}/mcp`, {
@@ -211,15 +212,15 @@ describe("explicit OAuth capabilities", () => {
     const refreshedResponse = await fetch(`${base}/oauth/token`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: old.body.refresh_token, client_id: clientId, scope: [...DEFAULT_SCOPES, ...executionScopes].join(" ") }),
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: old.body.refresh_token, client_id: clientId, scope: [...legacyScopes, ...executionScopes].join(" ") }),
     });
     expect(refreshedResponse.status).toBe(200);
     const refreshed = await refreshedResponse.json() as Record<string, string>;
-    expect(refreshed.scope.split(" ")).toEqual([...DEFAULT_SCOPES]);
+    expect(refreshed.scope.split(" ")).toEqual(legacyScopes);
     expect((await listJobs(refreshed.access_token)).result.isError).toBe(true);
 
     const newPkce = pkceVerifierAndChallenge();
-    const requested = [...DEFAULT_SCOPES, ...executionScopes];
+    const requested = [...legacyScopes, ...executionScopes];
     const explicit = await authorizeWithPairing(clientId, newPkce.challenge, bridge.pairing.create().code, "explicit-execution", requested.join(" "));
     for (const label of ["View execution job status", "Start execution jobs", "Cancel execution jobs"]) expect(explicit.page).toContain(label);
     expect(new URL(explicit.location!).searchParams.get("state")).toBe("explicit-execution");
@@ -231,7 +232,7 @@ describe("explicit OAuth capabilities", () => {
     expect(listed.structuredContent).toEqual({ jobs: [] });
     for (const token of [old.body.access_token, refreshed.access_token]) {
       const verdict = bridge.authStore.verifyAccessToken(token);
-      expect(verdict.ok && verdict.record.scopes).toEqual([...DEFAULT_SCOPES]);
+      expect(verdict.ok && verdict.record.scopes).toEqual(legacyScopes);
     }
   });
 
@@ -247,15 +248,15 @@ describe("explicit OAuth capabilities", () => {
   ];
 
   it.each([
-    { scope: null, expected: [...DEFAULT_SCOPES], mutation: false },
-    { scope: "", expected: [...DEFAULT_SCOPES], mutation: false },
-    { scope: " \t ", expected: [...DEFAULT_SCOPES], mutation: false },
+    { scope: null, expected: [...DEFAULT_SCOPES], mutation: true },
+    { scope: "", expected: [...DEFAULT_SCOPES], mutation: true },
+    { scope: " \t ", expected: [...DEFAULT_SCOPES], mutation: true },
     { scope: "workspace.read offline_access", expected: ["workspace.read", "offline_access"], mutation: false },
     ...newCapabilities.map(({ scope, mutation }) => ({ scope, expected: [scope], mutation })),
     ...newCapabilities.map(({ scope, mutation }) => ({
       scope: `${DEFAULT_SCOPES.join(" ")} ${scope}`,
-      expected: [...DEFAULT_SCOPES, scope],
-      mutation,
+      expected: [...new Set([...DEFAULT_SCOPES, scope])],
+      mutation: true,
     })),
     { scope: "unknown workspace.read", expected: ["workspace.read"], mutation: false },
     { scope: "unknown+workspace.write++workspace.write workspace.read", expected: ["workspace.write", "workspace.read"], mutation: true },
@@ -515,7 +516,7 @@ describe("refresh token rotation", () => {
     ["filesystem.external.read", "offline_access"],
     ["filesystem.external.write", "offline_access"],
     ["system.read", "offline_access"],
-    [...DEFAULT_SCOPES, "workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write"],
+    [...DEFAULT_SCOPES],
     ["execution.jobs.read", "offline_access"],
     ["execution.run", "offline_access"],
     ["execution.cancel", "offline_access"],
