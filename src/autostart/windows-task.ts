@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { getStateDir } from "../config/paths.js";
 import { StdRegProvHostRunAuthority, type HostRunAuthority } from "./host-run-authority.js";
@@ -216,55 +216,6 @@ function currentUserSid(shellPath: string): string {
   return sid;
 }
 
-export function buildHiddenPowerShellAction(input: {
-  nodePath: string;
-  nodeArguments: string[];
-  workingDirectory: string;
-  environment: Record<string, string>;
-  powershellPath: string;
-  diagnostics?: { stateDir: string; workspaceId: string; cliPath: string };
-}): ScheduledTaskAction {
-  if (input.diagnostics && !/^[a-f0-9]{12}$/i.test(input.diagnostics.workspaceId)) {
-    throw new Error("Invalid autostart workspace ID for Task diagnostics.");
-  }
-  const payload = Buffer.from(JSON.stringify({
-    nodePath: input.nodePath,
-    arguments: quoteWindowsCommandLine(input.nodeArguments),
-    workingDirectory: input.workingDirectory,
-    environment: input.environment,
-    diagnostics: input.diagnostics ?? null,
-  }), "utf8").toString("base64");
-  // The Task wrapper must not wait: Task Scheduler limits execution to three minutes.
-  // Only fixed diagnostic fields are persisted, never the environment or raw exceptions.
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    `$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
-    "$diagnostics = $payload.diagnostics",
-    "$logFile = $null",
-    "if ($null -ne $diagnostics -and $diagnostics.workspaceId -match '^[a-fA-F0-9]{12}$') { try { $diagDir = Join-Path $diagnostics.stateDir 'autostart\\diagnostics'; [void][IO.Directory]::CreateDirectory($diagDir); $logFile = Join-Path $diagDir ($diagnostics.workspaceId + '.launch.log') } catch { $logFile = $null } }",
-    "function Write-C2CEvent { param([string]$Stage, [object]$NodePid = $null, [object]$Code = $null); if ($null -eq $logFile) { return }; try { $entry = [ordered]@{ stage = $Stage; workspaceId = [string]$diagnostics.workspaceId; checkedAt = [DateTime]::UtcNow.ToString('o'); wrapperPid = $PID; nodePid = $NodePid; exitCode = $Code; stateDir = [string]$diagnostics.stateDir; cwd = [string]$payload.workingDirectory; nodePath = [string]$payload.nodePath; cliPath = [string]$diagnostics.cliPath }; $json = ConvertTo-Json -InputObject $entry -Compress; [IO.File]::AppendAllText($logFile, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false)) } catch { } }",
-    "Write-C2CEvent 'wrapper_entered'",
-    "try {",
-    "  foreach ($property in $payload.environment.PSObject.Properties) { [Environment]::SetEnvironmentVariable($property.Name, [string]$property.Value, 'Process') }",
-    "  Write-C2CEvent 'node_launch_attempted'",
-    "  $node = Start-Process -FilePath $payload.nodePath -ArgumentList $payload.arguments -WorkingDirectory $payload.workingDirectory -WindowStyle Hidden -PassThru",
-    "  Write-C2CEvent 'node_launched' $node.Id",
-    "  Write-C2CEvent 'wrapper_exited' $node.Id 0",
-    "  exit 0",
-    "} catch {",
-    "  Write-C2CEvent 'node_launch_failed'",
-    "  Write-C2CEvent 'wrapper_exited' $null 1",
-    "  exit 1",
-    "}",
-  ].join("\n");
-  const encodedScript = Buffer.from(script, "utf16le").toString("base64");
-  return {
-    command: input.powershellPath,
-    arguments: `-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ${encodedScript}`,
-    workingDirectory: input.workingDirectory,
-  };
-}
-
 function restoreNodeArguments(cliModulePath: string, registration: AutostartRegistration): string[] {
   const entry = path.resolve(cliModulePath);
   return [
@@ -283,29 +234,105 @@ function packageRootForCli(cliModulePath: string): string {
   return path.resolve(path.dirname(path.resolve(cliModulePath)), "..", "..");
 }
 
-export function buildAutostartPowerShellAction(
+export const TASK_CMD_LAUNCHER_SHA256 = "a16b2367e95bb6814f4e52c45dc4a51dce98725f3a10a12d2cce33bcb0970adb";
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase()
+    : path.resolve(left) === path.resolve(right);
+}
+
+function isAbsoluteTaskPath(value: string): boolean {
+  return path.isAbsolute(value) || path.win32.isAbsolute(value);
+}
+
+function resolveTaskPath(value: string): string {
+  if (path.isAbsolute(value)) return path.resolve(value);
+  if (path.win32.isAbsolute(value)) return path.win32.resolve(value);
+  return path.resolve(value);
+}
+
+function requireRuntimeFile(file: string): void {
+  let stat: fs.Stats;
+  try { stat = fs.lstatSync(file); }
+  catch { throw new Error("The protected Runtime is missing a required autostart file."); }
+  if (!stat.isFile() || stat.isSymbolicLink() || !sameWindowsPath(fs.realpathSync.native(file), file)) {
+    throw new Error("The protected Runtime contains an invalid autostart file.");
+  }
+}
+
+function taskEnvironment(environment: Record<string, string>, stateDir: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(environment)) {
+    if (!/^[a-z_][a-z0-9_]*$/i.test(name) || typeof value !== "string" || value.includes("\0")) {
+      throw new Error("The Task launcher environment contains an unsupported value.");
+    }
+    if (name.toUpperCase() !== "C2C_STATE_DIR") result[name] = value;
+  }
+  // Keep the canonical state root authoritative regardless of caller casing.
+  result.C2C_STATE_DIR = stateDir;
+  return result;
+}
+
+export function buildAutostartCmdAction(
   cliModulePath: string,
   registration: AutostartRegistration,
   options: WindowsTaskOptions = {}
 ): ScheduledTaskAction {
-  const stateDir = path.resolve(options.stateDir ?? getStateDir());
-  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
-  const shellPath = options.powershellPath ?? (systemRoot
-    ? path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-    : "powershell.exe");
-  const helperPath = path.resolve(path.dirname(path.resolve(cliModulePath)), "..", "autostart", "launch-breadcrumb.js");
-  const nodeArguments = restoreNodeArguments(cliModulePath, registration);
-  if (path.extname(path.resolve(cliModulePath)).toLowerCase() !== ".ts" && fs.existsSync(helperPath)) {
-    nodeArguments.unshift("--import", pathToFileURL(helperPath).href);
+  if (!/^[a-f0-9]{12}$/i.test(registration.workspaceId)) {
+    throw new Error("Invalid autostart workspace ID for the Task launcher.");
   }
-  return buildHiddenPowerShellAction({
-    nodePath: options.nodePath ?? process.execPath,
-    nodeArguments,
-    workingDirectory: packageRootForCli(cliModulePath),
-    environment: { ...(options.environment ?? {}), C2C_STATE_DIR: stateDir },
-    powershellPath: shellPath,
-    diagnostics: { stateDir, workspaceId: registration.workspaceId, cliPath: path.resolve(cliModulePath) },
-  });
+  if (!isAbsoluteTaskPath(registration.workspaceRoot)) {
+    throw new Error("Invalid autostart workspace path for the Task launcher.");
+  }
+  const stateDir = path.resolve(options.stateDir ?? getStateDir());
+  const runtimeRoot = packageRootForCli(cliModulePath);
+  const expectedCliPath = path.join(runtimeRoot, "dist", "cli", "index.js");
+  if (!sameWindowsPath(path.resolve(cliModulePath), expectedCliPath)) {
+    throw new Error("Scheduled Task autostart requires the protected Runtime CLI entry point.");
+  }
+
+  const launcherPath = path.join(runtimeRoot, "assets", "c2c-autostart-task.cmd");
+  const taskLauncherScript = path.join(runtimeRoot, "dist", "autostart", "task-launcher.js");
+  requireRuntimeFile(launcherPath);
+  requireRuntimeFile(taskLauncherScript);
+  const launcherHash = createHash("sha256").update(fs.readFileSync(launcherPath)).digest("hex");
+  if (launcherHash !== TASK_CMD_LAUNCHER_SHA256) {
+    throw new Error("The protected Runtime Task launcher failed its integrity check.");
+  }
+
+  const expectedNodePath = path.join(runtimeRoot, "node", "node.exe");
+  const nodePath = path.resolve(options.nodePath ?? process.execPath);
+  if (!sameWindowsPath(nodePath, expectedNodePath)) {
+    throw new Error("Scheduled Task autostart requires the Node executable from the protected Runtime.");
+  }
+  requireRuntimeFile(expectedNodePath);
+
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  const commandProcessorPath = options.commandProcessorPath ?? (systemRoot
+    ? path.join(systemRoot, "System32", "cmd.exe")
+    : "cmd.exe");
+  if (/[\r\n"%]/.test(launcherPath)) {
+    throw new Error("The protected Runtime launcher path contains unsupported command-shell characters.");
+  }
+
+  const payload = Buffer.from(JSON.stringify({
+    version: 1,
+    stateDir,
+    workspaceId: registration.workspaceId,
+    workspaceRoot: resolveTaskPath(registration.workspaceRoot),
+    environment: taskEnvironment(options.environment ?? {}, stateDir),
+  }), "utf8").toString("base64url");
+  const command = `${quoteWindowsArgument(launcherPath)} ${quoteWindowsArgument(payload)}`;
+  const argumentsValue = `/d /v:off /s /c "${command}"`;
+  if (argumentsValue.length > 8000) {
+    throw new Error("The protected Runtime Task launcher arguments exceed the safe cmd.exe limit.");
+  }
+  return {
+    command: commandProcessorPath,
+    arguments: argumentsValue,
+    workingDirectory: runtimeRoot,
+  };
 }
 
 export class WindowsTaskScheduler implements AutostartTaskAdapter {
@@ -314,6 +341,7 @@ export class WindowsTaskScheduler implements AutostartTaskAdapter {
   private readonly shellPath: string;
   private readonly schedulerPath: string;
   private readonly nodePath: string;
+  private readonly commandProcessorPath: string;
 
   constructor(private readonly cliModulePath: string, options: WindowsTaskOptions = {}) {
     this.stateDir = path.resolve(options.stateDir ?? getStateDir());
@@ -322,24 +350,23 @@ export class WindowsTaskScheduler implements AutostartTaskAdapter {
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
     this.schedulerPath = options.schedulerPath ?? (systemRoot ? path.join(systemRoot, "System32", "schtasks.exe") : "schtasks.exe");
     this.nodePath = options.nodePath ?? process.execPath;
+    this.commandProcessorPath = options.commandProcessorPath ?? (systemRoot
+      ? path.join(systemRoot, "System32", "cmd.exe")
+      : "cmd.exe");
   }
 
   private action(registration: AutostartRegistration, overrides: WindowsTaskInstallOverrides = {}): ScheduledTaskAction {
-    if (!overrides.cliArguments && !overrides.environment) {
-      return buildAutostartPowerShellAction(this.cliModulePath, registration, {
-        stateDir: this.stateDir,
-        environment: this.environment,
-        powershellPath: this.shellPath,
-        schedulerPath: this.schedulerPath,
-        nodePath: this.nodePath,
-      });
+    const expectedCliArguments = restoreNodeArguments(this.cliModulePath, registration);
+    if (overrides.cliArguments
+      && (overrides.cliArguments.length !== expectedCliArguments.length
+        || overrides.cliArguments.some((value, index) => value !== expectedCliArguments[index]))) {
+      throw new Error("Scheduled Task autostart only permits the fixed C2C restore command.");
     }
-    return buildHiddenPowerShellAction({
-      nodePath: this.nodePath,
-      nodeArguments: overrides.cliArguments ?? restoreNodeArguments(this.cliModulePath, registration),
-      workingDirectory: packageRootForCli(this.cliModulePath),
+    return buildAutostartCmdAction(this.cliModulePath, registration, {
+      stateDir: this.stateDir,
       environment: { ...this.environment, ...(overrides.environment ?? {}) },
-      powershellPath: this.shellPath,
+      nodePath: this.nodePath,
+      commandProcessorPath: this.commandProcessorPath,
     });
   }
 

@@ -3,13 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { AutostartService, taskNameForWorkspace, type AutostartInstallContext, type AutostartInstallResult, type AutostartRegistration, type AutostartTaskAdapter } from "../src/autostart/registration.js";
 import {
-  buildAutostartPowerShellAction,
-  buildHiddenPowerShellAction,
+  buildAutostartCmdAction,
   buildLogonTaskXml,
   quoteWindowsArgument,
   quoteWindowsCommandLine,
+  TASK_CMD_LAUNCHER_SHA256,
   WindowsAutostartAdapter,
 } from "../src/autostart/windows-task.js";
+import { parseTaskLaunchPayload } from "../src/autostart/task-launcher.js";
 import { readPermission, setPermission } from "../src/permission/index.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
@@ -382,91 +383,94 @@ describe("Windows workspace autostart registration", () => {
 describe("Windows Task Scheduler command construction", () => {
   const dirsForTaskDiagnostics: string[] = [];
   afterEach(() => { for (const dir of dirsForTaskDiagnostics) cleanup(dir); dirsForTaskDiagnostics.length = 0; });
-  it("emits safe pre-Node wrapper diagnostics and preloads the existing Node exit recorder", () => {
-    const stateDir = makeTmpDir("task-diagnostic-state");
-    const sourceRoot = makeTmpDir("task-diagnostic-runtime");
-    dirsForTaskDiagnostics.push(stateDir, sourceRoot);
-    const cli = path.join(sourceRoot, "dist", "cli", "index.js");
-    const helper = path.join(sourceRoot, "dist", "autostart", "launch-breadcrumb.js");
-    fs.mkdirSync(path.dirname(helper), { recursive: true });
-    fs.writeFileSync(helper, "// isolated test helper\n", "utf8");
-    const registration: AutostartRegistration = {
-      workspaceId: "aabbccddeeff", workspaceRoot: "C:\\Test Workspace",
-      taskName: taskNameForWorkspace("aabbccddeeff"), updatedAt: new Date().toISOString(),
-    };
-    const action = buildAutostartPowerShellAction(cli, registration, {
-      stateDir, nodePath: "C:\\Node\\node.exe", powershellPath: "C:\\PowerShell\\powershell.exe",
-      environment: { C2C_ADMIN_TOKEN: "DO-NOT-LOG-THIS-SECRET" },
-    });
-    const script = Buffer.from(action.arguments.split("-EncodedCommand ")[1], "base64").toString("utf16le");
-    const encodedPayload = script.match(/FromBase64String\('([^']+)'\)/)?.[1];
-    expect(encodedPayload).toBeDefined();
-    const payload = JSON.parse(Buffer.from(encodedPayload!, "base64").toString("utf8")) as {
-      nodePath: string; arguments: string; diagnostics: { workspaceId: string; stateDir: string; cliPath: string };
-    };
-    expect(payload.arguments).toContain("--import");
-    expect(payload.arguments).toContain("launch-breadcrumb.js");
-    expect(payload.arguments).toContain("autostart");
-    expect(payload.diagnostics).toEqual({ workspaceId: registration.workspaceId, stateDir, cliPath: cli });
-    expect(script).toContain("Write-C2CEvent 'wrapper_entered'");
-    expect(script).toContain("Write-C2CEvent 'node_launch_attempted'");
-    expect(script).toContain("Write-C2CEvent 'node_launched' $node.Id");
-    expect(script).toContain("Write-C2CEvent 'node_launch_failed'");
-    expect(script).toContain("Write-C2CEvent 'wrapper_exited'");
-    expect(script).toContain("Start-Process -FilePath $payload.nodePath");
-    expect(script).toContain("-PassThru");
-    expect(script).not.toContain(" -Wait");
-    expect(script).not.toContain("DO-NOT-LOG-THIS-SECRET");
-    expect(script).not.toContain("GetEnvironmentVariables");
-    const recordWriter = script.split("function Write-C2CEvent {")[1]?.split("Write-C2CEvent 'wrapper_entered'")[0] ?? "";
-    expect(recordWriter).toContain("AppendAllText($logFile");
-    expect(recordWriter).not.toContain("$payload.environment");
-    expect(recordWriter).not.toContain("C2C_ADMIN_TOKEN");
-    expect(recordWriter).not.toContain("Get-ChildItem Env:");
-    expect(script).not.toContain("RedirectStandardOutput");
-    expect(script).not.toContain("RedirectStandardError");
-    const before = (stage: string) => script.indexOf(`Write-C2CEvent '${stage}'`);
-    expect(before("wrapper_entered")).toBeGreaterThan(-1);
-    expect(before("wrapper_entered")).toBeLessThan(before("node_launch_attempted"));
-    expect(before("node_launch_attempted")).toBeLessThan(script.indexOf("Start-Process -FilePath"));
-    expect(script.indexOf("Start-Process -FilePath")).toBeLessThan(before("node_launched"));
-    expect(before("node_launched")).toBeLessThan(before("wrapper_exited"));
-    expect(script).toContain("Write-C2CEvent 'wrapper_exited' $null 1");
-    expect(script).toContain("AppendAllText($logFile");
-    expect(script).toContain(".launch.log");
-    expect(script).toContain("nodePid = $NodePid");
-    expect(script).toContain("checkedAt = [DateTime]::UtcNow");
-    expect(action.arguments.length).toBeLessThan(32767);
-  });
+  function makeTaskRuntime(name: string) {
+    const root = makeTmpDir(name);
+    dirsForTaskDiagnostics.push(root);
+    const cli = path.join(root, "dist", "cli", "index.js");
+    const taskLauncher = path.join(root, "dist", "autostart", "task-launcher.js");
+    const node = path.join(root, "node", "node.exe");
+    const launcher = path.join(root, "assets", "c2c-autostart-task.cmd");
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.mkdirSync(path.dirname(taskLauncher), { recursive: true });
+    fs.mkdirSync(path.dirname(node), { recursive: true });
+    fs.mkdirSync(path.dirname(launcher), { recursive: true });
+    fs.writeFileSync(cli, "// isolated CLI fixture\n", "utf8");
+    fs.writeFileSync(taskLauncher, "// isolated task launcher fixture\n", "utf8");
+    fs.writeFileSync(node, "isolated Node identity fixture\n", "utf8");
+    fs.copyFileSync(path.resolve("assets", "c2c-autostart-task.cmd"), launcher);
+    return { root, cli, node, launcher, taskLauncher };
+  }
 
-  it("preserves direct Node CLI invocation when the optional preload artifact is absent", () => {
-    const stateDir = makeTmpDir("task-diagnostic-no-helper");
+  it("builds a short fixed CMD action with a data-only restore payload", () => {
+    const runtime = makeTaskRuntime("task-cmd-runtime");
+    const stateDir = makeTmpDir("Task State With % NAME & 中文");
     dirsForTaskDiagnostics.push(stateDir);
-    const cli = path.join(stateDir, "runtime", "dist", "cli", "index.js");
+    const registration: AutostartRegistration = {
+      workspaceId: "aabbccddeeff", workspaceRoot: "C:\\Test Workspace & %WORKSPACE%\\Project",
+      taskName: taskNameForWorkspace("aabbccddeeff"), updatedAt: new Date().toISOString(),
+    };
+    const action = buildAutostartCmdAction(runtime.cli, registration, {
+      stateDir, nodePath: runtime.node, commandProcessorPath: "C:\\Windows\\System32\\cmd.exe",
+      environment: { c2c_state_dir: "C:\\wrong-state", C2C_PROBE_MARKER: "C:\\test marker.json" },
+    });
+    expect(action.command).toBe("C:\\Windows\\System32\\cmd.exe");
+    expect(action.workingDirectory).toBe(runtime.root);
+    expect(action.arguments).toContain("/d /v:off /s /c");
+    expect(action.arguments).toContain(quoteWindowsArgument(runtime.launcher));
+    expect(action.arguments).not.toMatch(/EncodedCommand|powershell/i);
+    expect(action.arguments.length).toBeLessThan(2000);
+    const encodedPayload = action.arguments.match(/ "([A-Za-z0-9_-]+)""$/)?.[1];
+    expect(encodedPayload).toBeDefined();
+    const payload = JSON.parse(Buffer.from(encodedPayload!, "base64url").toString("utf8")) as Record<string, unknown>;
+    expect(payload).toEqual({
+      version: 1,
+      stateDir: path.resolve(stateDir),
+      workspaceId: registration.workspaceId,
+      workspaceRoot: path.win32.resolve(registration.workspaceRoot),
+      environment: { C2C_PROBE_MARKER: "C:\\test marker.json", C2C_STATE_DIR: path.resolve(stateDir) },
+    });
+    expect(Object.keys(payload)).not.toContain("command");
+    expect(Object.keys(payload)).not.toContain("arguments");
+    expect(Object.keys(payload)).not.toContain("nodePath");
+  });
+
+  it("checks the packaged CMD launcher hash before constructing the Task action", () => {
+    const runtime = makeTaskRuntime("task-cmd-integrity");
     const registration: AutostartRegistration = {
       workspaceId: "aabbccddeeff", workspaceRoot: "C:\\Test Workspace",
       taskName: taskNameForWorkspace("aabbccddeeff"), updatedAt: new Date().toISOString(),
     };
-    const action = buildAutostartPowerShellAction(cli, registration, { stateDir });
-    const script = Buffer.from(action.arguments.split("-EncodedCommand ")[1], "base64").toString("utf16le");
-    const payload64 = script.match(/FromBase64String\('([^']+)'\)/)?.[1];
-    expect(payload64).toBeDefined();
-    const payload = JSON.parse(Buffer.from(payload64!, "base64").toString("utf8")) as {
-      arguments: string; diagnostics: { workspaceId: string; stateDir: string };
-    };
-    expect(payload.arguments).not.toContain("launch-breadcrumb.js");
-    expect(payload.arguments).not.toContain("--import");
-    expect(payload.arguments).toContain(quoteWindowsArgument(cli));
-    expect(payload.diagnostics).toMatchObject({ workspaceId: registration.workspaceId, stateDir });
-    expect(script).toContain("Write-C2CEvent 'wrapper_entered'");
+    expect(TASK_CMD_LAUNCHER_SHA256).toMatch(/^[a-f0-9]{64}$/);
+    fs.appendFileSync(runtime.launcher, "rem modified\r\n", "ascii");
+    expect(() => buildAutostartCmdAction(runtime.cli, registration, { nodePath: runtime.node }))
+      .toThrow(/integrity check/);
   });
 
-  it("rejects an invalid workspace identifier before encoding a Task action", () => {
-    expect(() => buildHiddenPowerShellAction({
-      nodePath: "node.exe", nodeArguments: ["cli.js"], workingDirectory: "C:\\runtime",
-      environment: {}, powershellPath: "powershell.exe",
-      diagnostics: { stateDir: "C:\\state", workspaceId: "../escape", cliPath: "C:\\runtime\\cli.js" },
-    })).toThrow(/workspace ID/);
+  it("parses only the fixed, data-only restore payload shape", () => {
+    const payload = Buffer.from(JSON.stringify({
+      version: 1,
+      stateDir: "C:\\C2C State",
+      workspaceId: "aabbccddeeff",
+      workspaceRoot: "C:\\Test Workspace",
+      environment: { c2c_state_dir: "C:\\ignored", C2C_TEST_MARKER: "C:\\probe" },
+    }), "utf8").toString("base64url");
+    expect(parseTaskLaunchPayload(payload)).toEqual({
+      version: 1,
+      stateDir: path.win32.resolve("C:\\C2C State"),
+      workspaceId: "aabbccddeeff",
+      workspaceRoot: path.win32.resolve("C:\\Test Workspace"),
+      environment: { C2C_TEST_MARKER: "C:\\probe" },
+    });
+    const unsafe = Buffer.from(JSON.stringify({
+      version: 1,
+      stateDir: "C:\\C2C State",
+      workspaceId: "aabbccddeeff",
+      workspaceRoot: "C:\\Test Workspace",
+      environment: {},
+      command: "whoami",
+    }), "utf8").toString("base64url");
+    expect(() => parseTaskLaunchPayload(unsafe)).toThrow(/payload/);
+    expect(() => parseTaskLaunchPayload("not+base64/url")) .toThrow(/encoding/);
   });
 
   it("quotes spaces, embedded quotes, trailing slashes, and empty arguments", () => {
@@ -482,8 +486,8 @@ describe("Windows Task Scheduler command construction", () => {
       taskName: "C2C & workspace",
       userSid: "S-1-5-21-1-2-3-1001",
       action: {
-        command: "C:\\Program Files\\Windows PowerShell\\powershell.exe",
-        arguments: "-WindowStyle Hidden -EncodedCommand abc123",
+        command: "C:\\Windows\\System32\\cmd.exe",
+        arguments: '/d /v:off /s /c ""C:\\Runtime\\assets\\c2c-autostart-task.cmd" "payload""',
         workingDirectory: "C:\\Users\\A & B\\c2c",
       },
     });
@@ -491,50 +495,10 @@ describe("Windows Task Scheduler command construction", () => {
     expect(xml).toContain("C2C &amp; workspace");
     expect(xml).toContain("<LogonType>InteractiveToken</LogonType>");
     expect(xml).toContain("<RunLevel>LeastPrivilege</RunLevel>");
+    expect(xml).toContain("<LogonTrigger><Enabled>true</Enabled><UserId>S-1-5-21-1-2-3-1001</UserId></LogonTrigger>");
     expect(xml).toContain("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>");
+    expect(xml).toContain("<Command>C:\\Windows\\System32\\cmd.exe</Command>");
+    expect(xml).toContain("c2c-autostart-task.cmd");
     expect(xml).toContain("<WorkingDirectory>C:\\Users\\A &amp; B\\c2c</WorkingDirectory>");
-  });
-
-  it("keeps Node executable, CLI entry, and workspace paths in the encoded hidden action", () => {
-    const nodeArguments = [
-      "C:\\C2C Install\\dist\\cli\\index.js",
-      "autostart",
-      "restore",
-      "--workspace",
-      "C:\\Users\\A B\\Project\\",
-      "--workspace-id",
-      "aabbccddeeff; Remove-Item test-marker",
-    ];
-    const action = buildHiddenPowerShellAction({
-      nodePath: "C:\\Program Files\\nodejs\\node.exe",
-      nodeArguments,
-      workingDirectory: "C:\\C2C Install",
-      environment: { C2C_STATE_DIR: "C:\\Users\\A B\\State" },
-      powershellPath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-    });
-
-    expect(action.command).toContain("powershell.exe");
-    expect(action.arguments).toContain("-WindowStyle Hidden");
-    expect(action.arguments).toContain("-EncodedCommand");
-    expect(action.workingDirectory).toBe("C:\\C2C Install");
-
-    const encodedScript = action.arguments.split("-EncodedCommand ")[1];
-    const script = Buffer.from(encodedScript, "base64").toString("utf16le");
-    expect(script).toContain("Start-Process -FilePath $payload.nodePath");
-    expect(script).not.toContain("C:\\Users\\A B\\Project");
-    const payloadBase64 = script.match(/FromBase64String\('([^']+)'\)/)?.[1];
-    expect(payloadBase64).toBeDefined();
-    const payload = JSON.parse(Buffer.from(payloadBase64!, "base64").toString("utf8")) as {
-      nodePath: string;
-      arguments: string;
-      workingDirectory: string;
-      environment: Record<string, string>;
-    };
-    expect(payload.nodePath).toBe("C:\\Program Files\\nodejs\\node.exe");
-    expect(payload.arguments).toBe(quoteWindowsCommandLine(nodeArguments));
-    expect(payload.workingDirectory).toBe("C:\\C2C Install");
-    expect(payload.environment).toEqual({ C2C_STATE_DIR: "C:\\Users\\A B\\State" });
-    expect(script).not.toContain(" -Wait");
-    expect(script).toContain("exit 0");
   });
 });

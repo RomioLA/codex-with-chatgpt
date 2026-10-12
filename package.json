@@ -9,6 +9,7 @@
   },
   "files": [
     "bin/",
+    "assets/",
     "dist/",
     "build/native/c2c-execution-helper.exe",
     "build/native/c2c-execution-launcher.exe",

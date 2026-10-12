@@ -180,12 +180,29 @@ function fixture() {
     taskName: taskNameForWorkspace(workspace.id),
     updatedAt: new Date(0).toISOString(),
   };
+  const provisionTaskRuntime = (cli: string): { root: string; node: string } => {
+    const root = path.resolve(path.dirname(cli), "..", "..");
+    const launcher = path.join(root, "assets", "c2c-autostart-task.cmd");
+    const taskLauncher = path.join(root, "dist", "autostart", "task-launcher.js");
+    const node = path.join(root, "node", "node.exe");
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.mkdirSync(path.dirname(launcher), { recursive: true });
+    fs.mkdirSync(path.dirname(taskLauncher), { recursive: true });
+    fs.mkdirSync(path.dirname(node), { recursive: true });
+    if (!fs.existsSync(launcher)) fs.copyFileSync(path.resolve("assets", "c2c-autostart-task.cmd"), launcher);
+    if (!fs.existsSync(cli)) fs.writeFileSync(cli, "// isolated CLI fixture\n", "utf8");
+    if (!fs.existsSync(taskLauncher)) fs.writeFileSync(taskLauncher, "// isolated task launcher fixture\n", "utf8");
+    if (!fs.existsSync(node)) fs.writeFileSync(node, "isolated Node identity fixture\n", "utf8");
+    return { root, node };
+  };
   const runtime = (cli = cliPath, runCommandProcessorPath = commandProcessorPath) => {
+    const taskRuntime = provisionTaskRuntime(cli);
     const scheduler = new WindowsTaskScheduler(cli, {
       stateDir,
       powershellPath: shellPath,
       schedulerPath: "schtasks.exe",
-      nodePath,
+      nodePath: taskRuntime.node,
+      commandProcessorPath,
     });
     const runKey = new WindowsRunKeyAutostart(cli, {
       stateDir,
@@ -240,6 +257,50 @@ afterEach(() => {
 });
 
 describe("autostart transactional registration", () => {
+  it("rejects Task CLI overrides outside the fixed restore command before mutation", () => {
+    const f = fixture();
+    const { scheduler } = f.runtime();
+
+    expect(() => scheduler.install(f.registration, { cliArguments: ["whoami"] })).toThrow(/fixed C2C restore command/);
+    expect(taskEvents.some((event) => event.operation === "create")).toBe(false);
+    expect(taskDefinitions.has(f.registration.taskName)).toBe(false);
+  });
+
+  it("registers the protected Runtime CMD launcher under the original logon identity and restore contract", () => {
+    const f = fixture();
+    const runtime = f.runtime();
+    runtime.service.enable(f.workspaceRoot);
+
+    const saved = taskDefinitions.get(f.registration.taskName);
+    expect(saved).toBeDefined();
+    const xml = saved!.subarray(2).toString("utf16le");
+    const runtimeRoot = path.resolve(path.dirname(f.cliPath), "..", "..");
+    const commandProcessorPath = path.join(process.env.SystemRoot ?? process.env.WINDIR!, "System32", "cmd.exe");
+    expect(xml).toContain(`<LogonTrigger><Enabled>true</Enabled><UserId>${userSid}</UserId></LogonTrigger>`);
+    expect(xml).toContain(`<UserId>${userSid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>`);
+    expect(xml.match(/<Command>([\s\S]*?)<\/Command>/i)?.[1]?.toLowerCase()).toBe(commandProcessorPath.toLowerCase());
+    expect(xml).toContain("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>");
+    expect(xml).toContain("<ExecutionTimeLimit>PT3M</ExecutionTimeLimit>");
+    expect(xml).toContain("<WorkingDirectory>");
+    expect(xml).toContain(`${runtimeRoot}\\assets\\c2c-autostart-task.cmd`);
+    expect(xml).not.toContain("EncodedCommand");
+
+    const argumentsValue = xml.match(/<Arguments>([\s\S]*?)<\/Arguments>/i)?.[1]
+      ?.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    const encodedPayload = argumentsValue?.match(/ "([A-Za-z0-9_-]+)""$/)?.[1];
+    expect(encodedPayload).toBeDefined();
+    const payload = JSON.parse(Buffer.from(encodedPayload!, "base64url").toString("utf8")) as Record<string, unknown>;
+    expect(payload).toMatchObject({
+      version: 1,
+      stateDir: f.stateDir,
+      workspaceId: f.workspaceId,
+      workspaceRoot: f.workspaceRoot,
+    });
+    expect(payload).not.toHaveProperty("command");
+    expect(payload).not.toHaveProperty("arguments");
+    expect(payload).not.toHaveProperty("nodePath");
+  });
+
   it("restores the complete old Scheduled Task XML when an update cannot publish its registration", () => {
     const f = fixture();
     const initial = f.runtime();
