@@ -18,7 +18,10 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import type { GenericCommand } from "./helper-protocol.js";
 import { consumeLevel3Request, resolveConsumedLevel3Request, isLevel3Enabled, getLevel3Request, completeLevel3Request } from "./level3-approval.js";
-import { createGitJobPlan, resolveGitJobPlan, readGitJobPlan } from "./git-job-plan.js";
+import { createGitJobPlan, resolveGitJobPlan, readGitJobPlan, archiveGitJobPlan } from "./git-job-plan.js";
+import { jobCanBeArchived } from "./record-archive.js";
+import { hasGitReviewHold, requireGitReview } from "./git-review-hold.js";
+import { verifyGitPostconditions } from "../git-write/planner.js";
 import { confirmGitWriteState, listGitRepositoryApprovals, type GitWriteOperation } from "../git-write/index.js";
 import { acquireRepositoryWriteLock } from "./repository-write-lock.js";
 
@@ -157,7 +160,8 @@ export class ExecutionSupervisor {
     this.now = options.now ?? Date.now;
     if (!this.store.corruption) {
       for (const job of this.store.listAll()) {
-        if (job.authorization && job.state === "interrupted" && !job.gitResult) this.auditControlledCompletion(job.jobId);
+        if (job.authorization && (job.authorization.type === "git" && !job.gitResult || job.state === "interrupted" && !job.gitResult)) this.auditControlledCompletion(job.jobId);
+        try { archiveGitJobPlan(this.workspace, job); } catch { /* preserve uncertain or unverified plans */ }
       }
     }
     supervisors.add(this);
@@ -187,6 +191,7 @@ export class ExecutionSupervisor {
     if (previous) return previous.authorization?.type === "level3" && previous.authorization.requestId === input.requestId && previous.authorization.digest === input.digest
       ? { ok: true, job: previous, duplicate: true } : { ok: false, error: "IDEMPOTENCY_CONFLICT" };
     try {
+      this.store.prepareCapacity();
       const authorization = consumeLevel3Request(this.workspace, input.requestId, input.oauthClientId, input.digest);
       return this.enqueueControlled(authorization.repository, { type: "level3", requestId: input.requestId, digest: input.digest },
         authorization.request.spec.timeoutSeconds, hash, input.oauthClientId);
@@ -212,6 +217,8 @@ export class ExecutionSupervisor {
       } catch { return { ok: false, error: "IDEMPOTENCY_CONFLICT" }; }
     }
     try {
+      this.store.prepareCapacity();
+      if (hasGitReviewHold(this.workspace, input.repositoryPath)) return { ok: false, error: "GIT_REVIEW_REQUIRED" };
       const created = createGitJobPlan(this.workspace, input.repositoryPath, input.operation);
       return this.enqueueControlled(created.plan.repository, { type: "git", requestId: created.requestId, digest: created.digest }, input.timeoutSeconds, hash, input.oauthClientId);
     } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
@@ -414,6 +421,7 @@ export class ExecutionSupervisor {
       if (repository.identity !== job.repositoryIdentity) throw new RepositoryIdentityError("PATH_CHANGED");
       if (job.authorization) {
         releaseWriteLock = acquireRepositoryWriteLock(repository, job.jobId);
+        if (job.authorization.type === "git" && hasGitReviewHold(this.workspace, job.repositoryPath)) throw new Error("GIT_REVIEW_REQUIRED");
         const resolved = job.authorization.type === "level3"
           ? resolveConsumedLevel3Request(this.workspace, job.authorization.requestId, job.oauthClientId, job.authorization.digest)
           : resolveGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
@@ -539,7 +547,7 @@ export class ExecutionSupervisor {
     }
   }
 
-  private completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3; exitCode: number; win32Error: number }, tempCleanupConfirmed: boolean): void {
+  private completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3 | 4 | 5; exitCode: number; win32Error: number }, tempCleanupConfirmed: boolean): void {
     this.finishSanitizers(jobId, active);
     const job = this.store.get(jobId);
     if (!job || job.state === "interrupted" || job.finishedAt) return;
@@ -549,6 +557,14 @@ export class ExecutionSupervisor {
     if (result.outcome === 3) {
       terminal = "interrupted";
       failureCode = "HELPER_CLEANUP_UNCONFIRMED";
+      exitCode = null;
+    } else if (result.outcome === 4) {
+      terminal = "failed";
+      failureCode = "AUTHORIZATION_REVOKED";
+      exitCode = null;
+    } else if (result.outcome === 5) {
+      terminal = "failed";
+      failureCode = "GIT_STATE_CHANGED";
       exitCode = null;
     } else if (result.outcome === 2 || active.intent === "timed_out") {
       terminal = "timed_out";
@@ -592,25 +608,36 @@ export class ExecutionSupervisor {
     if (!job?.authorization) return;
     try {
       if (job.authorization.type === "level3") {
-        completeLevel3Request(this.workspace.id, job.authorization.requestId, job.oauthClientId, job.state === "succeeded" ? "completed" : "failed");
+        completeLevel3Request(this.workspace.id, job.authorization.requestId, job.oauthClientId, job.state === "succeeded" ? "completed" : "failed", jobCanBeArchived(job));
       } else {
         const plan = readGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
         const confirmed = confirmGitWriteState(this.workspace, job.repositoryPath, plan.before);
         const network = ["push", "fetch", "pull_ff_only"].includes(plan.operation.kind);
         const remoteOutcome = !network ? "not_applicable" : !job.startedAt ? "not_attempted" : job.state === "succeeded" ? "reported_success" : "unknown";
-        this.store.replace({ ...job, gitResult: { confirmation: confirmed.state,
+        let integrity: "verified" | "unexpected" | "not_verified" = "not_verified";
+        if (job.state === "succeeded") {
+          try { integrity = verifyGitPostconditions(this.workspace, job.repositoryPath, plan) ? "verified" : "unexpected"; } catch { integrity = "unexpected"; }
+        }
+        const final = integrity === "unexpected" ? { ...job, state: "failed" as const, failureCode: "GIT_POSTCONDITION_UNTRUSTED" } : job;
+        const partial = integrity === "unexpected" || job.state !== "succeeded" && (confirmed.state !== "confirmed" || remoteOutcome === "unknown");
+        this.store.replace({ ...final, gitResult: { confirmation: confirmed.state, integrity,
           confirmationScope: "local_repository", remoteOutcome,
-          partialSuccessPossible: job.state !== "succeeded" && (confirmed.state !== "confirmed" || remoteOutcome === "unknown"),
+          partialSuccessPossible: partial,
           headBefore: plan.before.head, headAfter: "after" in confirmed ? confirmed.after.head : null,
           branchBefore: plan.before.branch, branchAfter: "after" in confirmed ? confirmed.after.branch : null } });
+        if (job.startedAt && (final.state !== "succeeded" || partial)) requireGitReview(this.workspace, job.repositoryPath, jobId, final.failureCode ?? "GIT_RESULT_UNCERTAIN", plan.before);
       }
     } catch {
       if (job.authorization.type === "git") this.store.replace({ ...job, gitResult: { confirmation: "unavailable", confirmationScope: "local_repository",
         remoteOutcome: job.startedAt ? "unknown" : "not_attempted", partialSuccessPossible: !!job.startedAt,
         headBefore: null, headAfter: null, branchBefore: null, branchAfter: null } });
+      if (job.authorization.type === "git" && job.startedAt) {
+        try { const plan = readGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest); requireGitReview(this.workspace, job.repositoryPath, jobId, "GIT_RESULT_UNAVAILABLE", plan.before); } catch { /* corrupt/missing authority already denies planning */ }
+      }
     }
     this.logger.info("Controlled execution finished", { workspaceId: this.workspace.id, jobId, oauthClientId: job.oauthClientId,
       capability: job.authorization.type, state: job.state, exitCode: job.exitCode, failureCode: job.failureCode });
+    try { const final = this.store.get(jobId); if (final) archiveGitJobPlan(this.workspace, final); } catch { /* no automatic cleanup of unknown evidence */ }
   }
 
   private requestTermination(jobId: string, active: ActiveExecution, intent: "cancelled" | "timed_out"): void {

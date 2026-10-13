@@ -4,6 +4,7 @@ import type { Command } from "commander";
 import { Workspace } from "../workspace/manager.js";
 import { setLevel3Enabled, isLevel3Enabled, listLevel3Requests, getLevel3Request, getLevel3RequestPreview, approveLevel3Request, revokeLevel3Request, type Level3Risk } from "../execution/level3-approval.js";
 import { approveGitRepository, previewGitRepositoryApproval, listGitRepositoryApprovals, revokeGitRepositoryApproval, type ApproveGitRepositoryInput } from "../git-write/index.js";
+import { previewGitReview, acknowledgeGitReview } from "../execution/git-review-hold.js";
 
 type Options = { workspace?: string; json: boolean };
 function workspace(opts: Options): Workspace { return new Workspace(path.resolve(opts.workspace ?? process.cwd())); }
@@ -43,15 +44,25 @@ export function registerV13Cli(program: Command): void {
     .requiredOption("--risk <risk>", "development or destructive-system")
     .requiredOption("--approve", "approve the exact inspected command")
     .option("--allow-system", "explicitly authorize destructive or system operations", false))
-    .action(guarded((opts: Options & { request: string; digest: string; risk: Level3Risk; allowSystem: boolean }) => {
+    .option("--allow-dynamic", "acknowledge unresolved dynamic-code entry semantics", false)
+    .action(guarded((opts: Options & { request: string; digest: string; risk: Level3Risk; allowSystem: boolean; allowDynamic: boolean }) => {
       const ws = workspace(opts);
-      const request = approveLevel3Request(ws, opts.request, opts.digest, true, { risk: opts.risk, ...(opts.allowSystem ? { allowSystem: true as const } : {}) });
+      const request = approveLevel3Request(ws, opts.request, opts.digest, true, { risk: opts.risk, ...(opts.allowSystem ? { allowSystem: true as const } : {}), ...(opts.allowDynamic ? { allowDynamic: true as const } : {}) });
       return { ok: true, workspaceId: ws.id, requestId: request.requestId, digest: request.digest, status: request.status };
     }));
   common(level3.command("revoke").requiredOption("--request <id>"))
     .action(guarded((opts: Options & { request: string }) => ({ ok: true, revoked: revokeLevel3Request(workspace(opts).id, opts.request, true) })));
 
   const git = program.command("git-write").description("Local allowlist for structured Git operations");
+  common(git.command("review").option("-r, --repository <path>", "repository", ".")
+    .option("--approve", "acknowledge inspected uncertain state", false).option("--job <id>").option("--digest <sha256>"))
+    .action(guarded((opts: Options & { repository: string; approve: boolean; job?: string; digest?: string }) => {
+      const ws = workspace(opts); const review = previewGitReview(ws, opts.repository);
+      if (!opts.approve) return { ok: true, review, instruction: "Inspect the recorded job and local/remote changes. Re-read state before resuming; acknowledgement never rolls back data or confirms an unknown remote result." };
+      if (!opts.job || !opts.digest) throw new Error("GIT_REVIEW_APPROVAL_REQUIRED");
+      acknowledgeGitReview(ws, opts.repository, opts.job, opts.digest, true);
+      return { ok: true, acknowledged: opts.job };
+    }));
   common(git.command("list")).action(guarded((opts: Options) => {
     const ws = workspace(opts); return { ok: true, workspaceId: ws.id, approvals: listGitRepositoryApprovals(ws.id) };
   }));
@@ -67,6 +78,7 @@ export function registerV13Cli(program: Command): void {
           Object.keys(policy).some((key) => !["allowedOperations", "allowedBranches", "allowedRemotes", "approvedCredentialHelper", "approvedProxy"].includes(key))) throw new Error("INVALID_POLICY");
       const preview = previewGitRepositoryApproval(ws, opts.repository, policy);
       if (!opts.approve) return { ok: true, approvalRequired: true, ...preview,
+        authorizationScope: "repository-wide; shared by all OAuth clients with git.write scope",
         instruction: "Inspect this exact repository and local allowlist, then rerun with --approve --digest. Hooks and arbitrary helpers are disabled; optional approved GCM runs in the controlled job." };
       if (opts.digest !== preview.digest) throw new Error("POLICY_DIGEST_MISMATCH");
       const approval = approveGitRepository(ws, opts.repository, { ...policy, localApproval: true }, opts.digest);

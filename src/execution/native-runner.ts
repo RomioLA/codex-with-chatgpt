@@ -156,6 +156,7 @@ export class WindowsNativeExecutionRunner {
       beforeHelperRequestWrite?: (runtime: TrustedRuntime) => void;
       launcherTestHoldMs?: number;
       launcherEvidence?: (line: string) => void;
+      helperBeforeResumeTest?: { releaseFile: string; phase?: "suspended" | "permit"; onSuspended: (line: string) => void };
     } = {}
   ) {}
 
@@ -188,6 +189,10 @@ export class WindowsNativeExecutionRunner {
       const holdMs = Math.max(0, Math.min(3000, Math.trunc(this.options.launcherTestHoldMs)));
       env.C2C_EXECUTION_LAUNCHER_TEST_EVIDENCE = "1";
       env.C2C_EXECUTION_LAUNCHER_TEST_HOLD_MS = String(holdMs);
+    }
+    if (this.options.helperBeforeResumeTest) {
+      env.C2C_EXECUTION_HELPER_TEST_RELEASE = path.resolve(this.options.helperBeforeResumeTest.releaseFile);
+      env.C2C_EXECUTION_HELPER_TEST_PHASE = this.options.helperBeforeResumeTest.phase ?? "suspended";
     }
     const spawnImpl = this.options.spawnImpl ?? spawn;
     let input: Buffer;
@@ -291,12 +296,13 @@ export class WindowsNativeExecutionRunner {
       child.stderr.on("data", (data: Buffer) => {
         const chunk = Buffer.from(data).toString("utf8");
         diagnostics = (diagnostics + chunk).slice(-4096);
-        if (this.options.launcherEvidence) {
+        if (this.options.launcherEvidence || this.options.helperBeforeResumeTest) {
           launcherEvidencePending += chunk;
           const lines = launcherEvidencePending.split(/\r?\n/);
           launcherEvidencePending = lines.pop() ?? "";
           for (const line of lines) {
-            if (line.startsWith("C2C_EXECUTION_LAUNCHER_EVIDENCE:")) this.options.launcherEvidence(line);
+            if (line.startsWith("C2C_EXECUTION_LAUNCHER_EVIDENCE:")) this.options.launcherEvidence?.(line);
+            if (line.startsWith("C2C_EXECUTION_HELPER_SUSPENDED:")) this.options.helperBeforeResumeTest?.onSuspended(line);
           }
         }
       });

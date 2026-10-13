@@ -147,6 +147,10 @@ rejected. C2C writers sharing a common Git directory share a lock. Index and
 switch's HEAD are mutable snapshots, checked again before launch; external local
 Git clients do not obey the C2C lock. Post-state confirms the local repository
 only; failed/cancelled network jobs may have partially succeeded remotely.
+Commit additionally binds an approved tree and parent and uses a ref compare-and-swap.
+Native rechecks mutable index/HEAD snapshots immediately before resume; it cannot
+exclude all external Git races. Uncertain or failed started writes require local
+review before further writes. Repository grants are shared across git.write clients.
 
 Level 3 is off by default and cannot be enabled or approved through MCP.
 Each command requires a local CLI approval binding OAuth client, workspace,
@@ -158,6 +162,18 @@ an extra explicit acknowledgement for the latter. Risk is not inferred by the
 model. Known shells require fixed CMD or PowerShell 7 launch modes. The native
 layer refuses an elevated token and uses the existing Job Object lifecycle and
 integrity checks. It neither invokes UAC nor grants extra privileges.
+Literal script entries join the approved materials. Unresolved dynamic entry
+semantics require explicit local acknowledgement, without claiming all dependencies
+are frozen. A revocable manifest-hash permit is held through ResumeThread; a busy
+revoke reports failure, never successful revocation. Active-process cancellation
+still requires confirmed Job Object completion. Native trusts protected Bridge
+authorization semantics and is not a second full OAuth/approval decision engine.
+
+Safe terminal history is archived with audit and idempotency records; uncertain
+or active jobs are retained. Archive disk usage is not bounded by the active limits.
+Bridge acquires the state/workspace owner lock before constructing its Supervisor,
+including persistRuntime=false. Direct independently constructed Supervisors do
+not inherit that production entry-point guarantee.
 
 The approved command runs with the current user's host access. Cwd containment,
 material locks and Job Objects are not an OS filesystem or network sandbox.

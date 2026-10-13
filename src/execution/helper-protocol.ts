@@ -1,4 +1,5 @@
 import type { ExecutionKind, PackageManager, OutputStream } from "./job-types.js";
+import path from "node:path";
 
 const REQUEST_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x35, 0x00]); // C2CJOB5\0
 const RESPONSE_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x35, 0x00]); // C2COUT5\0
@@ -29,6 +30,7 @@ export interface GenericCommand {
   approvalManifestFileIdentity: string;
   approvalManifestHash: string;
   materials: Array<{ path: string; fileIdentity: string; hash: string }>;
+  launchSnapshots?: Array<{ path: string; fileIdentity: string; hash: string }>;
 }
 
 export interface HelperRequest {
@@ -115,7 +117,7 @@ export function serializeTempCleanupRequest(request: TempCleanupRequest): Buffer
 }
 
 export interface HelperResultFrame {
-  outcome: 0 | 1 | 2 | 3;
+  outcome: 0 | 1 | 2 | 3 | 4 | 5;
   exitCode: number;
   win32Error: number;
 }
@@ -264,6 +266,9 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
   argumentCount.writeUInt32LE(generic.args.length);
   const materialCount = Buffer.alloc(4);
   materialCount.writeUInt32LE(generic.materials.length);
+  const snapshots = generic.launchSnapshots ?? [];
+  if (snapshots.length > 256 || snapshots.some(item => !path.win32.isAbsolute(item.path) || item.path.includes("\0") || !/^[a-f0-9]+:[a-f0-9]+$/i.test(item.fileIdentity) || !/^[a-f0-9]{64}$/i.test(item.hash))) throw new TypeError("Invalid launch snapshot");
+  const snapshotCount = Buffer.alloc(4); snapshotCount.writeUInt32LE(snapshots.length);
   return Buffer.concat([
     ...base,
     genericMode,
@@ -284,6 +289,8 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
       encodeString(material.fileIdentity),
       encodeString(material.hash),
     ]),
+    snapshotCount,
+    ...snapshots.flatMap(material => [encodeString(material.path), encodeString(material.fileIdentity), encodeString(material.hash)]),
   ]);
 }
 
@@ -327,7 +334,7 @@ export class HelperOutputDecoder {
       } else if (type === 3) {
         if (this.resultSeen || payload.byteLength !== 9) throw new Error("HELPER_PROTOCOL_BAD_RESULT");
         const outcome = payload.readUInt8(0);
-        if (outcome > 3) throw new Error("HELPER_PROTOCOL_BAD_RESULT");
+        if (outcome > 5) throw new Error("HELPER_PROTOCOL_BAD_RESULT");
         this.resultSeen = true;
         frames.push({
           type: "result",

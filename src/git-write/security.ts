@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { getStateDir } from "../config/paths.js";
 import type { Workspace } from "../workspace/manager.js";
+import { isProtectedStatePath } from "../workspace/protected-state.js";
 import { GitWriteError, type GitWriteMaterial } from "./types.js";
 
 export interface GitConfigEntry {
@@ -314,9 +315,10 @@ export function runVerifiedGit(
   executable: GitExecutable,
   cwd: string,
   args: string[],
-  options: { maxBuffer?: number; timeoutMs?: number } = {},
+  options: { maxBuffer?: number; timeoutMs?: number; indexFile?: string } = {},
 ): GitProcessResult {
   verifyExecutable(executable);
+  if (options.indexFile && (!isProtectedStatePath(assertNoReparsePath(options.indexFile)) || !fs.lstatSync(options.indexFile).isFile())) throw new GitWriteError("INVALID_PATH");
   let result: ReturnType<typeof spawnSync>;
   const clear = new Set(GIT_WRITE_CLEAR_ENVIRONMENT.map((name) => name.toUpperCase()));
   try {
@@ -328,6 +330,7 @@ export function runVerifiedGit(
           !name.toUpperCase().startsWith("GIT_") && !clear.has(name.toUpperCase())
         )),
         ...getGitWriteEnvironment(),
+        ...(options.indexFile ? { GIT_INDEX_FILE: options.indexFile } : {}),
       },
       maxBuffer: options.maxBuffer ?? MAX_GIT_OUTPUT_BYTES,
       timeout: options.timeoutMs ?? 30_000,

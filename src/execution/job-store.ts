@@ -3,6 +3,8 @@ import path from "node:path";
 import { getStateDir, ensureDir } from "../config/paths.js";
 import { isExecutionJobState, isExecutionKind, type ExecutionJob, type ExecutionStreamMeta, type OutputStream } from "./job-types.js";
 import { isTerminalExecutionState, transitionExecutionJob } from "./state-machine.js";
+import { archiveRecord, readArchivedRecord, jobCanBeArchived, archivedIdempotencyKey } from "./record-archive.js";
+import { atomicReplace } from "./atomic-replace.js";
 
 export const MAX_JOBS_PER_WORKSPACE = 50;
 export const JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -79,6 +81,7 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     )) &&
     (job.gitResult === undefined || (
       !!job.gitResult && ["confirmed", "changed", "identity_changed", "unavailable"].includes(job.gitResult.confirmation) &&
+      (job.gitResult.integrity === undefined || ["verified", "unexpected", "not_verified"].includes(job.gitResult.integrity)) &&
       job.gitResult.confirmationScope === "local_repository" &&
       ["not_applicable", "not_attempted", "reported_success", "unknown"].includes(job.gitResult.remoteOutcome) &&
       typeof job.gitResult.partialSuccessPossible === "boolean" &&
@@ -125,7 +128,7 @@ function serializeAtomic(file: string, value: unknown): void {
   } catch {
     /* best effort on Windows */
   }
-  fs.renameSync(temporary, file);
+  atomicReplace(temporary, file);
 }
 
 function isOutputStream(value: string): value is OutputStream {
@@ -237,39 +240,56 @@ export class ExecutionJobStore {
     }
   }
 
-  private prune(now = Date.now()): void {
+  private archiveJob(job: ExecutionJob): void {
+    archiveRecord(this.directory, "jobs", job.jobId, job);
+    archiveRecord(this.directory, "idempotency", archivedIdempotencyKey(job.oauthClientId, job.idempotencyKeyHash), { workspaceId: this.workspaceId, jobId: job.jobId });
+    // Output and uncertain evidence are retained. Only the active index shrinks.
+    this.jobs.delete(job.jobId);
+  }
+
+  private prune(now = Date.now(), reserveSlot = false): void {
     const ordered = [...this.jobs.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const keep: ExecutionJob[] = [];
     for (const job of ordered) {
       const age = now - Date.parse(job.createdAt);
-      const expired = Number.isFinite(age) && age > JOB_RETENTION_MS && isTerminalExecutionState(job.state);
+      const expired = Number.isFinite(age) && age > JOB_RETENTION_MS && jobCanBeArchived(job);
       if (expired) {
-        this.deleteOutputFiles(job.jobId);
-        this.jobs.delete(job.jobId);
+        this.archiveJob(job);
       } else {
         keep.push(job);
       }
     }
-    while (keep.length > MAX_JOBS_PER_WORKSPACE) {
-      const index = keep.findIndex((job) => isTerminalExecutionState(job.state));
+    while (keep.length > MAX_JOBS_PER_WORKSPACE - (reserveSlot ? 1 : 0)) {
+      const index = keep.findIndex(jobCanBeArchived);
       if (index < 0) break;
       const [dropped] = keep.splice(index, 1);
-      this.deleteOutputFiles(dropped.jobId);
-      this.jobs.delete(dropped.jobId);
+      this.archiveJob(dropped);
     }
   }
 
   create(job: ExecutionJob): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
     if (job.workspaceId !== this.workspaceId || this.jobs.has(job.jobId)) throw new TypeError("Invalid execution job");
-    this.prune();
+    this.prune(Date.now(), true);
     if (this.jobs.size >= MAX_JOBS_PER_WORKSPACE) throw new Error("JOB_STORE_FULL");
     this.jobs.set(job.jobId, { ...job, stdout: { ...EMPTY_STREAM }, stderr: { ...EMPTY_STREAM } });
     this.persist();
   }
 
+  prepareCapacity(): void {
+    if (this.corruption) throw new Error("STORE_CORRUPT");
+    this.prune(Date.now(), true);
+    this.persist();
+    if (this.jobs.size >= MAX_JOBS_PER_WORKSPACE) throw new Error("JOB_STORE_FULL");
+  }
+
   get(jobId: string): ExecutionJob | null {
-    return this.jobs.get(jobId) ?? null;
+    const active = this.jobs.get(jobId);
+    if (active) return active;
+    if (!/^[A-Za-z0-9_-]{24,64}$/.test(jobId)) return null;
+    const archived = readArchivedRecord<ExecutionJob>(this.directory, "jobs", jobId);
+    if (archived && (!isValidJob(archived, this.workspaceId) || archived.jobId !== jobId || !jobCanBeArchived(archived))) throw new Error("ARCHIVE_CORRUPT");
+    return archived;
   }
 
   listForClient(clientId: string, limit = MAX_JOBS_PER_WORKSPACE): ExecutionJob[] {
@@ -288,17 +308,23 @@ export class ExecutionJobStore {
   }
 
   findIdempotent(clientId: string, idempotencyKeyHash: string): ExecutionJob | null {
-    return [...this.jobs.values()].find((job) =>
+    const active = [...this.jobs.values()].find((job) =>
       job.oauthClientId === clientId && job.idempotencyKeyHash === idempotencyKeyHash
-    ) ?? null;
+    );
+    if (active) return active;
+    const pointer = readArchivedRecord<{workspaceId: string; jobId: string}>(this.directory, "idempotency", archivedIdempotencyKey(clientId, idempotencyKeyHash));
+    if (!pointer) return null;
+    const job = this.get(pointer.jobId);
+    if (!job || pointer.workspaceId !== this.workspaceId || job.oauthClientId !== clientId || job.idempotencyKeyHash !== idempotencyKeyHash) throw new Error("ARCHIVE_CORRUPT");
+    return job;
   }
 
   replace(job: ExecutionJob): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
     if (job.workspaceId !== this.workspaceId || !this.jobs.has(job.jobId)) throw new TypeError("Unknown execution job");
     this.jobs.set(job.jobId, job);
-    this.persist();
     this.prune();
+    this.persist();
   }
 
   appendSanitized(jobId: string, stream: OutputStream, text: string): void {
@@ -364,7 +390,7 @@ export class ExecutionJobStore {
 
   readOutput(jobId: string, stream: OutputStream, requestedOffset = 0, requestedBytes = MAX_OUTPUT_READ_BYTES): ReadJobOutputResult {
     if (this.corruption) return { ok: false, error: "STORE_CORRUPT" };
-    const job = this.jobs.get(jobId);
+    const job = this.get(jobId);
     if (!job) return { ok: false, error: "NOT_FOUND" };
     if (!Number.isSafeInteger(requestedOffset) || requestedOffset < 0 || !Number.isSafeInteger(requestedBytes) || requestedBytes < 1) {
       return { ok: false, error: "INVALID_OFFSET" };

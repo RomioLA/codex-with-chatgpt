@@ -4,9 +4,10 @@ import { describe, expect, it } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supervisor.js";
 import { setPermission } from "../src/permission/store.js";
-import { createLevel3Request, approveLevel3Request, setLevel3Enabled, revokeLevel3Request } from "../src/execution/level3-approval.js";
+import { createLevel3Request, approveLevel3Request, setLevel3Enabled, revokeLevel3Request, getLevel3Request } from "../src/execution/level3-approval.js";
 import type { NativeRunnerCompletion } from "../src/execution/native-runner.js";
-import { isolateStateDir, makeTmpDir, makeGitRepo, write } from "./helpers.js";
+import { isolateStateDir, makeTmpDir, makeGitRepo, write, git } from "./helpers.js";
+import { approveGitRepository, previewGitRepositoryApproval } from "../src/git-write/index.js";
 
 class Runner implements ExecutionRunner {
   requests: Array<Parameters<ExecutionRunner["start"]>[0]> = [];
@@ -32,6 +33,35 @@ function fixture() {
 }
 
 describe("V1.3 supervisor isolation", () => {
+  it("requires review after a started Git failure even when the local state is unchanged", async () => {
+    const f = fixture();
+    try {
+      const policy = { allowedRemotes: [], allowedBranches: ["main"], allowedOperations: ["branch_list" as const] };
+      const preview = previewGitRepositoryApproval(f.ws, ".", policy);
+      approveGitRepository(f.ws, ".", { ...policy, localApproval: true }, preview.digest);
+      const input = { repositoryPath: ".", operation: { kind: "branch_list" as const, expectedHead: null, expectedBranch: "main" },
+        timeoutSeconds: 30, oauthClientId: "git-failure-client", scopes: ["git.write"], idempotencyKey: "git-known-failure-0123456789" };
+      // The fixture's initialized repository has a real HEAD; take the preview's
+      // repository state through Git rather than guessing its commit identity.
+      const request = { ...input, operation: { ...input.operation, expectedHead: git(f.ws.root, "rev-parse", "HEAD").trim() } };
+      const started = f.supervisor.startGitWrite(request);
+      expect(started.ok).toBe(true);
+      f.runner.finish({ result: { outcome: 0, exitCode: 7, win32Error: 0 }, helperExitCode: 0, tempCleanupConfirmed: true });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(f.supervisor.startGitWrite(request)).toMatchObject({ ok: true, duplicate: true });
+      expect(f.supervisor.startGitWrite({ ...request, idempotencyKey: "git-fresh-key-0123456789" })).toMatchObject({ ok: false, error: "GIT_REVIEW_REQUIRED" });
+    } finally { await f.supervisor.shutdown(); }
+  });
+  it("deduplicates explicit and discovered script aliases and rejects UNC executable paths", async () => {
+    const f = fixture();
+    try {
+      setLevel3Enabled(f.ws.id, true, true);
+      write(f.ws.root, "entry.js", "approved script");
+      const record = createLevel3Request(f.ws, "owner", { ...f.spec, args: ["entry.js"], materials: ["./entry.js"] });
+      expect(getLevel3Request(f.ws.id, record.requestId)?.snapshot.materials).toHaveLength(1);
+      if (process.platform === "win32") expect(() => createLevel3Request(f.ws, "owner", { ...f.spec, executable: String.raw`\\unreachable-host\share\program.exe` })).toThrow("INVALID_ARGUMENTS");
+    } finally { await f.supervisor.shutdown(); }
+  });
   it("rejects known shell aliases and credential literals even beside a redaction placeholder", async () => {
     const f = fixture();
     try {

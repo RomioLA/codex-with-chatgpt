@@ -92,10 +92,14 @@ function genericTail(buffer: Buffer) {
     fileIdentity: readString(buffer, offset),
     hash: readString(buffer, offset),
   }));
+  const snapshotCount = buffer.readUInt32LE(offset.value); offset.value += 4;
+  const launchSnapshots = Array.from({ length: snapshotCount }, () => ({
+    path: readString(buffer, offset), fileIdentity: readString(buffer, offset), hash: readString(buffer, offset),
+  }));
   return {
     mode, executable, executableFileIdentity, executableHash, args, commandText,
     cwd, cwdFileIdentity, approvalManifest, approvalManifestFileIdentity,
-    approvalManifestHash, materials, end: offset.value,
+    approvalManifestHash, materials, ...(launchSnapshots.length ? { launchSnapshots } : {}), end: offset.value,
   };
 }
 

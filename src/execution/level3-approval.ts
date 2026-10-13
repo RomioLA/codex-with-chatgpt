@@ -6,6 +6,9 @@ import { StreamingSanitizer } from "./stream-sanitize.js";
 import { resolveRepositoryIdentity, type RepositoryIdentity } from "./repository-identity.js";
 import type { Workspace } from "../workspace/manager.js";
 import { isProtectedStatePath } from "../workspace/protected-state.js";
+import { bindLevel3ScriptEntries } from "./script-entry-binding.js";
+import { archiveRecord, readArchivedRecord } from "./record-archive.js";
+import { atomicReplace } from "./atomic-replace.js";
 
 export const LEVEL3_REQUEST_TTL_MS = 10 * 60 * 1000;
 export const MAX_LEVEL3_PENDING_REQUESTS = 50;
@@ -32,6 +35,7 @@ interface Level3SpecBase {
   cwd: string;
   timeoutSeconds: number;
   materials: string[];
+  entryBinding?: { kind: "literal_entries" | "dynamic_code"; uncertainties: string[] };
 }
 
 export type Level3Spec = Level3SpecBase & (
@@ -72,6 +76,8 @@ export interface Level3RequestRecord {
   expiresAt: string;
   risk: Level3Risk | null;
   allowSystem: boolean;
+  allowDynamic?: boolean;
+  cleanupConfirmedAt?: string;
   approvalId: string | null;
   approvedAt: string | null;
   launchExpiresAt: string | null;
@@ -140,6 +146,7 @@ interface Level3Manifest {
   digest: string;
   risk: Level3Risk;
   allowSystem: boolean;
+  allowDynamic: boolean;
   repositoryPath: string;
   repositoryIdentity: string;
   spec: Level3Spec;
@@ -171,6 +178,7 @@ export type Level3ApprovalErrorCode =
   | "LEVEL3_EXECUTABLE_UNAVAILABLE"
   | "LEVEL3_STORE_CORRUPT"
   | "LEVEL3_STORE_BUSY"
+  | "LEVEL3_REVOKE_BUSY"
   | "LEVEL3_STORE_FULL";
 
 export class Level3ApprovalError extends Error {
@@ -247,6 +255,22 @@ function manifestFile(workspaceId: string, requestId: string): string {
   return path.join(stateDirectory(workspaceId), `${requestId}.manifest.json`);
 }
 
+function invalidateLaunchPermit(record: Level3RequestRecord): void {
+  if (!record.manifestPath) return;
+  const permit = `${manifestFile(record.workspaceId, record.requestId)}.permit`;
+  try {
+    const stat = fs.lstatSync(permit);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== 64 || fs.readFileSync(permit, "utf8") !== record.manifestHash) fail("LEVEL3_STORE_CORRUPT");
+    // Native holds a no-write/no-delete handle from the final check through
+    // ResumeThread. A sharing conflict is BUSY, never a successful revoke.
+    fs.renameSync(permit, `${permit}.revoked`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if (error instanceof Level3ApprovalError) throw error;
+    fail("LEVEL3_REVOKE_BUSY");
+  }
+}
+
 function emptyState(workspaceId: string): Level3State {
   return { version: STATE_VERSION, workspaceId, enabled: false, requests: [] };
 }
@@ -319,7 +343,7 @@ function atomicWrite(file: string, value: unknown): void {
   try {
     fs.writeFileSync(temporary, serialized, { mode: 0o600, flag: "wx" });
     try { fs.chmodSync(temporary, 0o600); } catch { /* best effort on Windows */ }
-    fs.renameSync(temporary, file);
+    atomicReplace(temporary, file);
   } catch {
     try { fs.unlinkSync(temporary); } catch { /* preserve the original write error */ }
     fail("LEVEL3_STORE_CORRUPT");
@@ -395,6 +419,7 @@ function workspaceRelativeInput(workspace: Workspace, value: string): { abs: str
     fail("INVALID_ARGUMENTS");
   }
   const lexical = path.resolve(workspace.root, value.replace(/[\\/]/g, path.sep));
+  if (!isWithin(workspace.root, lexical)) fail("INVALID_ARGUMENTS");
   let resolved: { abs: string; rel: string };
   try { resolved = workspace.resolve(value); } catch { fail("INVALID_ARGUMENTS"); }
   if (!isWithin(workspace.root, lexical) || !isWithin(workspace.root, resolved.abs)) fail("INVALID_ARGUMENTS");
@@ -436,7 +461,8 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
     if (normPath(supplied.abs) !== normPath(repository.canonicalPath)) fail("INVALID_ARGUMENTS");
   }
   const executableInput = raw.executable;
-  if (typeof executableInput !== "string" || !path.isAbsolute(executableInput) || !/\.exe$/i.test(executableInput)) {
+  if (typeof executableInput !== "string" || !path.isAbsolute(executableInput) || !/\.exe$/i.test(executableInput) ||
+      (process.platform === "win32" && !/^[A-Za-z]:[\\/]/.test(executableInput))) {
     fail("INVALID_ARGUMENTS");
   }
   const executableMaterial = hashRegularFile(executableInput);
@@ -482,14 +508,18 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
   const normalizedMaterials: Level3MaterialSnapshot[] = [];
   const seen = new Set<string>();
   let totalMaterialBytes = 0;
-  for (const materialInput of raw.materials) {
+  const entries = bindLevel3ScriptEntries({ engine: raw.engine, workspaceRoot: workspace.root, cwd: cwd.path,
+    executable: executableMaterial.path, args, command });
+  const allMaterials = [...new Set([...raw.materials, ...entries.materials])];
+  if (allMaterials.length > MAX_LEVEL3_MATERIALS) fail("INVALID_ARGUMENTS");
+  for (const materialInput of allMaterials) {
     const resolved = workspaceRelativeInput(workspace, materialInput);
     if (!isWithin(repository.canonicalPath, resolved.abs) ||
         !isWithin(repository.canonicalPath, resolved.lexical)) fail("INVALID_ARGUMENTS");
     const material = hashRegularFile(resolved.lexical);
     if (normPath(material.path) !== normPath(resolved.abs)) fail("LEVEL3_MATERIAL_CHANGED");
     const key = normPath(material.path);
-    if (seen.has(key)) fail("INVALID_ARGUMENTS");
+    if (seen.has(key)) continue;
     seen.add(key);
     totalMaterialBytes += material.sizeBytes;
     if (totalMaterialBytes > MAX_LEVEL3_TOTAL_MATERIAL_BYTES) fail("INVALID_ARGUMENTS");
@@ -525,6 +555,7 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
     cwdFileIdentity: cwd.fileIdentity,
     materials: normalizedMaterials,
   };
+  spec.entryBinding = { kind: entries.hasUnresolvedSemantics ? "dynamic_code" : "literal_entries", uncertainties: entries.uncertainties };
   return {
     spec,
     repositoryPath: repository.workspaceRelativePath || ".",
@@ -619,6 +650,14 @@ function withStateTransaction<T>(workspaceId: string, action: (state: Level3Stat
 }
 
 function ensureHistoryCapacity(state: Level3State): void {
+  if (state.requests.length < MAX_LEVEL3_REQUEST_HISTORY) return;
+  const retained: Level3RequestRecord[] = [];
+  for (const record of state.requests) {
+    const safe = TERMINAL_STATES.has(record.status) && ((!record.consumedAt && !record.launchingAt) || !!record.cleanupConfirmedAt);
+    if (safe) archiveRecord(stateDirectory(state.workspaceId), "level3", record.requestId, record);
+    else retained.push(record);
+  }
+  state.requests = retained;
   if (state.requests.length >= MAX_LEVEL3_REQUEST_HISTORY) fail("LEVEL3_STORE_FULL");
 }
 
@@ -654,6 +693,7 @@ function toManifest(record: Level3RequestRecord): Level3Manifest {
     digest: record.digest,
     risk: record.risk,
     allowSystem: record.allowSystem,
+    allowDynamic: record.allowDynamic === true,
     repositoryPath: record.repositoryPath,
     repositoryIdentity: record.repositoryIdentity,
     spec: record.spec,
@@ -733,6 +773,7 @@ export function setLevel3Enabled(workspaceId: string, enabled: boolean, localApp
       const now = new Date().toISOString();
       for (const request of state.requests) {
         if (["pending", "approved", "consumed", "launching"].includes(request.status)) {
+          invalidateLaunchPermit(request);
           request.status = "revoked";
           request.finishedAt = now;
         }
@@ -747,6 +788,7 @@ export function revokeLevel3Request(workspaceId: string, requestId: string, loca
   return withStateTransaction(workspaceId, (state) => {
     const record = state.requests.find((item) => item.requestId === requestId);
     if (!record || TERMINAL_STATES.has(record.status)) return false;
+    invalidateLaunchPermit(record);
     record.status = "revoked";
     record.finishedAt = new Date().toISOString();
     return true;
@@ -810,7 +852,11 @@ export function createLevel3Request(workspace: Workspace, clientId: string, rawS
 /** Local CLI only: full record includes material hashes and protected manifest path. */
 export function getLevel3Request(workspaceId: string, requestId: string): Level3RequestRecord | null {
   if (!/^[A-Za-z0-9_-]{24,64}$/.test(requestId)) fail("INVALID_ARGUMENTS");
-  return readState(workspaceId).requests.find((item) => item.requestId === requestId) ?? null;
+  const active = readState(workspaceId).requests.find((item) => item.requestId === requestId);
+  if (active) return active;
+  const archived = readArchivedRecord<Level3RequestRecord>(stateDirectory(workspaceId), "level3", requestId);
+  if (archived && (!validStoredRecord(archived, workspaceId) || archived.requestId !== requestId || !TERMINAL_STATES.has(archived.status))) fail("LEVEL3_STORE_CORRUPT");
+  return archived;
 }
 
 /** Local CLI only: list is bounded and contains only live, unexpired requests. */
@@ -836,7 +882,7 @@ export function approveLevel3Request(
   requestId: string,
   expectedDigest: string,
   localApproval: true,
-  options: { risk: Level3Risk; allowSystem?: true },
+  options: { risk: Level3Risk; allowSystem?: true; allowDynamic?: true },
 ): Level3RequestRecord {
   if (localApproval !== true || !workspace || !/^[A-Za-z0-9_-]{24,64}$/.test(requestId) || !isSha256(expectedDigest) ||
       !options || (options.risk !== "development" && options.risk !== "destructive-system")) fail("INVALID_ARGUMENTS");
@@ -848,6 +894,7 @@ export function approveLevel3Request(
     if (record.digest !== expectedDigest) fail("LEVEL3_DIGEST_MISMATCH");
     if (record.status === "expired" || recordExpired(record, Date.now())) fail("LEVEL3_REQUEST_EXPIRED");
     if (record.status !== "pending") fail("LEVEL3_REQUEST_NOT_PENDING");
+    if (record.spec.entryBinding?.kind === "dynamic_code" && options.allowDynamic !== true) fail("LEVEL3_RISK_APPROVAL_REQUIRED");
     verifyRequestBinding(record, record.clientId, expectedDigest);
     currentSnapshot(workspace, record);
     const approvedAt = new Date().toISOString();
@@ -856,6 +903,7 @@ export function approveLevel3Request(
     record.status = "approved";
     record.risk = options.risk;
     record.allowSystem = options.allowSystem === true;
+    record.allowDynamic = options.allowDynamic === true;
     record.approvalId = approvalId;
     record.approvedAt = approvedAt;
     record.launchExpiresAt = launchExpiresAt;
@@ -872,6 +920,7 @@ export function approveLevel3Request(
     const material = hashRegularFile(record.manifestPath);
     record.manifestFileIdentity = material.fileIdentity;
     record.manifestHash = material.hash;
+    fs.writeFileSync(`${record.manifestPath}.permit`, material.hash, { mode: 0o600, flag: "wx" });
     return record;
   });
 }
@@ -958,11 +1007,13 @@ export function completeLevel3Request(
   requestId: string,
   clientId: string,
   outcome: "completed" | "failed",
+  cleanupConfirmed = false,
 ): boolean {
   if (!validClientId(clientId) || !/^[A-Za-z0-9_-]{24,64}$/.test(requestId) ||
       (outcome !== "completed" && outcome !== "failed")) fail("INVALID_ARGUMENTS");
   return withStateTransaction(workspaceId, (state) => {
     const record = state.requests.find((item) => item.requestId === requestId);
+    if (record?.clientId === clientId && cleanupConfirmed) record.cleanupConfirmedAt = new Date().toISOString();
     if (!record || record.clientId !== clientId ||
         (record.status !== "launching" && !(record.status === "consumed" && outcome === "failed"))) return false;
     record.status = outcome;

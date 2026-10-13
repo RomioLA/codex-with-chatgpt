@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { getStateDir, ensureDir } from "../config/paths.js";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveRepositoryIdentity, RepositoryIdentityError } from "../execution/repository-identity.js";
@@ -120,6 +121,24 @@ function validateOperationShape(input: unknown): asserts input is GitWriteOperat
 function runText(executable: GitExecutable, cwd: string, args: string[], common: string[]): string {
   const output = requireGitSuccess(runVerifiedGit(executable, cwd, [...common, ...args], { maxBuffer: 64 * 1024 }));
   return output.toString("utf8").replace(/\r?\n$/, "");
+}
+
+function reviewedIndexTree(repository: ReturnType<typeof resolveRepositoryIdentity>, executable: GitExecutable, config: GitConfigEntry[]) {
+  const source = readFileMaterial(path.join(repository.gitDirectory, "index"));
+  const bytes = fs.readFileSync(source.path);
+  if (sha256(bytes) !== source.hash) throw new GitWriteError("EXPECTED_STATE_CHANGED");
+  const directory = assertNoReparsePath(ensureDir(path.join(getStateDir(), "execution", "git-index-snapshots")));
+  const temporary = path.join(directory, `${randomBytes(24).toString("hex")}.index`);
+  fs.writeFileSync(temporary, bytes, { flag: "wx", mode: 0o600 });
+  try {
+    const result = requireGitSuccess(runVerifiedGit(executable, repository.canonicalPath,
+      [...buildCommonGitArgs(config, null), "write-tree"], { maxBuffer: 4096, indexFile: temporary }));
+    return { tree: result.toString("utf8").trim(), source };
+  } finally {
+    // One exact per-call scratch file, created with wx beneath protected state.
+    // No directory/unknown-file pruning; interrupted artifacts remain evidence.
+    try { if (fs.lstatSync(temporary).isFile() && !fs.lstatSync(temporary).isSymbolicLink() && fs.realpathSync.native(temporary).toLowerCase() === temporary.toLowerCase()) fs.unlinkSync(temporary); } catch { /* preserve unconfirmed scratch ownership */ }
+  }
 }
 
 function stateSnapshot(
@@ -349,6 +368,7 @@ function validateStagedCommit(
   const staged = decodeGitPaths(requireGitSuccess(runVerifiedGit(executable, root, [
     ...common, "diff", "--cached", "--name-only", "--no-renames", "-z",
   ])));
+  if (staged.length === 0) throw new GitWriteError("INVALID_ARGUMENTS");
   const repoRules = new IgnoreRules(root);
   for (const candidate of staged) {
     if (candidate.startsWith("/") || candidate.split("/").some((part) => part === ".." || part === "")) {
@@ -668,6 +688,8 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
   );
   const helper = input.kind === "push" || input.kind === "fetch" || input.kind === "pull_ff_only" ? approval.credentialHelper : null;
   const helperCommand = credentialHelperCommand(approval, helper !== null);
+  // write-tree may update the cache-tree extension: capture it before index
+  // identity/hash, and bind the tree rather than re-reading a mutable index.
   const state = stateSnapshot(repository.identity, executable, repository.canonicalPath, config, helperCommand);
   assertExpectedState(input, state);
   const headMaterial = captureHeadMaterial(repository, state);
@@ -680,9 +702,17 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
   if (input.kind === "pull_ff_only" && state.branch !== input.branch) throw new GitWriteError("INVALID_BRANCH");
   if (input.kind === "push" && state.branch !== input.branch) throw new GitWriteError("INVALID_BRANCH");
 
+  const reviewed = input.kind === "commit" ? reviewedIndexTree(repository, executable, config) : null;
+  const tree = reviewed?.tree ?? null;
+  if (tree !== null && !HEX.test(tree)) throw new GitWriteError("STATE_UNAVAILABLE");
+
   const { materials, snapshotMaterials } = collectMaterials(
     repository, executable, config, approval, sourcePaths, headMaterial, input.kind !== "switch",
   );
+  if (reviewed) {
+    const index = snapshotMaterials.find(item => norm(item.path) === norm(reviewed.source.path));
+    if (!index || index.hash !== reviewed.source.hash || index.fileIdentity !== reviewed.source.fileIdentity) throw new GitWriteError("EXPECTED_STATE_CHANGED");
+  }
   const before: GitWriteBefore = {
     repositoryIdentity: repository.identity,
     executable: executable.path,
@@ -699,7 +729,11 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
   } as GitWriteOperation);
   const environment = getGitWriteEnvironment();
   const policyHash = gitWritePolicyHash(approval);
+  const commitBinding = tree && state.branch ? { tree, parent: state.head, branch: state.branch } : undefined;
+  const switchBinding = input.kind === "switch" ? { head: runText(executable, repository.canonicalPath, ["rev-parse", "--verify", `refs/heads/${input.name}^{commit}`], buildCommonGitArgs(config, null)) } : undefined;
   const digest = sha256(JSON.stringify({
+    commitBinding,
+    switchBinding,
     repository: repository.identity,
     executable: { path: executable.path, fileIdentity: executable.fileIdentity, hash: executable.hash },
     args,
@@ -714,6 +748,8 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
     policyHash,
   }));
   return {
+    ...(commitBinding ? { commitBinding } : {}),
+    ...(switchBinding ? { switchBinding } : {}),
     repository,
     executable: executable.path,
     executableFileIdentity: executable.fileIdentity,
@@ -730,6 +766,32 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
     remoteBinding,
     credentialHelper: helper ? { ...helper } : null,
   };
+}
+
+/** Verify operation-specific postconditions while the C2C writer lock is held.
+ * This detects unexpected outcomes; it never rolls back external user data. */
+export function verifyGitPostconditions(workspace: Workspace, repositoryPath: string, plan: GitWritePlan): boolean {
+  const repository = resolveRepositoryIdentity(workspace, repositoryPath);
+  if (repository.identity !== plan.repository.identity) return false;
+  const executable: GitExecutable = { path: plan.executable, fileIdentity: plan.executableFileIdentity, hash: plan.executableHash };
+  const config = loadGitConfig(executable, repository.canonicalPath); validateGitConfig(config);
+  const common = buildCommonGitArgs(config, null);
+  const after = stateSnapshot(repository.identity, executable, repository.canonicalPath, config, null);
+  if (plan.operation.kind === "commit") {
+    if (!plan.commitBinding || after.branch !== plan.commitBinding.branch || !after.head) return false;
+    const actual = requireGitSuccess(runVerifiedGit(executable, repository.canonicalPath, [...common, "log", "-1", "--format=%P%n%T", after.head])).toString("utf8").trimEnd().split(/\r?\n/);
+    return actual[0] === (plan.commitBinding.parent ?? "") && actual[1] === plan.commitBinding.tree;
+  }
+  if (plan.operation.kind === "switch") {
+    if (!plan.switchBinding || after.branch !== plan.operation.name || after.head !== plan.switchBinding.head || after.refsHash !== plan.before.refsHash) return false;
+    assertCleanWorktree(executable, repository.canonicalPath, config); return true;
+  }
+  if (plan.operation.kind === "pull_ff_only") {
+    if (after.branch !== plan.before.branch || !after.head) return false;
+    if (plan.before.head && runVerifiedGit(executable, repository.canonicalPath, [...common, "merge-base", "--is-ancestor", plan.before.head, after.head]).code !== 0) return false;
+    assertCleanWorktree(executable, repository.canonicalPath, config); return true;
+  }
+  return after.head === plan.before.head && after.branch === plan.before.branch;
 }
 
 export function confirmGitWriteState(

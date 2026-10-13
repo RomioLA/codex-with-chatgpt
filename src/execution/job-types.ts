@@ -44,6 +44,7 @@ export interface ExecutionJob {
     digest: string;
   };
   gitResult?: {
+    integrity?: "verified" | "unexpected" | "not_verified";
     confirmation: "confirmed" | "changed" | "identity_changed" | "unavailable";
     confirmationScope: "local_repository";
     remoteOutcome: "not_applicable" | "not_attempted" | "reported_success" | "unknown";

@@ -116,6 +116,7 @@ const executionJobSchema = z.object({
   }),
   authorization: z.object({ type: z.enum(["level3", "git"]), requestId: z.string(), digest: z.string() }).optional(),
   git_result: z.object({ confirmation: z.string(), confirmationScope: z.literal("local_repository"),
+    integrity: z.enum(["verified", "unexpected", "not_verified"]).optional(),
     remoteOutcome: z.enum(["not_applicable", "not_attempted", "reported_success", "unknown"]), partialSuccessPossible: z.boolean(),
     headBefore: z.string().nullable(), headAfter: z.string().nullable(),
     branchBefore: z.string().nullable(), branchAfter: z.string().nullable() }).optional(),

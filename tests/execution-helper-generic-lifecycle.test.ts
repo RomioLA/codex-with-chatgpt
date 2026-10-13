@@ -87,6 +87,7 @@ function makeNativeFixture(
     },
   }), "utf8");
   fs.writeFileSync(manifestPath, manifestBytes, { flag: "wx" });
+  fs.writeFileSync(`${manifestPath}.permit`, createHash("sha256").update(manifestBytes).digest("hex"), { flag: "wx" });
   const genericCommand: GenericCommand = {
     mode: spec.mode,
     executable,

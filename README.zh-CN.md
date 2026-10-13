@@ -19,6 +19,7 @@
 - 包含 Windows Bridge/Tunnel 状态恢复和自动启动相关能力。
 - V1.3 开发版增加结构化 Git Write，以及默认关闭、须本机逐次批准完整命令的 Level 3 PowerShell 7 / CMD / 本地程序执行。
 - 不提供远程提权、无限制 Shell 或任意 Git 参数通道。V1.3 尚未部署到 Production，操作与验收见 [V1.3 阶段报告](docs/v1.3-stage-report.md)。
+- 本轮对抗审查修复增加字面脚本绑定、Native 可撤销启动许可、固定提交 tree/ref CAS 与安全历史归档；剩余 Beta 门禁见 [安全修复报告](docs/v1.3-security-fix-report.md)。当前 CLI 单命令审批不定义未来工作会话和交互式终端的授权模型。
 
 执行授权由 C2C 本机 trusted-command policy 管理。package script 只是执行材料；修改 `package.json` 不会自动批准新 recipe。Windows Job Object 只约束进程生命周期，不提供文件系统、网络、权限或不可信项目代码沙箱；经批准的 package script 仍会执行项目代码。
 

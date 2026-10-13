@@ -152,6 +152,7 @@ struct Request {
         std::wstring hash;
     };
     std::vector<Material> genericMaterials;
+    std::vector<Material> launchSnapshots;
 };
 
 struct TempCleanupRequest {
@@ -176,6 +177,8 @@ enum class Outcome : BYTE {
     Cancelled = kOutcomeCancelled,
     TimedOut = kOutcomeTimedOut,
     HelperError = kOutcomeHelperError,
+    AuthorizationDenied = 4,
+    PrelaunchStateChanged = 5,
 };
 
 std::mutex g_outputMutex;
@@ -467,6 +470,16 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
                 !ReadString(input, kMaxFieldBytes, material.fileIdentity, error) ||
                 !ReadString(input, kMaxFieldBytes, material.hash, error)) return false;
             request.genericMaterials.push_back(std::move(material));
+        }
+        DWORD snapshotCount = 0;
+        if (!ReadU32(input, snapshotCount, error) || snapshotCount > kMaxGenericMaterials) return false;
+        for (DWORD index = 0; index < snapshotCount; ++index) {
+            Request::Material material;
+            if (!ReadString(input, kMaxFieldBytes, material.path, error) ||
+                !ReadString(input, kMaxFieldBytes, material.fileIdentity, error) ||
+                !ReadString(input, kMaxFieldBytes, material.hash, error) ||
+                !IsIdentity(material.fileIdentity) || !IsHex(material.hash, 64)) return false;
+            request.launchSnapshots.push_back(std::move(material));
         }
         const bool validMode = request.genericMode >= 1 && request.genericMode <= 3;
         const bool validCommandShape = request.genericMode == 1
@@ -842,6 +855,13 @@ bool ValidateRequestPaths(Request& request, DWORD& error) {
         for (auto& material : request.genericMaterials) {
             if (!ValidateCanonicalPath(material.path, false, canonical, error)) return false;
             material.path = std::move(canonical);
+        }
+        for (auto& material : request.launchSnapshots) {
+            if (!ValidateCanonicalPath(material.path, false, canonical, error)) return false;
+            material.path = std::move(canonical);
+            if (!IsPathWithinDirectory(request.gitDirectory, material.path) && !IsPathWithinDirectory(request.commonGitDirectory, material.path)) {
+                error = ERROR_ACCESS_DENIED; return false;
+            }
         }
     }
     if (!ValidateCanonicalPath(request.gitDirectory, true, canonical, error)) {
@@ -1251,6 +1271,39 @@ bool OpenMatchingMarkerFile(const std::wstring& path, const std::string& expecte
 bool MatchesMarkerFile(const std::wstring& path, const std::string& expected, DWORD& error) {
     UniqueHandle file;
     return OpenMatchingMarkerFile(path, expected, GENERIC_READ, file, error);
+}
+
+// Authorization provenance remains in the trusted Bridge. This narrowly binds
+// its revocable launch permit to the locked manifest through ResumeThread.
+bool AcquireLaunchPermit(const Request& request, UniqueHandle& permit, DWORD& error) {
+    if (request.recipe != 2 || !HasRequestIdSuffix(request.approvalManifest.substr(
+            request.approvalManifest.find_last_of(L'\\') + 1), L".manifest.json")) return true;
+    std::string expected;
+    if (!ToAscii(request.approvalManifestHash, expected)) { error = ERROR_INVALID_DATA; return false; }
+    return OpenMatchingMarkerFile(request.approvalManifest + L".permit", expected,
+                                  GENERIC_READ, permit, error);
+}
+
+// Test-only deny/delay barrier; no MCP input or child environment can set it.
+// Failure to release within three seconds never resumes the child.
+bool TestWaitBeforeResume(const wchar_t* phase, DWORD childPid, DWORD& error) {
+    std::wstring release, selected;
+    DWORD environmentError = ERROR_SUCCESS;
+    if (!ReadEnvironmentValue(L"C2C_EXECUTION_HELPER_TEST_RELEASE", release, environmentError)) return true;
+    if (!ReadEnvironmentValue(L"C2C_EXECUTION_HELPER_TEST_PHASE", selected, environmentError) || selected != phase) return true;
+    std::string phaseText;
+    ToAscii(selected, phaseText);
+    const std::string evidence = "C2C_EXECUTION_HELPER_SUSPENDED:" + std::to_string(childPid) + ":" + phaseText + "\n";
+    DWORD written = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), evidence.data(), static_cast<DWORD>(evidence.size()), &written, nullptr);
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < end) {
+        const DWORD attributes = GetFileAttributesW(release.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0) return true;
+        Sleep(5);
+    }
+    error = ERROR_TIMEOUT;
+    return false;
 }
 
 bool MatchesTempRootMarker(const std::wstring& path, const std::string& workspaceId,
@@ -2407,8 +2460,9 @@ int wmain(int argc, wchar_t** argv) {
             outcome = Outcome::HelperError;
         } else {
             verifiedInJob = true;
+            const bool testReleased = TestWaitBeforeResume(L"suspended", GetProcessId(process.get()), resultError);
             ControlEvent event = control.state();
-            if (event != ControlEvent::None || std::chrono::steady_clock::now() >= deadline) {
+            if (!testReleased || event != ControlEvent::None || std::chrono::steady_clock::now() >= deadline) {
                 if (event == ControlEvent::Cancel) {
                     outcome = Outcome::Cancelled;
                 } else if (event == ControlEvent::None) {
@@ -2465,18 +2519,32 @@ int wmain(int argc, wchar_t** argv) {
                         const bool materialLocksVerified =
                             VerifyRuntimeMaterialLocks(request, resultError);
                         if (!materialLocksVerified) failureStage = "verify-runtime-material-locks";
-                        const DWORD previousSuspendCount = materialLocksVerified
+                        UniqueHandle launchPermit;
+                        std::vector<UniqueHandle> snapshotChecks;
+                        bool snapshotsVerified = true;
+                        for (const auto& material : request.launchSnapshots) {
+                            if (!OpenFileLock(material.path, &material.fileIdentity, &material.hash, snapshotChecks, resultError)) { snapshotsVerified = false; break; }
+                        }
+                        const bool launchAuthorized = materialLocksVerified && snapshotsVerified && AcquireLaunchPermit(request, launchPermit, resultError) &&
+                            TestWaitBeforeResume(L"permit", GetProcessId(process.get()), resultError);
+                        if (materialLocksVerified && !launchAuthorized) failureStage = "launch-permit";
+                        // Git itself must update these files; release just before
+                        // Resume. Commit uses pinned tree/parent + ref CAS as well.
+                        snapshotChecks.clear();
+                        const DWORD previousSuspendCount = launchAuthorized
                             ? ResumeThread(primaryThread.get())
                             : static_cast<DWORD>(-1);
+                        launchPermit.reset();
                         if (previousSuspendCount != 1) {
-                            if (materialLocksVerified) {
+                            if (launchAuthorized) {
                                 resultError = previousSuspendCount == static_cast<DWORD>(-1)
                                                   ? GetLastError()
                                                   : ERROR_INVALID_STATE;
                                 failureStage = "resume-child";
                             }
                             jobZeroConfirmed = terminateTree(ERROR_PROCESS_ABORTED);
-                            outcome = Outcome::HelperError;
+                            outcome = jobZeroConfirmed && materialLocksVerified && !launchAuthorized
+                                ? snapshotsVerified ? Outcome::AuthorizationDenied : Outcome::PrelaunchStateChanged : Outcome::HelperError;
                         } else {
                             primaryThread.reset();
                             bool terminateIssued = false;

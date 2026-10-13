@@ -59,6 +59,8 @@ export interface GitWriteRemoteBinding {
 }
 
 export interface GitWritePlan {
+  commitBinding?: { tree: string; parent: string | null; branch: string };
+  switchBinding?: { head: string };
   repository: RepositoryIdentity;
   executable: string;
   executableFileIdentity: string;

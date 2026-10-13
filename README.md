@@ -19,6 +19,7 @@ This repository is **RomioLA's C2C Local fork** of [XiaoDuoYa/codex-with-chatgpt
 - Includes Windows bridge/tunnel state handling, recovery, and autostart support.
 - V1.3 development adds structured Git writes and separately enabled Level 3 PowerShell 7 / CMD / local program execution, with local approval of each exact command.
 - Does not expose remote elevation, an unrestricted shell, or arbitrary Git arguments. V1.3 is not deployed to Production; see the [V1.3 stage report](docs/v1.3-stage-report.md).
+- The adversarial-review fixes bind literal scripts, enforce revocable native launch permits, use fixed-tree commit/ref CAS and retain audit history through safe rotation. See the [security repair report](docs/v1.3-security-fix-report.md) for remaining Beta gates. Current single-command CLI approval does not define the future session/terminal authorization model.
 
 Execution approval is held in C2C's local trusted-command policy. A package script is execution material; changing `package.json` never approves a new recipe. Windows Job Objects contain process lifetime only. They do not sandbox filesystem, network, privileges, or untrusted project code; an approved package script still executes project code.
 
