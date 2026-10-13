@@ -7,6 +7,11 @@ export const EXECUTION_TOOL_SCOPES = {
   execution_job_output: "execution.jobs.read",
   execution_cancel: "execution.cancel",
   execution_list: "execution.jobs.read",
+  level3_request: "execution.level3",
+  level3_request_status: "execution.level3",
+  level3_start: "execution.level3",
+  git_write: "git.write",
+  git_branches: "git.read",
 } as const;
 
 type ExecutionTool = keyof typeof EXECUTION_TOOL_SCOPES;

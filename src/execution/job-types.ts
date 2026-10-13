@@ -37,6 +37,22 @@ export interface ExecutionJob {
   repositoryPath: string;
   oauthClientId: string;
   recipe: ExecutionRecipe;
+  /** V1.3 capabilities are explicit; they never inherit recipe authorization. */
+  authorization?: {
+    type: "level3" | "git";
+    requestId: string;
+    digest: string;
+  };
+  gitResult?: {
+    confirmation: "confirmed" | "changed" | "identity_changed" | "unavailable";
+    confirmationScope: "local_repository";
+    remoteOutcome: "not_applicable" | "not_attempted" | "reported_success" | "unknown";
+    partialSuccessPossible: boolean;
+    headBefore: string | null;
+    headAfter: string | null;
+    branchBefore: string | null;
+    branchAfter: string | null;
+  };
   state: ExecutionJobState;
   createdAt: string;
   startedAt: string | null;

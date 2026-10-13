@@ -17,7 +17,8 @@ This repository is **RomioLA's C2C Local fork** of [XiaoDuoYa/codex-with-chatgpt
 - Exposes bounded, read-only Windows Host Observation for process, listener, network, DNS, path, and host context inspection.
 - Starts locally approved, bounded test/build/lint/typecheck or named package-script recipes through the execution tools.
 - Includes Windows bridge/tunnel state handling, recovery, and autostart support.
-- Does **not** expose an arbitrary shell, caller-supplied command strings, remote permission elevation, or unrestricted Git commands.
+- V1.3 development adds structured Git writes and separately enabled Level 3 PowerShell 7 / CMD / local program execution, with local approval of each exact command.
+- Does not expose remote elevation, an unrestricted shell, or arbitrary Git arguments. V1.3 is not deployed to Production; see the [V1.3 stage report](docs/v1.3-stage-report.md).
 
 Execution approval is held in C2C's local trusted-command policy. A package script is execution material; changing `package.json` never approves a new recipe. Windows Job Objects contain process lifetime only. They do not sandbox filesystem, network, privileges, or untrusted project code; an approved package script still executes project code.
 
@@ -115,7 +116,7 @@ C2C Local Bridge  ---- Cloudflare tunnel
 Local Workspace  ---- C2C native helper ---- locally approved recipe
 ```
 
-ChatGPT can inspect and modify authorized files through C2C Local and start bounded recipes that a local operator explicitly approved. C2C exposes no arbitrary Shell MCP or caller-supplied command strings.
+ChatGPT can inspect and modify authorized files through C2C Local and start locally approved bounded recipes. V1.3 development also adds repository-policy-controlled Git writes and single-use Level 3 approvals bound to the exact command digest.
 
 ## Security boundaries
 
@@ -124,7 +125,7 @@ ChatGPT can inspect and modify authorized files through C2C Local and start boun
 - Sensitive files such as credentials, keys, SSH material, and `.env*` are denied by default, with `.env.example` allowed.
 - `.c2cignore` can add project-specific exclusions.
 - File mutation requires both OAuth scope and the local permission mode.
-- The execution tool accepts only a named recipe approved by C2C's local policy; there is no MCP shell, caller-supplied command string, Git commit tool, or remote permission-elevation tool.
+- V1.2 execution tools still accept only named, locally approved recipes. V1.3 adds separate opt-in `git.write` and `execution.level3` scopes; repository grants and exact-command approvals are managed only by the local CLI. Existing tokens gain no new scopes on refresh.
 - An approved package script can still invoke shell commands and project code with the local account's available access. Windows Job Objects contain process lifecycle only; they do not sandbox files, network access, privileges, or malicious code.
 - Runtime integrity binds the selected Node executable; npm's `npm-cli.js`, `lib/cli.js`, `lib/cli/validate-engines.js`, `lib/cli/entry.js`, `lib/cli/exit-handler.js`, `lib/npm.js`, and `package.json`; or pinned pnpm's `bin/pnpm.cjs`, `bin/pnpm.mjs`, `dist/pnpm.mjs`, and `package.json`. It also binds the workspace package manifest and approved recipe record held outside the repository. These hashes detect changes after runtime discovery; they do not authenticate the publisher or detect already-malicious bytes in the selected Node/npm/Corepack installation, and they do not freeze every later module or dependency.
 - The helper and fixed launcher SHA-256 values come from C2C build/distribution metadata. The launcher holds the verified helper file and its path directories against write, rename, and replacement through `CreateProcessW`; deployment must protect the launcher and the rest of the C2C distribution code directory. The metadata does not authenticate a distribution whose launcher and expected metadata can both be replaced.

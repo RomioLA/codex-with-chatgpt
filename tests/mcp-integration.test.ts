@@ -137,6 +137,10 @@ describe("MCP tools over Streamable HTTP", () => {
     { name: "execution_job_output", scope: "execution.jobs.read", args: { job_id: "a".repeat(24), stream: "stdout" } },
     { name: "execution_cancel", scope: "execution.cancel", args: { job_id: "a".repeat(24) } },
     { name: "execution_list", scope: "execution.jobs.read", args: { limit: 1 } },
+    { name: "level3_request", scope: "execution.level3", args: { repository_path: ".", engine: "program", executable: "C:/test/program.exe", args: [], cwd: ".", timeout_seconds: 30 } },
+    { name: "level3_request_status", scope: "execution.level3", args: { request_id: "a".repeat(24) } },
+    { name: "level3_start", scope: "execution.level3", args: { request_id: "a".repeat(24), digest: "a".repeat(64), idempotency_key: "v13-scope-key-0123456" } },
+    { name: "git_write", scope: "git.write", args: { repository_path: ".", operation: { kind: "branch_list", expectedHead: null, expectedBranch: null }, timeout_seconds: 30, idempotency_key: "v13-git-scope-0123456" } },
   ];
 
   it("publishes execution OAuth policies on the actual tools/list wire response", async () => {
@@ -202,10 +206,15 @@ describe("MCP tools over Streamable HTTP", () => {
       "execution_start",
       "execution_status",
       "execution_summary",
+      "git_branches",
       "git_diff",
       "git_info",
       "git_status",
+      "git_write",
       "host_context",
+      "level3_request",
+      "level3_request_status",
+      "level3_start",
       "list_directory",
       "move_file",
       "network_listeners",
@@ -252,6 +261,19 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(description).toContain("nextOffset");
     expect(description).not.toContain("has_more");
     expect(description).not.toContain("next_offset");
+  });
+
+  it("reads branches with git.read while Git write remains unauthorized", async () => {
+    const branches = structuredJsonOf<{ branches: { ref: string; head: string }[]; total: number }>(
+      await client.callTool({ name: "git_branches", arguments: { repository_path: ".", limit: 1 } })
+    );
+    expect(branches.total).toBeGreaterThan(0);
+    expect(branches.branches[0].ref).toMatch(/^refs\/(heads|remotes)\//);
+    expect(branches.branches[0].head).toMatch(/^[a-f0-9]{40}$/);
+    const denied = await client.callTool({ name: "git_write", arguments: { repository_path: ".", operation: {
+      kind: "branch_list", expectedHead: branches.branches[0].head, expectedBranch: "main" },
+      timeout_seconds: 30, idempotency_key: "readonly-git-reject-0123456" } });
+    expect(jsonOf(denied)).toMatchObject({ error: "INSUFFICIENT_SCOPE" });
   });
 
   it("workspace_info returns identity and project detection", async () => {

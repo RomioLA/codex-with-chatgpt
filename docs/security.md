@@ -28,23 +28,21 @@
 | Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a salted workspace hash |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
-| Execution output exposure | ChatGPT can start only a bounded recipe approved in C2C's local trusted-command policy. Per-stream sanitizers handle chunk boundaries, UTF-8 splits, token patterns, long values, and private-key blocks; stdout and stderr stay independent, so a secret split across both streams is not guaranteed to be detected. Output size is capped and restricted streams are listed without a body. This sanitizer is not a malicious-code data-exfiltration boundary. |
+| Execution output exposure | V1.2 recipes require local trusted-command approval; V1.3 Git writes require a repository grant and Level 3 requires one local exact-command approval. Per-stream sanitizers handle chunk boundaries, UTF-8 splits, token patterns, long values, and private-key blocks; stdout and stderr stay independent, so a secret split across both streams is not guaranteed to be detected. Generic output containing NUL bytes is restricted rather than interpreted as UTF-8. Output size is capped. This sanitizer is not a malicious-code data-exfiltration boundary. |
 | Generated media handoff | `read_image` is a read-only inspection tool. The local executor imports the original browser download into a new workspace-relative path; signatures, size, containment and SVG active-content checks are enforced, and existing files are never overwritten. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
 
 ## Token & scope design
 
-The default grant remains read-only: `workspace.read`, `workspace.search`,
-`git.read`, `execution.read`, and `offline_access`. Optional mutation scopes
-are `workspace.write`, `workspace.delete`, `filesystem.external.read`, and
-`filesystem.external.write`. Tools enforce scopes individually
-(`INSUFFICIENT_SCOPE`); explicitly requested scopes never gain unrequested
+The frozen V1.2 `DEFAULT_SCOPES` includes workspace read/search/write/delete,
+Git read, execution read/jobs.read/run/cancel, external filesystem read/write,
+Host Observation `system.read`, and `offline_access`. This list is unchanged in
+V1.3. `git.write` and `execution.level3` are supported, separately requested
+scopes and are never added to the default grant. Tools enforce scopes
+individually (`INSUFFICIENT_SCOPE`); requested scopes never gain unrequested
 capabilities. A mutation also needs the local permission mode to allow it.
-`system.read` is an additional, explicitly requested read-only scope for Host
-Observation; it is not in the default grant or the mutation set. Refresh rotation
-preserves the refresh token's stored scopes and never adds this scope. Scope
-filtering continues to drop unknown names; a request with no supported scopes
-is rejected.
+Refresh rotation preserves the stored scope set and does not upgrade existing
+tokens. Unknown names are filtered and a request with no supported scopes fails.
 Access tokens live for 1 hour. Refresh tokens live for 30 days and rotate on
 use. All tokens are bound to `workspace_id` and `client_id`.
 
@@ -124,7 +122,7 @@ present at discovery is accepted as the selected baseline, so the selected
 runtime installation itself remains a trust input and must be managed by the
 local operator.
 
-C2C does not expose an arbitrary Shell MCP or caller-supplied command string.
+The V1.2 bounded recipe tools do not accept caller-supplied command strings.
 An approved package script can still invoke Shell and execute project code with
 the local account's available access. Windows Job Objects contain process
 lifecycle only; they are not a filesystem sandbox, network sandbox, privilege
@@ -137,6 +135,37 @@ are divided between stdout and stderr. Minimal environment-variable exposure
 reduces accidental disclosure; the sanitizer does not stop malicious project
 code from exfiltrating data through other channels or from shaping output to
 evade its patterns.
+
+## V1.3 controlled Git and Level 3
+
+`git_write` accepts a discriminated operation and structured fields, never
+arbitrary Git argv or a remote URL supplied by MCP. The selected repository,
+allowed operations, branches, exact HTTPS remotes, author and executable
+materials are bound to a local preview digest. Hooks and external filters are
+disabled; unsafe configuration and alternate/promisor object stores are
+rejected. C2C writers sharing a common Git directory share a lock. Index and
+switch's HEAD are mutable snapshots, checked again before launch; external local
+Git clients do not obey the C2C lock. Post-state confirms the local repository
+only; failed/cancelled network jobs may have partially succeeded remotely.
+
+Level 3 is off by default and cannot be enabled or approved through MCP.
+Each command requires a local CLI approval binding OAuth client, workspace,
+repository, executable identity/hash, exact argv or shell text, cwd, materials
+and timeout. Approval expires after ten minutes and is consumed once; revoke or
+disable cancels active work, and restart does not replay interrupted jobs.
+The local reviewer chooses development versus destructive/system risk, with
+an extra explicit acknowledgement for the latter. Risk is not inferred by the
+model. Known shells require fixed CMD or PowerShell 7 launch modes. The native
+layer refuses an elevated token and uses the existing Job Object lifecycle and
+integrity checks. It neither invokes UAC nor grants extra privileges.
+
+The approved command runs with the current user's host access. Cwd containment,
+material locks and Job Objects are not an OS filesystem or network sandbox.
+Operator-approved programs, dynamic libraries, Git/GCM dependencies and the
+protected C2C distribution remain trust inputs. UTF-8 text is the supported
+output format; NUL-bearing generic output is withheld. See
+[Git Write](v1.3-git-write.md), [Level 3](v1.3-level3.md) and the
+[stage report](v1.3-stage-report.md) for the tested boundaries and local workflow.
 
 ## Host Observation
 

@@ -68,6 +68,7 @@ import {
 } from "../execution/trusted-registry.js";
 import { resolveRepositoryIdentity } from "../execution/repository-identity.js";
 import { EXECUTION_KINDS, type ExecutionKind, type PackageManager } from "../execution/job-types.js";
+import { registerV13Cli } from "./v13.js";
 import { importMediaAsset } from "../media/import.js";
 import { isPermissionMode, readPermission, setPermission, type PermissionMode } from "../permission/index.js";
 import {
@@ -80,6 +81,7 @@ import { recordLaunchBreadcrumb } from "../autostart/launch-breadcrumb.js";
 import { WindowsAutostartAdapter, WindowsRunKeyAutostart, WindowsTaskScheduler } from "../autostart/windows-task.js";
 
 const program = new Command();
+registerV13Cli(program);
 
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");

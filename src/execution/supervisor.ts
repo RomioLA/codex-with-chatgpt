@@ -16,6 +16,11 @@ import { ExecutionTempOwner } from "./execution-temp.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
+import type { GenericCommand } from "./helper-protocol.js";
+import { consumeLevel3Request, resolveConsumedLevel3Request, isLevel3Enabled, getLevel3Request, completeLevel3Request } from "./level3-approval.js";
+import { createGitJobPlan, resolveGitJobPlan, readGitJobPlan } from "./git-job-plan.js";
+import { confirmGitWriteState, listGitRepositoryApprovals, type GitWriteOperation } from "../git-write/index.js";
+import { acquireRepositoryWriteLock } from "./repository-write-lock.js";
 
 export const MAX_EXECUTION_TIMEOUT_SECONDS = 3600;
 export const MAX_GLOBAL_EXECUTIONS = 2;
@@ -53,7 +58,7 @@ export type ExecutionServiceErrorCode =
 
 export type StartExecutionResult =
   | { ok: true; job: ExecutionJob; duplicate: boolean }
-  | { ok: false; error: ExecutionServiceErrorCode };
+  | { ok: false; error: string };
 
 export type CancelExecutionResult =
   | { ok: true; job: ExecutionJob }
@@ -67,6 +72,7 @@ export interface ExecutionRunner {
     timeoutSeconds: number;
     stateDirectory: string;
     tempLease: ReturnType<ExecutionTempOwner["create"]>;
+    genericCommand?: GenericCommand;
   }, callbacks: {
     onOutput: (stream: OutputStream, data: Buffer) => void;
     onDiagnostic?: (message: string) => void;
@@ -82,6 +88,8 @@ interface ActiveExecution {
   sanitizers: Record<OutputStream, StreamingSanitizer>;
   decoders: Record<OutputStream, StringDecoder>;
   finished: Promise<void>;
+  releaseWriteLock?: () => void;
+  treeConfirmed?: boolean;
 }
 
 const supervisors = new Set<ExecutionSupervisor>();
@@ -147,6 +155,11 @@ export class ExecutionSupervisor {
     this.permissionPollMs = options.permissionPollMs ?? EXECUTION_PERMISSION_POLL_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? EXECUTION_CANCEL_GRACE_MS;
     this.now = options.now ?? Date.now;
+    if (!this.store.corruption) {
+      for (const job of this.store.listAll()) {
+        if (job.authorization && job.state === "interrupted" && !job.gitResult) this.auditControlledCompletion(job.jobId);
+      }
+    }
     supervisors.add(this);
     this.permissionTimer = setInterval(() => this.reconcilePermission(), this.permissionPollMs);
     this.permissionTimer.unref?.();
@@ -155,6 +168,70 @@ export class ExecutionSupervisor {
   private readonly permissionPollMs: number;
   private readonly cancelGraceMs: number;
   private readonly now: () => number;
+
+  private controlledGate(scopes: readonly string[], scope: string, clientId: string, idempotencyKey: string): string | null {
+    if (!this.accepting) return "SUPERVISOR_CLOSING";
+    if (this.store.corruption) return "STORE_CORRUPT";
+    if (!Array.isArray(scopes) || !scopes.includes(scope)) return "INSUFFICIENT_SCOPE";
+    if (typeof clientId !== "string" || clientId.length < 1 || clientId.length > 200 ||
+        typeof idempotencyKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(idempotencyKey)) return "INVALID_ARGUMENTS";
+    if (readPermission(this.workspace.id) === "readonly") return "EXECUTION_PERMISSION_DENIED";
+    return null;
+  }
+
+  startLevel3(input: { requestId: string; digest: string; oauthClientId: string; scopes: readonly string[]; idempotencyKey: string }): StartExecutionResult {
+    const denied = this.controlledGate(input.scopes, "execution.level3", input.oauthClientId, input.idempotencyKey);
+    if (denied) return { ok: false, error: denied };
+    const hash = createHash("sha256").update(input.idempotencyKey).digest("hex");
+    const previous = this.store.findIdempotent(input.oauthClientId, hash);
+    if (previous) return previous.authorization?.type === "level3" && previous.authorization.requestId === input.requestId && previous.authorization.digest === input.digest
+      ? { ok: true, job: previous, duplicate: true } : { ok: false, error: "IDEMPOTENCY_CONFLICT" };
+    try {
+      const authorization = consumeLevel3Request(this.workspace, input.requestId, input.oauthClientId, input.digest);
+      return this.enqueueControlled(authorization.repository, { type: "level3", requestId: input.requestId, digest: input.digest },
+        authorization.request.spec.timeoutSeconds, hash, input.oauthClientId);
+    } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
+  }
+
+  startGitWrite(input: { repositoryPath: string; operation: GitWriteOperation; timeoutSeconds: number; oauthClientId: string; scopes: readonly string[]; idempotencyKey: string }): StartExecutionResult {
+    const denied = this.controlledGate(input.scopes, "git.write", input.oauthClientId, input.idempotencyKey);
+    if (denied) return { ok: false, error: denied };
+    if (!Number.isSafeInteger(input.timeoutSeconds) || input.timeoutSeconds < 1 || input.timeoutSeconds > MAX_EXECUTION_TIMEOUT_SECONDS) return { ok: false, error: "INVALID_ARGUMENTS" };
+    const hash = createHash("sha256").update(input.idempotencyKey).digest("hex");
+    const previous = this.store.findIdempotent(input.oauthClientId, hash);
+    if (previous) {
+      try {
+        if (previous.authorization?.type !== "git") throw new Error("IDEMPOTENCY_CONFLICT");
+        const old = readGitJobPlan(this.workspace, previous.authorization.requestId, previous.authorization.digest);
+        const original = { ...old.operation };
+        if (input.operation.expectedStatusHash === undefined) delete original.expectedStatusHash;
+        const comparable = (operation: GitWriteOperation) => JSON.stringify(operation, Object.keys(operation).sort());
+        if (resolveRepositoryIdentity(this.workspace, input.repositoryPath).identity !== old.repository.identity ||
+            comparable(original) !== comparable(input.operation) || previous.timeoutSeconds !== input.timeoutSeconds) throw new Error("IDEMPOTENCY_CONFLICT");
+        return { ok: true, job: previous, duplicate: true };
+      } catch { return { ok: false, error: "IDEMPOTENCY_CONFLICT" }; }
+    }
+    try {
+      const created = createGitJobPlan(this.workspace, input.repositoryPath, input.operation);
+      return this.enqueueControlled(created.plan.repository, { type: "git", requestId: created.requestId, digest: created.digest }, input.timeoutSeconds, hash, input.oauthClientId);
+    } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
+  }
+
+  private enqueueControlled(repository: RepositoryIdentity, authorization: NonNullable<ExecutionJob["authorization"]>, timeoutSeconds: number, idempotencyKeyHash: string, oauthClientId: string): StartExecutionResult {
+    const job: ExecutionJob = {
+      jobId: randomBytes(24).toString("base64url"), workspaceId: this.workspace.id,
+      repositoryIdentity: repository.identity, repositoryPath: repository.workspaceRelativePath, oauthClientId,
+      recipe: { kind: "package_script", target: "v13", packageManager: "npm", scriptHash: authorization.digest }, authorization,
+      state: "queued", createdAt: new Date(this.now()).toISOString(), startedAt: null, finishedAt: null, timeoutSeconds,
+      idempotencyKeyHash, tempOwnership: null, exitCode: null, failureCode: null,
+      stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+      stderr: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+    };
+    try { this.store.create(job); } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
+    this.logger.info("Controlled execution authorized", { workspaceId: this.workspace.id, jobId: job.jobId, oauthClientId, capability: authorization.type, requestId: authorization.requestId, digest: authorization.digest });
+    this.schedule();
+    return { ok: true, job: this.store.get(job.jobId) ?? job, duplicate: false };
+  }
 
   start(input: StartExecutionInput): StartExecutionResult {
     if (!this.accepting) return { ok: false, error: "SUPERVISOR_CLOSING" };
@@ -279,6 +356,7 @@ export class ExecutionSupervisor {
     if (job.state === "queued") {
       const cancelled = transitionExecutionJob(job, "cancelled", { failureCode: "CANCELLED_BEFORE_START" });
       this.store.replace(cancelled);
+      this.auditControlledCompletion(jobId);
       scheduleAll();
       return { ok: true, job: cancelled };
     }
@@ -329,10 +407,22 @@ export class ExecutionSupervisor {
     }
     let repository: RepositoryIdentity;
     let trustedCommand: TrustedCommand;
+    let genericCommand: GenericCommand | undefined;
+    let releaseWriteLock: (() => void) | undefined;
     try {
       repository = resolveRepositoryIdentity(this.workspace, job.repositoryPath);
       if (repository.identity !== job.repositoryIdentity) throw new RepositoryIdentityError("PATH_CHANGED");
-      trustedCommand = findTrustedCommand({
+      if (job.authorization) {
+        releaseWriteLock = acquireRepositoryWriteLock(repository, job.jobId);
+        const resolved = job.authorization.type === "level3"
+          ? resolveConsumedLevel3Request(this.workspace, job.authorization.requestId, job.oauthClientId, job.authorization.digest)
+          : resolveGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
+        if (resolved.repository.identity !== repository.identity) throw new RepositoryIdentityError("PATH_CHANGED");
+        genericCommand = resolved.genericCommand;
+        trustedCommand = { workspaceId: this.workspace.id, repositoryIdentity: repository.identity,
+          canonicalRepositoryPath: repository.canonicalPath, kind: "package_script", target: "v13", packageManager: "npm",
+          scriptHash: job.authorization.digest, packageJsonHash: job.authorization.digest, approvedAt: job.createdAt, approvalSource: "local-cli" };
+      } else trustedCommand = findTrustedCommand({
         workspaceId: this.workspace.id,
         repositoryIdentity: repository.identity,
         canonicalRepositoryPath: repository.canonicalPath,
@@ -340,12 +430,14 @@ export class ExecutionSupervisor {
         target: job.recipe.target,
       });
     } catch (error) {
+      releaseWriteLock?.();
       globalSlots.delete(workspaceSlot);
       const failureCode = error instanceof RepositoryIdentityError
         ? error.code === "REPARSE_POINT" ? "REPARSE_POINT" : "REPOSITORY_IDENTITY_CHANGED"
-        : "COMMAND_NOT_APPROVED";
+        : job.authorization ? cleanCode((error as Error).message) : "COMMAND_NOT_APPROVED";
       const failed = transitionExecutionJob(job, "failed", { failureCode });
       this.store.replace(failed);
+      this.auditControlledCompletion(job.jobId);
       scheduleAll();
       return;
     }
@@ -370,6 +462,7 @@ export class ExecutionSupervisor {
         timeoutSeconds: job.timeoutSeconds,
         stateDirectory: this.store.directory,
         tempLease,
+        ...(genericCommand ? { genericCommand } : {}),
       }, {
         onOutput: (stream, data) => this.onOutput(job.jobId, stream, data, active),
         onDiagnostic: (message) => this.logger.warn("Execution helper diagnostic", {
@@ -389,13 +482,19 @@ export class ExecutionSupervisor {
         sanitizers,
         decoders,
         finished: Promise.resolve(),
+        releaseWriteLock,
+        treeConfirmed: false,
       };
       this.active.set(job.jobId, active);
       active.finished = handle.completion
-        .then((completion) => this.completeJob(job.jobId, active, completion.result, completion.tempCleanupConfirmed === true))
+        .then((completion) => {
+          active.treeConfirmed = completion.result.outcome !== 3;
+          this.completeJob(job.jobId, active, completion.result, completion.tempCleanupConfirmed === true);
+        })
         .catch(() => this.failUnconfirmed(job.jobId, active, "HELPER_UNCONFIRMED"))
         .finally(() => this.releaseActive(job.jobId, active));
     } catch (error) {
+      releaseWriteLock?.();
       const failed = transitionExecutionJob(this.store.get(job.jobId) ?? running, "failed", {
         failureCode: cleanCode((error as Error).message === "EXECUTION_HELPER_UNAVAILABLE"
           ? "EXECUTION_HELPER_UNAVAILABLE"
@@ -404,6 +503,7 @@ export class ExecutionSupervisor {
             : "HELPER_START_FAILED"),
       });
       this.store.replace(failed);
+      this.auditControlledCompletion(job.jobId);
       globalSlots.delete(workspaceSlot);
       scheduleAll();
     }
@@ -411,6 +511,12 @@ export class ExecutionSupervisor {
 
   private onOutput(jobId: string, stream: OutputStream, data: Buffer, active: ActiveExecution): void {
     if (!active || this.store.get(jobId)?.state === "interrupted") return;
+    if (this.store.get(jobId)?.authorization && data.includes(0)) {
+      // Generic programs can emit UTF-16 or binary data. Do not pass NUL-
+      // interleaved secrets around the UTF-8 text sanitizer.
+      this.store.markOutputRestricted(jobId, stream, "non_text_output");
+      return;
+    }
     const text = active.decoders[stream].write(data);
     if (!text) return;
     const safe = active.sanitizers[stream].push(text);
@@ -476,7 +582,35 @@ export class ExecutionSupervisor {
     if (active.graceTimer) clearTimeout(active.graceTimer);
     if (this.active.get(jobId) === active) this.active.delete(jobId);
     globalSlots.delete(active.workspaceSlot);
+    this.auditControlledCompletion(jobId);
+    if (active.treeConfirmed) active.releaseWriteLock?.();
     scheduleAll();
+  }
+
+  private auditControlledCompletion(jobId: string): void {
+    const job = this.store.get(jobId);
+    if (!job?.authorization) return;
+    try {
+      if (job.authorization.type === "level3") {
+        completeLevel3Request(this.workspace.id, job.authorization.requestId, job.oauthClientId, job.state === "succeeded" ? "completed" : "failed");
+      } else {
+        const plan = readGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
+        const confirmed = confirmGitWriteState(this.workspace, job.repositoryPath, plan.before);
+        const network = ["push", "fetch", "pull_ff_only"].includes(plan.operation.kind);
+        const remoteOutcome = !network ? "not_applicable" : !job.startedAt ? "not_attempted" : job.state === "succeeded" ? "reported_success" : "unknown";
+        this.store.replace({ ...job, gitResult: { confirmation: confirmed.state,
+          confirmationScope: "local_repository", remoteOutcome,
+          partialSuccessPossible: job.state !== "succeeded" && (confirmed.state !== "confirmed" || remoteOutcome === "unknown"),
+          headBefore: plan.before.head, headAfter: "after" in confirmed ? confirmed.after.head : null,
+          branchBefore: plan.before.branch, branchAfter: "after" in confirmed ? confirmed.after.branch : null } });
+      }
+    } catch {
+      if (job.authorization.type === "git") this.store.replace({ ...job, gitResult: { confirmation: "unavailable", confirmationScope: "local_repository",
+        remoteOutcome: job.startedAt ? "unknown" : "not_attempted", partialSuccessPossible: !!job.startedAt,
+        headBefore: null, headAfter: null, branchBefore: null, branchAfter: null } });
+    }
+    this.logger.info("Controlled execution finished", { workspaceId: this.workspace.id, jobId, oauthClientId: job.oauthClientId,
+      capability: job.authorization.type, state: job.state, exitCode: job.exitCode, failureCode: job.failureCode });
   }
 
   private requestTermination(jobId: string, active: ActiveExecution, intent: "cancelled" | "timed_out"): void {
@@ -508,6 +642,7 @@ export class ExecutionSupervisor {
   private cancelQueuedForDowngrade(): void {
     for (const job of this.queuedJobs()) {
       this.store.replace(transitionExecutionJob(job, "cancelled", { failureCode: "PERMISSION_DOWNGRADED" }));
+      this.auditControlledCompletion(job.jobId);
     }
     for (const [jobId, active] of this.active) {
       if (active.intent) continue;
@@ -523,6 +658,16 @@ export class ExecutionSupervisor {
   reconcilePermission(): void {
     if (this.closed) return;
     if (readPermission(this.workspace.id) === "readonly") this.cancelQueuedForDowngrade();
+    for (const job of this.store.listAll()) {
+      if (!job.authorization || (job.state !== "queued" && job.state !== "running")) continue;
+      let authorized = false;
+      try {
+        authorized = job.authorization.type === "level3"
+          ? isLevel3Enabled(this.workspace.id) && ["consumed", "launching"].includes(getLevel3Request(this.workspace.id, job.authorization.requestId)?.status ?? "")
+          : listGitRepositoryApprovals(this.workspace.id).some((approval) => approval.repositoryIdentity === job.repositoryIdentity);
+      } catch { /* corrupt or revoked authority fails closed */ }
+      if (!authorized) this.cancel(job.jobId, job.oauthClientId);
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -530,6 +675,7 @@ export class ExecutionSupervisor {
     this.accepting = false;
     for (const job of this.queuedJobs()) {
       this.store.replace(transitionExecutionJob(job, "cancelled", { failureCode: "BRIDGE_SHUTDOWN" }));
+      this.auditControlledCompletion(job.jobId);
     }
     const pending: Promise<void>[] = [];
     for (const [jobId, active] of this.active) {

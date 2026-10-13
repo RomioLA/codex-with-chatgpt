@@ -23,6 +23,8 @@ export const DEFAULT_SCOPES = [
 // Future additions to SUPPORTED_SCOPES must not silently expand DEFAULT_SCOPES.
 export const SUPPORTED_SCOPES = [
   ...DEFAULT_SCOPES,
+  "git.write",
+  "execution.level3",
 ] as const;
 
 export type Scope = (typeof SUPPORTED_SCOPES)[number];

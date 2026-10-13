@@ -18,6 +18,7 @@ import { PRODUCT_NAME, VERSION } from "../version.js";
 import { readWorkspaceImage } from "../workspace/media.js";
 import { registerFileTools } from "./file-tools.js";
 import { registerHostObservationTools } from "./host-observation-tools.js";
+import { registerV13Tools } from "./v13-tools.js";
 import { ExecutionSupervisor } from "../execution/supervisor.js";
 import type { ExecutionJob } from "../execution/job-types.js";
 import { EXECUTION_TOOL_SCOPES, executionToolAuth, executionScopeChallenge, installExecutionOAuthListing } from "./oauth.js";
@@ -88,9 +89,9 @@ const executionJobSchema = z.object({
   repository_path: z.string(),
   oauth_client_id: z.string(),
   recipe: z.object({
-    kind: z.enum(["test", "build", "lint", "typecheck", "package_script"]),
+    kind: z.enum(["test", "build", "lint", "typecheck", "package_script", "level3", "git_write"]),
     target: z.string(),
-    package_manager: z.enum(["npm", "pnpm"]),
+    package_manager: z.enum(["npm", "pnpm"]).optional(),
   }),
   state: z.enum(["queued", "running", "cancelling", "succeeded", "failed", "cancelled", "timed_out", "interrupted"]),
   created_at: z.string(),
@@ -113,9 +114,14 @@ const executionJobSchema = z.object({
     truncated: z.boolean(),
     restricted: z.boolean(),
   }),
+  authorization: z.object({ type: z.enum(["level3", "git"]), requestId: z.string(), digest: z.string() }).optional(),
+  git_result: z.object({ confirmation: z.string(), confirmationScope: z.literal("local_repository"),
+    remoteOutcome: z.enum(["not_applicable", "not_attempted", "reported_success", "unknown"]), partialSuccessPossible: z.boolean(),
+    headBefore: z.string().nullable(), headAfter: z.string().nullable(),
+    branchBefore: z.string().nullable(), branchAfter: z.string().nullable() }).optional(),
 });
 
-function executionJobView(job: ExecutionJob): z.infer<typeof executionJobSchema> {
+export function executionJobView(job: ExecutionJob): z.infer<typeof executionJobSchema> {
   const streamView = (value: ExecutionJob["stdout"]) => ({
     total_bytes: value.totalBytes,
     retained_bytes: value.retainedBytes,
@@ -129,11 +135,16 @@ function executionJobView(job: ExecutionJob): z.infer<typeof executionJobSchema>
     repository_identity: job.repositoryIdentity,
     repository_path: job.repositoryPath,
     oauth_client_id: job.oauthClientId,
-    recipe: {
+    recipe: job.authorization ? {
+      kind: job.authorization.type === "level3" ? "level3" : "git_write",
+      target: job.authorization.requestId,
+    } : {
       kind: job.recipe.kind,
       target: job.recipe.target,
       package_manager: job.recipe.packageManager,
     },
+    ...(job.authorization ? { authorization: job.authorization } : {}),
+    ...(job.gitResult ? { git_result: job.gitResult } : {}),
     state: job.state,
     created_at: job.createdAt,
     started_at: job.startedAt,
@@ -854,6 +865,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
 
   registerFileTools(server, workspace, ctx.logger);
   registerHostObservationTools(server, workspace);
+  registerV13Tools(server, ctx);
   finishOAuthListingRegistration();
   return server;
 }

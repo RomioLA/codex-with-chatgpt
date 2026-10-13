@@ -16,6 +16,21 @@ const KIND_CODE: Record<ExecutionKind, number> = {
 
 const MANAGER_CODE: Record<PackageManager, number> = { npm: 1, pnpm: 2 };
 
+export interface GenericCommand {
+  mode: "direct" | "cmd" | "powershell";
+  executable: string;
+  executableFileIdentity: string;
+  executableHash: string;
+  args: string[];
+  commandText?: string;
+  cwd: string;
+  cwdFileIdentity: string;
+  approvalManifest: string;
+  approvalManifestFileIdentity: string;
+  approvalManifestHash: string;
+  materials: Array<{ path: string; fileIdentity: string; hash: string }>;
+}
+
 export interface HelperRequest {
   packageManager: PackageManager;
   kind: ExecutionKind;
@@ -63,6 +78,7 @@ export interface HelperRequest {
   gitEntryType: "file" | "directory";
   gitEntryHash: string;
   packageJsonHash: string;
+  genericCommand?: GenericCommand;
 }
 
 export interface TempCleanupRequest {
@@ -94,7 +110,7 @@ export function serializeTempCleanupRequest(request: TempCleanupRequest): Buffer
     request.jobId,
     request.nonce,
     String(request.createdAtMs),
-  ].map(encodeString);
+  ].map((value) => encodeString(value));
   return Buffer.concat([magic, version, ...fields]);
 }
 
@@ -109,9 +125,10 @@ export type HelperFrame =
   | { type: "stderr"; data: Buffer }
   | { type: "result"; result: HelperResultFrame };
 
-function encodeString(value: string): Buffer {
+function encodeString(value: string, allowEmpty = false): Buffer {
   const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength === 0 || bytes.byteLength > MAX_HELPER_STRING_BYTES) {
+  if ((!allowEmpty && bytes.byteLength === 0) || bytes.byteLength > MAX_HELPER_STRING_BYTES ||
+      bytes.toString("utf8") !== value || value.includes("\0")) {
     throw new TypeError("Invalid execution helper string length");
   }
   const length = Buffer.allocUnsafe(4);
@@ -147,9 +164,45 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
       !Number.isSafeInteger(request.tempCreatedAtMs) || request.tempCreatedAtMs < 0) {
     throw new TypeError("Invalid execution temp ownership");
   }
+  const generic = request.genericCommand;
+  if (generic) {
+    if (request.kind !== "package_script" || !Array.isArray(generic.args) ||
+        !Array.isArray(generic.materials)) {
+      throw new TypeError("Invalid generic execution request");
+    }
+    const modeCode = generic.mode === "direct" ? 1 : generic.mode === "cmd" ? 2 :
+      generic.mode === "powershell" ? 3 : 0;
+    if (modeCode === 0 || generic.args.length > 256 || generic.materials.length > 256 ||
+        !/^[a-f0-9]+:[a-f0-9]+$/i.test(generic.executableFileIdentity) ||
+        !/^[a-f0-9]{64}$/i.test(generic.executableHash) ||
+        !/^[a-f0-9]+:[a-f0-9]+$/i.test(generic.cwdFileIdentity) ||
+        !/^[a-f0-9]+:[a-f0-9]+$/i.test(generic.approvalManifestFileIdentity) ||
+        !/^[a-f0-9]{64}$/i.test(generic.approvalManifestHash)) {
+      throw new TypeError("Invalid generic execution request");
+    }
+    if (generic.mode === "direct" ? generic.commandText !== undefined :
+        typeof generic.commandText !== "string" || generic.commandText.length === 0 || generic.args.length !== 0) {
+      throw new TypeError("Invalid generic command mode");
+    }
+    for (const argument of generic.args) {
+      if (typeof argument !== "string") throw new TypeError("Invalid generic command argument");
+    }
+    const seenMaterialPaths = new Set<string>();
+    for (const material of generic.materials) {
+      const foldedPath = material.path.toLowerCase();
+      if (!/^[a-f0-9]+:[a-f0-9]+$/i.test(material.fileIdentity) ||
+          !/^[a-f0-9]{64}$/i.test(material.hash) || seenMaterialPaths.has(foldedPath)) {
+        throw new TypeError("Invalid generic execution material");
+      }
+      seenMaterialPaths.add(foldedPath);
+    }
+    if (request.packageJsonHash.toLowerCase() !== generic.approvalManifestHash.toLowerCase()) {
+      throw new TypeError("Generic approval manifest hash mismatch");
+    }
+  }
   const fixed = Buffer.alloc(4);
   fixed.writeUInt16LE(5, 0); // protocol version
-  fixed.writeUInt8(1, 2); // fixed package-script recipe
+  fixed.writeUInt8(generic ? 2 : 1, 2); // package-script or generic recipe
   fixed.writeUInt8(MANAGER_CODE[request.packageManager], 3);
   const tail = Buffer.alloc(8);
   tail.writeUInt8(KIND_CODE[request.kind], 0);
@@ -157,7 +210,7 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
   tail.writeUInt16LE(0, 2); // reserved
   tail.writeUInt32LE(request.timeoutSeconds, 4);
   const gitEntryKind = Buffer.from([request.gitEntryType === "file" ? 1 : 2]);
-  return Buffer.concat([
+  const base = [
     REQUEST_MAGIC,
     fixed,
     tail,
@@ -204,6 +257,33 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
     gitEntryKind,
     encodeString(request.gitEntryHash),
     encodeString(request.packageJsonHash),
+  ];
+  if (!generic) return Buffer.concat(base);
+  const genericMode = Buffer.from([generic.mode === "direct" ? 1 : generic.mode === "cmd" ? 2 : 3]);
+  const argumentCount = Buffer.alloc(4);
+  argumentCount.writeUInt32LE(generic.args.length);
+  const materialCount = Buffer.alloc(4);
+  materialCount.writeUInt32LE(generic.materials.length);
+  return Buffer.concat([
+    ...base,
+    genericMode,
+    encodeString(generic.executable),
+    encodeString(generic.executableFileIdentity),
+    encodeString(generic.executableHash),
+    argumentCount,
+    ...generic.args.map((argument) => encodeString(argument, true)),
+    encodeString(generic.commandText ?? "", true),
+    encodeString(generic.cwd),
+    encodeString(generic.cwdFileIdentity),
+    encodeString(generic.approvalManifest),
+    encodeString(generic.approvalManifestFileIdentity),
+    encodeString(generic.approvalManifestHash),
+    materialCount,
+    ...generic.materials.flatMap((material) => [
+      encodeString(material.path),
+      encodeString(material.fileIdentity),
+      encodeString(material.hash),
+    ]),
   ]);
 }
 

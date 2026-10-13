@@ -24,6 +24,8 @@ namespace {
 constexpr DWORD kMaxFieldBytes = 131072;
 constexpr DWORD kMaxTargetBytes = 64;
 constexpr DWORD kMaxFrameBytes = 64 * 1024;
+constexpr DWORD kMaxGenericArguments = 256;
+constexpr DWORD kMaxGenericMaterials = 256;
 constexpr DWORD kJobDrainLimitMs = 30000;
 constexpr DWORD kNoChildExitCode = 0xFFFFFFFFu;
 
@@ -75,7 +77,18 @@ struct UniqueHandle {
     }
 };
 
+struct UniqueModule {
+    HMODULE value = nullptr;
+
+    UniqueModule() = default;
+    explicit UniqueModule(HMODULE module) : value(module) {}
+    UniqueModule(const UniqueModule&) = delete;
+    UniqueModule& operator=(const UniqueModule&) = delete;
+    ~UniqueModule() { if (value != nullptr) FreeLibrary(value); }
+};
+
 struct Request {
+    BYTE recipe = 1;
     BYTE manager = 0;
     BYTE kind = 0;
     DWORD timeoutSeconds = 0;
@@ -122,6 +135,23 @@ struct Request {
     BYTE gitEntryType = 0;
     std::wstring gitEntryHash;
     std::wstring packageJsonHash;
+    BYTE genericMode = 0;
+    std::wstring genericExecutable;
+    std::wstring genericExecutableFileIdentity;
+    std::wstring genericExecutableHash;
+    std::vector<std::wstring> genericArguments;
+    std::wstring genericCommandText;
+    std::wstring genericCwd;
+    std::wstring genericCwdFileIdentity;
+    std::wstring approvalManifest;
+    std::wstring approvalManifestFileIdentity;
+    std::wstring approvalManifestHash;
+    struct Material {
+        std::wstring path;
+        std::wstring fileIdentity;
+        std::wstring hash;
+    };
+    std::vector<Material> genericMaterials;
 };
 
 struct TempCleanupRequest {
@@ -256,10 +286,14 @@ bool ReadU32(HANDLE input, DWORD& value, DWORD& error) {
     return true;
 }
 
-bool Utf8ToWide(const std::string& input, std::wstring& output) {
-    if (input.empty() || input.find('\0') != std::string::npos ||
+bool Utf8ToWide(const std::string& input, std::wstring& output, bool allowEmpty = false) {
+    if ((!allowEmpty && input.empty()) || input.find('\0') != std::string::npos ||
         input.size() > static_cast<size_t>(kMaxFieldBytes)) {
         return false;
+    }
+    if (input.empty()) {
+        output.clear();
+        return true;
     }
     const int inputLength = static_cast<int>(input.size());
     const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
@@ -278,12 +312,13 @@ bool Utf8ToWide(const std::string& input, std::wstring& output) {
     return true;
 }
 
-bool ReadString(HANDLE input, DWORD maximumBytes, std::wstring& output, DWORD& error) {
+bool ReadString(HANDLE input, DWORD maximumBytes, std::wstring& output, DWORD& error,
+                bool allowEmpty = false) {
     DWORD length = 0;
     if (!ReadU32(input, length, error)) {
         return false;
     }
-    if (length == 0 || length > maximumBytes || length > kMaxFieldBytes) {
+    if ((!allowEmpty && length == 0) || length > maximumBytes || length > kMaxFieldBytes) {
         error = ERROR_INVALID_DATA;
         return false;
     }
@@ -292,7 +327,7 @@ bool ReadString(HANDLE input, DWORD maximumBytes, std::wstring& output, DWORD& e
     if (!ReadExact(input, bytes.data(), length, error)) {
         return false;
     }
-    if (!Utf8ToWide(bytes, output)) {
+    if (!Utf8ToWide(bytes, output, allowEmpty)) {
         error = ERROR_NO_UNICODE_TRANSLATION;
         return false;
     }
@@ -327,13 +362,14 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         return false;
     }
 
-    if (version != 5 || recipe != 1 || reservedByte != 0 || reservedWord != 0 ||
+    if (version != 5 || (recipe != 1 && recipe != 2) || reservedByte != 0 || reservedWord != 0 ||
         (request.manager != 1 && request.manager != 2) ||
         request.kind < 1 || request.kind > 5 ||
         request.timeoutSeconds < 1 || request.timeoutSeconds > 3600) {
         error = ERROR_INVALID_DATA;
         return false;
     }
+    request.recipe = recipe;
 
     if (!ReadString(input, kMaxFieldBytes, request.cwd, error) ||
         !ReadString(input, kMaxFieldBytes, request.gitDirectory, error) ||
@@ -396,6 +432,62 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         !IsIdentity(request.managerCoreFileIdentity)) {
         error = ERROR_INVALID_DATA;
         return false;
+    }
+    if (request.recipe == 2) {
+        DWORD argumentCount = 0;
+        DWORD materialCount = 0;
+        if (!ReadByte(input, request.genericMode, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericExecutable, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericExecutableFileIdentity, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericExecutableHash, error) ||
+            !ReadU32(input, argumentCount, error) || argumentCount > kMaxGenericArguments) {
+            if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+            return false;
+        }
+        request.genericArguments.reserve(argumentCount);
+        for (DWORD index = 0; index < argumentCount; ++index) {
+            std::wstring argument;
+            if (!ReadString(input, kMaxFieldBytes, argument, error, true)) return false;
+            request.genericArguments.push_back(std::move(argument));
+        }
+        if (!ReadString(input, kMaxFieldBytes, request.genericCommandText, error, true) ||
+            !ReadString(input, kMaxFieldBytes, request.genericCwd, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericCwdFileIdentity, error) ||
+            !ReadString(input, kMaxFieldBytes, request.approvalManifest, error) ||
+            !ReadString(input, kMaxFieldBytes, request.approvalManifestFileIdentity, error) ||
+            !ReadString(input, kMaxFieldBytes, request.approvalManifestHash, error) ||
+            !ReadU32(input, materialCount, error) || materialCount > kMaxGenericMaterials) {
+            if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+            return false;
+        }
+        request.genericMaterials.reserve(materialCount);
+        for (DWORD index = 0; index < materialCount; ++index) {
+            Request::Material material;
+            if (!ReadString(input, kMaxFieldBytes, material.path, error) ||
+                !ReadString(input, kMaxFieldBytes, material.fileIdentity, error) ||
+                !ReadString(input, kMaxFieldBytes, material.hash, error)) return false;
+            request.genericMaterials.push_back(std::move(material));
+        }
+        const bool validMode = request.genericMode >= 1 && request.genericMode <= 3;
+        const bool validCommandShape = request.genericMode == 1
+            ? request.genericCommandText.empty()
+            : !request.genericCommandText.empty() && request.genericArguments.empty();
+        if (!validMode || !validCommandShape ||
+            !IsIdentity(request.genericExecutableFileIdentity) ||
+            !IsHex(request.genericExecutableHash, 64) ||
+            !IsIdentity(request.genericCwdFileIdentity) ||
+            !IsIdentity(request.approvalManifestFileIdentity) ||
+            !IsHex(request.approvalManifestHash, 64) ||
+            !SameOrdinal(request.packageJsonHash, request.approvalManifestHash)) {
+            error = ERROR_INVALID_DATA;
+            return false;
+        }
+        for (const auto& material : request.genericMaterials) {
+            if (!IsIdentity(material.fileIdentity) || !IsHex(material.hash, 64)) {
+                error = ERROR_INVALID_DATA;
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -566,6 +658,22 @@ bool IsBasename(const std::wstring& path, const wchar_t* expected) {
     return CompareStringOrdinal(base.c_str(), -1, expected, -1, TRUE) == CSTR_EQUAL;
 }
 
+bool HasExeExtension(const std::wstring& path) {
+    const std::wstring base = PathBasename(path);
+    const size_t dot = base.find_last_of(L'.');
+    return dot != std::wstring::npos &&
+        CompareStringOrdinal(base.c_str() + dot, -1, L".exe", -1, TRUE) == CSTR_EQUAL;
+}
+
+bool IsPathWithinDirectory(const std::wstring& root, const std::wstring& candidate) {
+    if (candidate.size() < root.size() ||
+        CompareStringOrdinal(root.c_str(), static_cast<int>(root.size()),
+                             candidate.c_str(), static_cast<int>(root.size()), TRUE) != CSTR_EQUAL) {
+        return false;
+    }
+    return candidate.size() == root.size() || root.back() == L'\\' || candidate[root.size()] == L'\\';
+}
+
 bool IsSafeLabel(const std::wstring& value, size_t maximumLength);
 bool ReadEnvironmentValue(const wchar_t* name, std::wstring& value, DWORD& error);
 
@@ -625,6 +733,34 @@ bool IsSafeLabel(const std::wstring& value, size_t maximumLength) {
         });
 }
 
+bool IsRequestId(const std::wstring& value) {
+    return value.size() >= 24 && value.size() <= 64 && IsSafeLabel(value, 64);
+}
+
+bool HasRequestIdSuffix(const std::wstring& fileName, const std::wstring& suffix) {
+    if (fileName.size() <= suffix.size()) return false;
+    const size_t idLength = fileName.size() - suffix.size();
+    return IsRequestId(fileName.substr(0, idLength)) &&
+        CompareStringOrdinal(fileName.c_str() + idLength, static_cast<int>(suffix.size()),
+                             suffix.c_str(), static_cast<int>(suffix.size()), TRUE) == CSTR_EQUAL;
+}
+
+bool IsApprovalManifestForWorkspace(const Request& request) {
+    const std::wstring stateRoot = ParentDirectory(ParentDirectory(ParentDirectory(request.tempRootPath)));
+    if (stateRoot.empty()) return false;
+    const std::wstring executionRoot = stateRoot.back() == L'\\'
+        ? stateRoot + L"execution"
+        : stateRoot + L"\\execution";
+    const std::wstring workspaceId = request.tempWorkspaceId;
+    const std::wstring level3Directory = executionRoot + L"\\level3\\" + workspaceId;
+    const std::wstring gitPlansDirectory = executionRoot + L"\\git-plans\\" + workspaceId;
+    const std::wstring manifestDirectory = ParentDirectory(request.approvalManifest);
+    const std::wstring fileName = PathBasename(request.approvalManifest);
+    if (SameOrdinal(manifestDirectory, level3Directory)) return HasRequestIdSuffix(fileName, L".manifest.json");
+    if (SameOrdinal(manifestDirectory, gitPlansDirectory)) return HasRequestIdSuffix(fileName, L".json");
+    return false;
+}
+
 bool ReadEnvironmentValue(const wchar_t* name, std::wstring& value, DWORD& error) {
     const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
     if (needed == 0) {
@@ -680,6 +816,34 @@ bool ValidateRequestPaths(Request& request, DWORD& error) {
         return false;
     }
     request.cwd = std::move(canonical);
+    if (request.recipe == 2) {
+        if (!ValidateCanonicalPath(request.genericCwd, true, canonical, error)) return false;
+        request.genericCwd = std::move(canonical);
+        if (!IsPathWithinDirectory(request.cwd, request.genericCwd)) {
+            error = ERROR_ACCESS_DENIED;
+            return false;
+        }
+        if (!ValidateCanonicalPath(request.genericExecutable, false, canonical, error)) return false;
+        request.genericExecutable = std::move(canonical);
+        if (!HasExeExtension(request.genericExecutable)) {
+            error = ERROR_INVALID_NAME;
+            return false;
+        }
+        const bool powershellExecutable = IsBasename(request.genericExecutable, L"powershell.exe") ||
+            IsBasename(request.genericExecutable, L"pwsh.exe");
+        if ((request.genericMode == 3 && !powershellExecutable) ||
+            (request.genericMode == 1 &&
+             (IsBasename(request.genericExecutable, L"cmd.exe") || powershellExecutable))) {
+            error = ERROR_INVALID_NAME;
+            return false;
+        }
+        if (!ValidateCanonicalPath(request.approvalManifest, false, canonical, error)) return false;
+        request.approvalManifest = std::move(canonical);
+        for (auto& material : request.genericMaterials) {
+            if (!ValidateCanonicalPath(material.path, false, canonical, error)) return false;
+            material.path = std::move(canonical);
+        }
+    }
     if (!ValidateCanonicalPath(request.gitDirectory, true, canonical, error)) {
         return false;
     }
@@ -778,6 +942,10 @@ bool ValidateRequestPaths(Request& request, DWORD& error) {
     if (!ExpectedExecutionTempRoot(request.tempWorkspaceId, expectedTempRoot, error) ||
         !SameOrdinal(request.tempRootPath, expectedTempRoot)) {
         if (error == ERROR_SUCCESS) error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    if (request.recipe == 2 && !IsApprovalManifestForWorkspace(request)) {
+        error = ERROR_ACCESS_DENIED;
         return false;
     }
     const std::wstring expectedTempPath = request.tempRootPath + L"\\tmp-" + request.tempJobId;
@@ -1343,6 +1511,10 @@ bool LockExecutionMaterials(const Request& request, std::vector<UniqueHandle>& l
         !LockDirectoryPath(request.jobTempDir, &request.jobTempFileIdentity, locks, error)) {
         return false;
     }
+    if (request.recipe == 2 &&
+        !LockDirectoryPath(request.genericCwd, &request.genericCwdFileIdentity, locks, error)) {
+        return false;
+    }
     if (!ValidateTempOwnershipMarkers(request, error)) return false;
     const std::wstring gitEntryPath = request.cwd + L"\\.git";
     if (request.gitEntryType == 2) {
@@ -1352,8 +1524,13 @@ bool LockExecutionMaterials(const Request& request, std::vector<UniqueHandle>& l
         return false;
     }
 
-    const std::wstring manifestPath = request.cwd + L"\\package.json";
-    if (!OpenFileLock(manifestPath, nullptr, &request.packageJsonHash, locks, error)) return false;
+    if (request.recipe == 1) {
+        const std::wstring manifestPath = request.cwd + L"\\package.json";
+        if (!OpenFileLock(manifestPath, nullptr, &request.packageJsonHash, locks, error)) return false;
+    } else if (!OpenFileLock(request.approvalManifest, &request.approvalManifestFileIdentity,
+                             &request.approvalManifestHash, locks, error)) {
+        return false;
+    }
 
     const auto parentDirectory = [](const std::wstring& file) {
         const size_t separator = file.find_last_of(L'\\');
@@ -1384,6 +1561,14 @@ bool LockExecutionMaterials(const Request& request, std::vector<UniqueHandle>& l
         !OpenFileLock(request.managerCore, &request.managerCoreFileIdentity,
                       &request.managerCoreHash, locks, error)) {
         return false;
+    }
+    if (request.recipe == 2) {
+        if (!OpenFileLock(request.genericExecutable, &request.genericExecutableFileIdentity,
+                          &request.genericExecutableHash, locks, error)) return false;
+        for (const auto& material : request.genericMaterials) {
+            if (!OpenFileLock(material.path, &material.fileIdentity,
+                              &material.hash, locks, error)) return false;
+        }
     }
     return true;
 }
@@ -1531,7 +1716,9 @@ bool BuildEnvironment(const Request& request, ChildEnvironment& environment, DWO
     const std::wstring nodeDirectory = slash == 2
                                            ? request.nodeExecutable.substr(0, 3)
                                            : request.nodeExecutable.substr(0, slash);
-    environment.path = environment.system32 + L";" + nodeDirectory;
+    environment.path = request.recipe == 2
+        ? environment.system32
+        : environment.system32 + L";" + nodeDirectory;
     environment.systemRoot = windowsDir;
 
     std::vector<std::pair<std::wstring, std::wstring>> entries = {
@@ -1542,16 +1729,10 @@ bool BuildEnvironment(const Request& request, ChildEnvironment& environment, DWO
         {L"TEMP", environment.privateTemp},
         {L"TMP", environment.privateTemp},
         {L"USERPROFILE", environment.privateTemp},
+        {L"HOME", environment.privateTemp},
         {L"APPDATA", environment.privateTemp},
         {L"LOCALAPPDATA", environment.privateTemp},
         {L"PATHEXT", L".COM;.EXE;.BAT;.CMD"},
-        {L"npm_config_userconfig", environment.userConfig},
-        {L"npm_config_globalconfig", environment.globalConfig},
-        {L"npm_config_cache", environment.npmCache},
-        {L"npm_config_script_shell", environment.comSpec},
-        {L"GIT_CONFIG_GLOBAL", environment.gitConfig},
-        {L"GIT_CONFIG_SYSTEM", environment.gitConfig},
-        {L"GIT_CONFIG_NOSYSTEM", L"1"},
         {L"GIT_CONFIG_COUNT", L"2"},
         {L"GIT_CONFIG_KEY_0", L"core.hooksPath"},
         {L"GIT_CONFIG_VALUE_0", environment.gitHooksDir},
@@ -1559,6 +1740,22 @@ bool BuildEnvironment(const Request& request, ChildEnvironment& environment, DWO
         {L"GIT_CONFIG_VALUE_1", L""},
         {L"GIT_TERMINAL_PROMPT", L"0"},
     };
+    if (request.recipe == 1) {
+        entries.emplace_back(L"npm_config_userconfig", environment.userConfig);
+        entries.emplace_back(L"npm_config_globalconfig", environment.globalConfig);
+        entries.emplace_back(L"npm_config_cache", environment.npmCache);
+        entries.emplace_back(L"npm_config_script_shell", environment.comSpec);
+        entries.emplace_back(L"GIT_CONFIG_GLOBAL", environment.gitConfig);
+        entries.emplace_back(L"GIT_CONFIG_SYSTEM", environment.gitConfig);
+        entries.emplace_back(L"GIT_CONFIG_NOSYSTEM", L"1");
+    } else {
+        entries.emplace_back(L"GIT_CONFIG_GLOBAL", L"NUL");
+        entries.emplace_back(L"GIT_CONFIG_SYSTEM", L"NUL");
+        entries.emplace_back(L"GIT_CONFIG_NOSYSTEM", L"1");
+        entries.emplace_back(L"GIT_ATTR_NOSYSTEM", L"1");
+        entries.emplace_back(L"GIT_NO_REPLACE_OBJECTS", L"1");
+        entries.emplace_back(L"GCM_INTERACTIVE", L"Never");
+    }
     std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
         return CompareStringOrdinal(left.first.c_str(), -1,
                                     right.first.c_str(), -1, TRUE) == CSTR_LESS_THAN;
@@ -1601,6 +1798,48 @@ std::wstring QuoteWindowsArgument(const std::wstring& argument) {
 bool BuildCommandLine(const Request& request, const ChildEnvironment& environment,
                       std::vector<wchar_t>& commandLine, DWORD& error) {
     std::vector<std::wstring> arguments;
+    if (request.recipe == 2) {
+        if (request.genericMode == 2) {
+            if (!SameOrdinal(request.genericExecutable, environment.comSpec)) {
+                error = ERROR_INVALID_NAME;
+                return false;
+            }
+            std::wstring command = QuoteWindowsArgument(request.genericExecutable) +
+                L" /D /S /C \"" + request.genericCommandText + L"\"";
+            if (command.size() >= 32766) {
+                error = ERROR_FILENAME_EXCED_RANGE;
+                return false;
+            }
+            commandLine.assign(command.begin(), command.end());
+            commandLine.push_back(L'\0');
+            return true;
+        }
+        arguments.push_back(request.genericExecutable);
+        if (request.genericMode == 1) {
+            arguments.insert(arguments.end(), request.genericArguments.begin(),
+                             request.genericArguments.end());
+        } else if (request.genericMode == 3) {
+            arguments.push_back(L"-NoProfile");
+            arguments.push_back(L"-NonInteractive");
+            arguments.push_back(L"-Command");
+            arguments.push_back(request.genericCommandText);
+        } else {
+            error = ERROR_INVALID_DATA;
+            return false;
+        }
+        std::wstring command;
+        for (const auto& argument : arguments) {
+            if (!command.empty()) command.push_back(L' ');
+            command += QuoteWindowsArgument(argument);
+            if (command.size() >= 32766) {
+                error = ERROR_FILENAME_EXCED_RANGE;
+                return false;
+            }
+        }
+        commandLine.assign(command.begin(), command.end());
+        commandLine.push_back(L'\0');
+        return true;
+    }
     arguments.push_back(request.nodeExecutable);
     arguments.push_back(request.managerCli);
     if (request.manager == 1) {
@@ -1946,9 +2185,15 @@ bool CreateSuspendedChild(const Request& request, const ChildEnvironment& enviro
     PROCESS_INFORMATION processInfo{};
     DWORD creationFlags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT |
                           CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
-    if (!CreateProcessW(request.nodeExecutable.c_str(), commandLine.data(),
+    const wchar_t* applicationName = request.recipe == 2
+        ? request.genericExecutable.c_str()
+        : request.nodeExecutable.c_str();
+    const wchar_t* workingDirectory = request.recipe == 2
+        ? request.genericCwd.c_str()
+        : request.cwd.c_str();
+    if (!CreateProcessW(applicationName, commandLine.data(),
                         nullptr, nullptr, TRUE, creationFlags,
-                        const_cast<wchar_t*>(environment.block.data()), request.cwd.c_str(),
+                        const_cast<wchar_t*>(environment.block.data()), workingDirectory,
                         &startup.StartupInfo, &processInfo)) {
         error = GetLastError();
         return false;
@@ -1965,6 +2210,44 @@ bool VerifyChildInJob(HANDLE process, HANDLE job, DWORD& error) {
         return false;
     }
     if (!isMember) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    return true;
+}
+
+bool EnsureCurrentTokenNotElevated(DWORD& error) {
+    UniqueModule advapi(LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
+    if (advapi.value == nullptr) {
+        error = GetLastError();
+        return false;
+    }
+    const auto openProcessToken = reinterpret_cast<decltype(&OpenProcessToken)>(
+        GetProcAddress(advapi.value, "OpenProcessToken"));
+    const auto getTokenInformation = reinterpret_cast<decltype(&GetTokenInformation)>(
+        GetProcAddress(advapi.value, "GetTokenInformation"));
+    if (openProcessToken == nullptr || getTokenInformation == nullptr) {
+        error = ERROR_PROC_NOT_FOUND;
+        return false;
+    }
+    HANDLE tokenRaw = INVALID_HANDLE_VALUE;
+    if (!openProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tokenRaw)) {
+        error = GetLastError();
+        return false;
+    }
+    UniqueHandle token(tokenRaw);
+    TOKEN_ELEVATION elevation{};
+    DWORD returned = 0;
+    if (!getTokenInformation(token.get(), TokenElevation, &elevation,
+                              sizeof(elevation), &returned)) {
+        error = GetLastError();
+        return false;
+    }
+    if (returned != sizeof(elevation)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    if (elevation.TokenIsElevated != 0) {
         error = ERROR_ACCESS_DENIED;
         return false;
     }
@@ -2057,6 +2340,9 @@ int wmain(int argc, wchar_t** argv) {
         if (initialControl != ControlEvent::Cancel) {
             resultError = ERROR_INVALID_DATA;
         }
+    } else if (request.recipe == 2 && !EnsureCurrentTokenNotElevated(resultError)) {
+        failureStage = "reject-elevated-token";
+        outcome = Outcome::HelperError;
     } else if (!ValidateRequestPaths(request, resultError)) {
         failureStage = "validate-paths";
         outcome = Outcome::HelperError;

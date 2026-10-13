@@ -17,7 +17,8 @@
 - 通过 execution 工具启动由本机操作者明确批准的 bounded test/build/lint/typecheck 或具名 package-script recipe。
 - 提供受限、只读的 Windows Host Observation，可查看进程、监听端口、网络、DNS、路径和主机上下文。
 - 包含 Windows Bridge/Tunnel 状态恢复和自动启动相关能力。
-- **不提供**任意 Shell、调用方自带命令字符串、远程提权或任意 Git 命令通道。
+- V1.3 开发版增加结构化 Git Write，以及默认关闭、须本机逐次批准完整命令的 Level 3 PowerShell 7 / CMD / 本地程序执行。
+- 不提供远程提权、无限制 Shell 或任意 Git 参数通道。V1.3 尚未部署到 Production，操作与验收见 [V1.3 阶段报告](docs/v1.3-stage-report.md)。
 
 执行授权由 C2C 本机 trusted-command policy 管理。package script 只是执行材料；修改 `package.json` 不会自动批准新 recipe。Windows Job Object 只约束进程生命周期，不提供文件系统、网络、权限或不可信项目代码沙箱；经批准的 package script 仍会执行项目代码。
 
@@ -115,7 +116,7 @@ C2C Local Bridge  ---- Cloudflare Tunnel
 本地 Workspace  ---- C2C Native Helper ---- 本机已批准的 recipe
 ```
 
-ChatGPT 可以通过 C2C Local 检查、修改已授权文件，并启动由本机操作者明确批准的 bounded recipe。C2C 不提供任意 Shell MCP 或调用方自带命令字符串。
+ChatGPT 可以通过 C2C Local 检查、修改已授权文件并启动本机批准的 bounded recipe。V1.3 开发版另提供仓库策略约束的 Git Write，及精确命令摘要绑定、单次使用的 Level 3 本机审批流程。
 
 ## 安全边界
 
@@ -124,7 +125,7 @@ ChatGPT 可以通过 C2C Local 检查、修改已授权文件，并启动由本�
 - 凭据、密钥、SSH、`.env*` 等敏感文件默认拒绝，`.env.example` 允许读取。
 - `.c2cignore` 可以增加项目自己的排除规则。
 - 文件修改必须同时满足 OAuth scope 和本机 permission mode。
-- Execution 工具只接受 C2C 本机策略批准的具名 recipe；MCP 不提供 Shell、调用方自带命令字符串、Git commit 或远程权限提升工具。
+- V1.2 Execution 工具仍只接受本机策略批准的具名 recipe。V1.3 的 `git.write`、`execution.level3` 是独立可选 scopes；Git 策略与 Level 3 逐次审批只由本机 CLI 管理，旧 token 不会自动扩权。
 - 已批准的 package script 仍可调用 Shell，并以本机用户账户权限执行项目代码。Windows Job Object 只约束进程生命周期，不提供文件系统、网络、权限或恶意代码沙箱。
 - Runtime 完整性绑定选中的 Node 可执行文件；npm 的 `npm-cli.js`、`lib/cli.js`、`lib/cli/validate-engines.js`、`lib/cli/entry.js`、`lib/cli/exit-handler.js`、`lib/npm.js` 和 `package.json`；或固定版本 pnpm 的 `bin/pnpm.cjs`、`bin/pnpm.mjs`、`dist/pnpm.mjs` 和 `package.json`。这些列出的 runtime 文件会核对 file identity 与 SHA-256。workspace package manifest 按 SHA-256 检查并保持打开以防替换；已批准 recipe 记录保存在仓库外。这些哈希用于发现之后的变更，不认证发行者，也不能识别选中的 Node/npm/Corepack 安装在发现前就已有的恶意内容；Node 后续加载的全部模块和依赖也没有被冻结。
 - Helper 和固定 Launcher 的 SHA-256 来自 C2C 构建/发行元数据。Launcher 在调用 `CreateProcessW` 期间持有已验证 Helper 文件，并锁定其路径目录，阻止写入、重命名和替换；部署仍须保护 Launcher 及 C2C 发行代码目录。若 Launcher 和期望元数据都能被一起替换，元数据不能认证整套发行内容。

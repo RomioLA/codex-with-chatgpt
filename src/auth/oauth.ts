@@ -79,6 +79,8 @@ function pairingPage(opts: {
     "execution.jobs.read": "View execution job status",
     "execution.run": "Start execution jobs",
     "execution.cancel": "Cancel execution jobs",
+    "git.write": "Perform locally authorized Git writes",
+    "execution.level3": "Request and run individually approved local commands (Level 3)",
     "system.read": "Read limited host system diagnostics",
     offline_access: "Stay connected between sessions",
     "workspace.write": "Create and modify files in this workspace",
@@ -93,6 +95,8 @@ function pairingPage(opts: {
       "filesystem.external.write",
       "execution.run",
       "execution.cancel",
+      "git.write",
+      "execution.level3",
     ].includes(scope)
   );
   const accessLabel = hasMutationScope ? "" : " (read-only)";

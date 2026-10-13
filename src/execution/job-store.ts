@@ -72,6 +72,19 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     typeof recipe.target === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(recipe.target) &&
     (recipe.packageManager === "npm" || recipe.packageManager === "pnpm") &&
     typeof recipe.scriptHash === "string" && /^[a-f0-9]{64}$/.test(recipe.scriptHash) &&
+    (job.authorization === undefined || (
+      !!job.authorization && (job.authorization.type === "level3" || job.authorization.type === "git") &&
+      typeof job.authorization.requestId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(job.authorization.requestId) &&
+      typeof job.authorization.digest === "string" && /^[a-f0-9]{64}$/.test(job.authorization.digest)
+    )) &&
+    (job.gitResult === undefined || (
+      !!job.gitResult && ["confirmed", "changed", "identity_changed", "unavailable"].includes(job.gitResult.confirmation) &&
+      job.gitResult.confirmationScope === "local_repository" &&
+      ["not_applicable", "not_attempted", "reported_success", "unknown"].includes(job.gitResult.remoteOutcome) &&
+      typeof job.gitResult.partialSuccessPossible === "boolean" &&
+      [job.gitResult.headBefore, job.gitResult.headAfter].every((value) => value === null || typeof value === "string" && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(value)) &&
+      [job.gitResult.branchBefore, job.gitResult.branchAfter].every((value) => value === null || typeof value === "string" && value.length > 0 && value.length <= 200)
+    )) &&
     isExecutionJobState(job.state) &&
     typeof job.createdAt === "string" &&
     (job.startedAt === null || typeof job.startedAt === "string") &&

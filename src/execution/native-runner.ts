@@ -5,7 +5,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { TrustedCommand } from "./trusted-registry.js";
 import type { RepositoryIdentity } from "./repository-identity.js";
-import type { HelperRequest, HelperResultFrame } from "./helper-protocol.js";
+import type { GenericCommand, HelperRequest, HelperResultFrame } from "./helper-protocol.js";
 import { HelperOutputDecoder, HELPER_CANCEL_BYTE, serializeHelperRequest } from "./helper-protocol.js";
 import type { OutputStream } from "./job-types.js";
 import { redact } from "../logger/index.js";
@@ -37,7 +37,10 @@ export interface NativeRunnerRequest {
   timeoutSeconds: number;
   stateDirectory: string;
   tempLease: ExecutionTempLease;
+  genericCommand?: GenericCommand;
 }
+
+export type { GenericCommand } from "./helper-protocol.js";
 
 export function resolveExecutionHelperPath(options: {
   platform?: NodeJS.Platform;
@@ -236,7 +239,8 @@ export class WindowsNativeExecutionRunner {
         gitEntryFileIdentity: request.repository.fileIdentities.gitEntry,
         gitEntryType: request.repository.gitEntryType,
         gitEntryHash: request.repository.gitEntryHash,
-        packageJsonHash: request.trustedCommand.packageJsonHash,
+        packageJsonHash: request.genericCommand?.approvalManifestHash ?? request.trustedCommand.packageJsonHash,
+        genericCommand: request.genericCommand,
       });
       child = spawnImpl(launcherPath, [], {
         cwd: path.dirname(launcherPath),
