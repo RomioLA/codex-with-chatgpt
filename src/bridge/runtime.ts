@@ -69,7 +69,7 @@ export async function probeBridge(
 export type BridgeObservation =
   | { state: "healthy"; runtime: RuntimeState }
   | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" }
-  | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" };
+  | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" | "runtime_identity_stale" };
 
 function observePid(pid: number): "present" | "missing" | "unknown" {
   if (!Number.isInteger(pid) || pid <= 0) return "unknown";
@@ -89,15 +89,19 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
   const runtime = readRuntimeState(workspaceId);
   if (!runtime) return { state: "stopped", runtime: null, reason: "runtime_missing" };
 
+  // /health identifies the workspace, not the persisted admin identity.
+  // When a new listener appears before replacing an old runtime file, a
+  // matching health response must not authorize reuse of the stale PID/token.
   const health = await probeBridge(runtime.port);
-  if (health && health.workspaceId === workspaceId) {
-    return { state: "healthy", runtime };
-  }
-  if (health) {
+  const pid = observePid(runtime.pid);
+  if (health && health.workspaceId !== workspaceId) {
     return { state: "unknown", runtime, reason: "workspace_mismatch" };
   }
-
-  const pid = observePid(runtime.pid);
+  if (health) {
+    if (pid === "missing") return { state: "unknown", runtime, reason: "runtime_identity_stale" };
+    if (pid === "unknown") return { state: "unknown", runtime, reason: "pid_unknown" };
+    return { state: "healthy", runtime };
+  }
   if (pid === "missing") return { state: "stopped", runtime, reason: "pid_missing" };
   return { state: "unknown", runtime, reason: pid === "unknown" ? "pid_unknown" : "probe_failed" };
 }

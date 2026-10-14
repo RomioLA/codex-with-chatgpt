@@ -26,6 +26,76 @@ export interface EnsureBridgeResult {
   spawned: boolean;
 }
 
+interface AdminIdentity {
+  service?: unknown;
+  workspaceId?: unknown;
+  workspaceRoot?: unknown;
+  pid?: unknown;
+  port?: unknown;
+  startedAt?: unknown;
+}
+
+export class BridgeAdminIdentityError extends Error {
+  constructor() {
+    super("Bridge admin authentication or identity mismatch; refusing to reuse the runtime.");
+    this.name = "BridgeAdminIdentityError";
+  }
+}
+
+/** Returns false only for transient transport failures; identity failures are terminal. */
+async function verifyAdminReady(runtime: RuntimeState, workspace: Workspace): Promise<boolean> {
+  let info: AdminIdentity;
+  try {
+    info = await adminFetch<AdminIdentity>(runtime, "GET", "/admin/info", 1500);
+  } catch (error) {
+    const status = (error as Error & { httpStatus?: number }).httpStatus;
+    if (status === 401 || status === 403 || status === 404) {
+      throw new BridgeAdminIdentityError();
+    }
+    const cause = error instanceof Error ? error.cause as NodeJS.ErrnoException | undefined : undefined;
+    const code = (error as NodeJS.ErrnoException).code ?? cause?.code;
+    if (code && ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "UND_ERR_CONNECT_TIMEOUT"].includes(code)) return false;
+    if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return false;
+    throw error;
+  }
+  const sameRoot = typeof info?.workspaceRoot === "string" &&
+    (process.platform === "win32"
+      ? path.resolve(info.workspaceRoot).toLowerCase() === path.resolve(workspace.root).toLowerCase()
+      : path.resolve(info.workspaceRoot) === path.resolve(workspace.root));
+  if (
+    info?.service !== runtime.service ||
+    info.workspaceId !== workspace.id ||
+    !sameRoot ||
+    info.pid !== runtime.pid ||
+    info.port !== runtime.port ||
+    info.startedAt !== runtime.startedAt
+  ) {
+    throw new BridgeAdminIdentityError();
+  }
+  return true;
+}
+
+/** Retry only transport-level admin unavailability, not authentication or identity failures. */
+async function waitForExistingAdminReady(runtime: RuntimeState, workspace: Workspace): Promise<void> {
+  const deadline = Date.now() + 4_000;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    if (await verifyAdminReady(runtime, workspace)) return;
+    if (attempt === 5 || Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
+    const observed = await findBridgeObservation(workspace.id);
+    if (
+      observed.state !== "healthy" ||
+      observed.runtime.pid !== runtime.pid ||
+      observed.runtime.port !== runtime.port ||
+      observed.runtime.startedAt !== runtime.startedAt ||
+      observed.runtime.adminToken !== runtime.adminToken
+    ) {
+      throw new BridgeAdminIdentityError();
+    }
+  }
+  throw new Error("Existing Bridge admin interface did not become ready within the bounded retry window.");
+}
+
 /**
  * Ensure a bridge is running for the workspace. Reuses a live instance,
  * otherwise spawns a detached daemon and waits for it to become healthy.
@@ -33,7 +103,10 @@ export interface EnsureBridgeResult {
 export async function ensureBridge(workspaceRoot: string, opts: { port?: number } = {}): Promise<EnsureBridgeResult> {
   const workspace = new Workspace(workspaceRoot);
   const observation = await findBridgeObservation(workspace.id);
-  if (observation.state === "healthy") return { runtime: observation.runtime, spawned: false };
+  if (observation.state === "healthy") {
+    await waitForExistingAdminReady(observation.runtime, workspace);
+    return { runtime: observation.runtime, spawned: false };
+  }
   if (observation.state === "unknown") {
     throw new Error(
       `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
@@ -65,6 +138,7 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
       windowsHide: true,
     }
   );
+  const spawnedPid = child.pid;
   child.unref();
   fs.closeSync(out);
 
@@ -72,13 +146,20 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 300));
     const runtime = await findLiveBridge(workspace.id);
-    if (runtime) return { runtime, spawned: true };
+    // During startup the new listener can briefly answer /health while the
+    // runtime file still contains the previous Bridge identity. Only accept
+    // the runtime published by the child we just spawned.
+    if (runtime && spawnedPid !== undefined && runtime.pid === spawnedPid) {
+      if (await verifyAdminReady(runtime, workspace)) return { runtime, spawned: true };
+    }
     if (child.exitCode !== null && child.exitCode !== 0) {
       const concurrentStartDeadline = Date.now() + 2000;
       while (Date.now() < concurrentStartDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
         const concurrentRuntime = await findLiveBridge(workspace.id);
-        if (concurrentRuntime) return { runtime: concurrentRuntime, spawned: false };
+        if (concurrentRuntime && await verifyAdminReady(concurrentRuntime, workspace)) {
+          return { runtime: concurrentRuntime, spawned: false };
+        }
       }
       throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
     }
@@ -102,7 +183,9 @@ export async function adminFetch<T = unknown>(
     });
     const body = (await response.json().catch(() => ({}))) as T & { message?: string };
     if (!response.ok) {
-      throw new Error((body as { message?: string }).message ?? `Admin request failed (${response.status})`);
+      const failure = new Error((body as { message?: string }).message ?? `Admin request failed (${response.status})`);
+      Object.assign(failure, { httpStatus: response.status });
+      throw failure;
     }
     return body;
   } finally {

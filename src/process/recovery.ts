@@ -2,7 +2,7 @@ import path from "node:path";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { findBridgeObservation, type BridgeObservation, type RuntimeState } from "../bridge/runtime.js";
-import { adminFetch, ensureBridge, type EnsureBridgeResult } from "./daemon.js";
+import { adminFetch, BridgeAdminIdentityError, ensureBridge, type EnsureBridgeResult } from "./daemon.js";
 import { Logger, type Logger as LoggerType } from "../logger/index.js";
 import { readLastEndpoint, mcpUrlFromPublic, normalizePublicUrl } from "../config/endpoint.js";
 import { readPermission, type PermissionMode } from "../permission/index.js";
@@ -36,6 +36,7 @@ export interface RecoveryAdminInfo {
 export type RecoveryReason =
   | "bridgeStopped"
   | "bridgeUncertain"
+  | "bridgeIdentityMismatch"
   | "bridgeRecoveryFailed"
   | "tunnelPreferenceUnset"
   | "namedConfigurationMissing"
@@ -112,6 +113,14 @@ export interface RecoveryOptions {
   adminFetchImpl?: <T = unknown>(runtime: RuntimeState, method: "GET" | "POST", route: string, timeoutMs?: number) => Promise<T>;
   fetchImpl?: typeof fetch;
   logger?: LoggerType;
+}
+
+type AdminHttpError = Error & { httpStatus?: number };
+
+function isAdminIdentityFailure(error: unknown): boolean {
+  if (error instanceof BridgeAdminIdentityError) return true;
+  const status = error && typeof error === "object" ? (error as AdminHttpError).httpStatus : undefined;
+  return status === 401 || status === 403 || status === 404;
 }
 
 type Observation = BridgeObservation;
@@ -293,7 +302,9 @@ export async function collectRuntimeDiagnostics(
         info = await (opts.adminFetchImpl ?? adminFetch)<RecoveryAdminInfo>(observation.runtime, "GET", "/admin/info");
       } catch (error) {
         bridgeStatus = "uncertain";
-        bridgeReason = preference === "named" ? "admin_probe_failed" : `admin_probe_failed:${(error as Error).message}`;
+        bridgeReason = isAdminIdentityFailure(error)
+          ? "admin_identity_mismatch"
+          : preference === "named" ? "admin_probe_failed" : `admin_probe_failed:${(error as Error).message}`;
       }
     }
   } else if (observation.state === "stopped") {
@@ -347,7 +358,9 @@ export async function collectRuntimeDiagnostics(
           : "broken";
 
   let reason: RecoveryReason | null = null;
-  if (bridgeStatus === "uncertain") reason = "bridgeUncertain";
+  if (bridgeStatus === "uncertain") {
+    reason = bridgeReason === "admin_identity_mismatch" ? "bridgeIdentityMismatch" : "bridgeUncertain";
+  }
   else if (bridgeStatus === "stopped") reason = "bridgeStopped";
   else if (preference === "named" && !namedReady) reason = "namedConfigurationMissing";
   else if (credential && credential.status !== "ready") reason = namedCredentialReason(credential.status);
@@ -429,7 +442,13 @@ export async function restoreWorkspace(
   } catch (error) {
     detail = preference === "named" ? "Bridge runtime or admin identity could not be verified." : (error as Error).message;
     const observation = await findBridgeObservation(workspace.id);
-    reason = observation.state === "unknown" ? "bridgeUncertain" : "bridgeRecoveryFailed";
+    if (isAdminIdentityFailure(error) ||
+      (runtime && observation.state === "healthy" && !runtimeMatchesObservation(runtime, observation, workspace))) {
+      reason = "bridgeIdentityMismatch";
+      detail = "Bridge runtime or authenticated admin identity does not match.";
+    } else {
+      reason = observation.state === "unknown" ? "bridgeUncertain" : "bridgeRecoveryFailed";
+    }
     logger.error(`Bridge recovery failed workspace=${workspace.id} reason=${reason}`);
   }
 
@@ -443,7 +462,7 @@ export async function restoreWorkspace(
         !runtimeMatchesObservation(runtime, observation, workspace) ||
         !infoMatchesRuntime(info, workspace, observation.runtime)
       ) {
-        reason = "namedRuntimeMismatch";
+        reason = "bridgeIdentityMismatch";
         detail = "Bridge runtime and admin identity do not match.";
       }
     } catch {
@@ -635,7 +654,7 @@ export async function restoreWorkspace(
         diagnostics.bridge.reason = "final_runtime_observation_failed";
         diagnostics.tunnel.status = "unknown";
       } else if (!runtimeMatchesObservation(runtime, observation, workspace)) {
-        reason = "namedRuntimeMismatch";
+        reason = "bridgeIdentityMismatch";
         detail = "Bridge runtime identity changed during Named Tunnel recovery.";
         diagnostics.bridge.status = "uncertain";
         diagnostics.bridge.reason = "runtime_identity_mismatch";
@@ -643,7 +662,7 @@ export async function restoreWorkspace(
       } else {
         const finalInfo = await adminFetchImpl<RecoveryAdminInfo>(observation.runtime, "GET", "/admin/info");
         if (!infoMatchesRuntime(finalInfo, workspace, observation.runtime)) {
-          reason = "namedRuntimeMismatch";
+          reason = "bridgeIdentityMismatch";
           detail = "Bridge runtime and final admin identity do not match.";
           diagnostics.bridge.status = "uncertain";
           diagnostics.bridge.reason = "admin_identity_mismatch";
@@ -666,11 +685,14 @@ export async function restoreWorkspace(
           }
         }
       }
-    } catch {
-      reason = "bridgeUncertain";
-      detail = "Bridge runtime and admin identity could not be reconfirmed after the Named Tunnel probe.";
+    } catch (error) {
+      const identityFailure = isAdminIdentityFailure(error);
+      reason = identityFailure ? "bridgeIdentityMismatch" : "bridgeUncertain";
+      detail = identityFailure
+        ? "Bridge final admin authentication or identity mismatch."
+        : "Bridge runtime and admin identity could not be reconfirmed after the Named Tunnel probe.";
       diagnostics.bridge.status = "uncertain";
-      diagnostics.bridge.reason = "final_admin_probe_failed";
+      diagnostics.bridge.reason = identityFailure ? "admin_identity_mismatch" : "final_admin_probe_failed";
       diagnostics.tunnel.status = "unknown";
     }
   }
