@@ -37,6 +37,8 @@ export interface BoundScriptEntry {
 export type ScriptEntryUncertainty =
   | "shell-expansion"
   | "computed-path"
+  | "unverified-execution-target"
+  | "unsupported-execution-target"
   | "computed-command"
   | "unsupported-shell-syntax"
   | "unclosed-quote"
@@ -58,6 +60,7 @@ export interface ScriptEntryBindingResult {
 interface Token {
   value: string;
   dynamic: boolean;
+  quoted?: boolean;
 }
 
 interface LexedCommand {
@@ -68,8 +71,26 @@ interface LexedCommand {
 const SCRIPT_EXTENSIONS = new Set([
   ".ps1", ".cmd", ".bat", ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts",
 ]);
-const POWERSHELL_ENTRY_EXTENSIONS = new Set([".ps1"]);
+const POWERSHELL_ENTRY_EXTENSIONS = new Set([".ps1", ".cmd", ".bat", ".exe", ".com"]);
+const POWERSHELL_RECOGNIZED_EXTENSIONS = new Set([...SCRIPT_EXTENSIONS, ...POWERSHELL_ENTRY_EXTENSIONS]);
 const CMD_ENTRY_EXTENSIONS = new Set([".cmd", ".bat"]);
+const CMD_EXECUTABLE_EXTENSIONS = new Set([...CMD_ENTRY_EXTENSIONS, ".exe", ".com"]);
+const CMD_RECOGNIZED_EXTENSIONS = new Set([...SCRIPT_EXTENSIONS, ...CMD_EXECUTABLE_EXTENSIONS]);
+const CMD_START_SWITCH_OPTIONS = new Set([
+  "/b", "/i", "/min", "/max", "/separate", "/shared", "/low", "/normal", "/high", "/realtime",
+  "/abovenormal", "/wait",
+]);
+const CMD_START_VALUE_OPTIONS = new Set(["/affinity", "/d", "/node"]);
+const START_PROCESS_VALUE_OPTIONS = new Set([
+  "-argumentlist", "-credential", "-erroraction", "-errorvariable", "-filepath", "-informationaction",
+  "-informationvariable", "-outbuffer", "-outvariable", "-pipelinevariable", "-progressaction",
+  "-redirectstandarderror", "-redirectstandardinput", "-redirectstandardoutput", "-verb", "-warningaction",
+  "-warningvariable", "-windowstyle", "-workingdirectory",
+]);
+const START_PROCESS_SWITCH_OPTIONS = new Set([
+  "-confirm", "-debug", "-loaduserprofile", "-nonewwindow", "-passthru", "-usenewenvironment", "-verbose",
+  "-wait", "-whatif",
+]);
 
 const INTERPRETERS = new Set([
   "python", "python2", "python3", "py", "node", "deno", "bun", "tsx", "ts-node",
@@ -93,7 +114,8 @@ const CMD_BUILTINS = new Set([
 ]);
 
 const UNCERTAINTY_ORDER: ScriptEntryUncertainty[] = [
-  "shell-expansion", "computed-path", "computed-command", "unsupported-shell-syntax", "unclosed-quote",
+  "shell-expansion", "computed-path", "unverified-execution-target", "unsupported-execution-target",
+  "computed-command", "unsupported-shell-syntax", "unclosed-quote",
   "ambiguous-command-search", "interpreter-eval", "opaque-nested-command",
 ];
 
@@ -112,6 +134,44 @@ function normalizeCommandName(value: string): string {
 
 function isInterpreter(value: string): boolean {
   return INTERPRETERS.has(normalizeCommandName(value));
+}
+
+function markInterpreterCommandUncertainty(
+  executable: string,
+  args: readonly Token[],
+  uncertainties: Set<ScriptEntryUncertainty>,
+): void {
+  const interpreter = normalizeCommandName(executable);
+  const values = args.map((token) => token.value.toLowerCase());
+  if (values.some((value) => /^(-c|-m|-e|--eval|--print|-command|-encodedcommand)(?:\s|$)/.test(value))) {
+    uncertainties.add("interpreter-eval");
+  }
+  if ((interpreter === "cmd" && values.some((value) => /^\/(?:c|k)(?:\s|$)/.test(value))) ||
+      (["pwsh", "powershell"].includes(interpreter) &&
+        values.some((value) => /^-(?:command|encodedcommand)(?:\s|$)/.test(value)))) {
+    uncertainties.add("opaque-nested-command");
+  }
+}
+
+function addInterpreterArgumentEntries(
+  input: ScriptEntryBindingInput,
+  executable: string,
+  args: readonly Token[],
+  found: Array<{ reference: string; source: ScriptEntrySource }>,
+  uncertainties: Set<ScriptEntryUncertainty>,
+): void {
+  addProgramEntries({
+    engine: "program",
+    workspaceRoot: input.workspaceRoot,
+    cwd: input.cwd,
+    executable,
+    args: args.map((token) => token.value),
+  }, found, uncertainties);
+  markInterpreterCommandUncertainty(executable, args, uncertainties);
+  if (args.some((token) => /\.(?:py|pyw|js|mjs|cjs|ts|mts|cts|ps1|cmd|bat)(?:\s|$)/i.test(token.value) &&
+      !hasScriptExtension(token.value))) {
+    uncertainties.add("unsupported-shell-syntax");
+  }
 }
 
 function existsAsFileInput(input: ScriptEntryBindingInput, reference: string): boolean {
@@ -142,12 +202,16 @@ function lexShell(command: string, engine: "powershell" | "cmd"): LexedCommand {
   let segment: Token[] = [];
   let value = "";
   let tokenDynamic = false;
+  let tokenQuoted = false;
   let quote: "'" | '"' | null = null;
 
   const flushToken = () => {
-    if (value.length > 0 || tokenDynamic) segment.push({ value, dynamic: tokenDynamic });
+    if (value.length > 0 || tokenDynamic || tokenQuoted) {
+      segment.push({ value, dynamic: tokenDynamic, quoted: tokenQuoted });
+    }
     value = "";
     tokenDynamic = false;
+    tokenQuoted = false;
   };
   const flushSegment = () => {
     flushToken();
@@ -200,6 +264,7 @@ function lexShell(command: string, engine: "powershell" | "cmd"): LexedCommand {
 
     if (char === '"' || (engine === "powershell" && char === "'")) {
       quote = char;
+      tokenQuoted = true;
       continue;
     }
 
@@ -284,8 +349,12 @@ function lexShell(command: string, engine: "powershell" | "cmd"): LexedCommand {
   return { segments, uncertainties };
 }
 
-function getScriptReference(token: Token, uncertainties: Set<ScriptEntryUncertainty>): string | undefined {
-  if (!hasScriptExtension(token.value)) return undefined;
+function getScriptReference(
+  token: Token,
+  uncertainties: Set<ScriptEntryUncertainty>,
+  extensions: ReadonlySet<string> = SCRIPT_EXTENSIONS,
+): string | undefined {
+  if (!extensions.has(extensionOf(token.value))) return undefined;
   if (token.dynamic || /[*?]/.test(token.value)) {
     uncertainties.add("computed-path");
     return undefined;
@@ -297,7 +366,216 @@ function shellEntryExtensionAllowed(engine: "powershell" | "cmd", value: string)
   const extension = extensionOf(value);
   return engine === "powershell"
     ? POWERSHELL_ENTRY_EXTENSIONS.has(extension)
-    : CMD_ENTRY_EXTENSIONS.has(extension);
+    : CMD_EXECUTABLE_EXTENSIONS.has(extension);
+}
+
+function isExplicitPath(value: string): boolean {
+  return path.isAbsolute(value) || /^[A-Za-z]:/.test(value) || /[\\/]/.test(value);
+}
+
+function addPowerShellPathEntry(
+  input: ScriptEntryBindingInput,
+  token: Token,
+  found: Array<{ reference: string; source: ScriptEntrySource }>,
+  uncertainties: Set<ScriptEntryUncertainty>,
+): void {
+  if (token.dynamic || /[*?]/.test(token.value)) {
+    uncertainties.add("computed-path");
+    return;
+  }
+
+  const extension = extensionOf(token.value);
+  if (extension === ".ps1") {
+    // Preserve the existing behavior: a literal .ps1 is a definite PowerShell
+    // script entry, so Level 3's regular-file snapshot rejects it if missing.
+    found.push({ reference: token.value, source: "shell-command" });
+    return;
+  }
+
+  if (!existsAsFileInput(input, token.value)) {
+    // A missing path can appear between approval and launch. Requiring the
+    // existing dynamic-code acknowledgement prevents an empty snapshot from
+    // looking like a statically understood command.
+    uncertainties.add("unverified-execution-target");
+    return;
+  }
+
+  found.push({ reference: token.value, source: "shell-command" });
+  if (!POWERSHELL_ENTRY_EXTENSIONS.has(extension)) {
+    // Freeze an existing file conservatively without claiming that PowerShell
+    // can execute its file type. Approval remains gated as dynamic code.
+    uncertainties.add("unsupported-execution-target");
+  }
+}
+
+function addPowerShellExecutionTarget(
+  input: ScriptEntryBindingInput,
+  token: Token,
+  found: Array<{ reference: string; source: ScriptEntrySource }>,
+  uncertainties: Set<ScriptEntryUncertainty>,
+): void {
+  if (token.dynamic || /[*?]/.test(token.value)) {
+    uncertainties.add("computed-path");
+  } else if (!token.value.trim()) {
+    uncertainties.add("unverified-execution-target");
+  } else if (isExplicitPath(token.value)) {
+    addPowerShellPathEntry(input, token, found, uncertainties);
+  } else {
+    // Start-Process resolves a bare FilePath through process search rules.
+    uncertainties.add("ambiguous-command-search");
+  }
+}
+
+function addPowerShellStartProcessEntries(
+  input: ScriptEntryBindingInput,
+  segment: readonly Token[],
+  commandIndex: number,
+  found: Array<{ reference: string; source: ScriptEntrySource }>,
+  uncertainties: Set<ScriptEntryUncertainty>,
+): void {
+  const args = segment.slice(commandIndex + 1);
+  let target: Token | undefined;
+  let argumentListSeen = false;
+  const childArgs: Token[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index]!;
+    const separator = token.value.search(/[:=]/);
+    const optionName = (separator >= 0 ? token.value.slice(0, separator) : token.value).toLowerCase();
+    const attachedValue = separator >= 0 ? token.value.slice(separator + 1) : undefined;
+
+    if (optionName.startsWith("-")) {
+      if (optionName === "-filepath") {
+        const value = attachedValue !== undefined ? { value: attachedValue, dynamic: token.dynamic } : args[index + 1];
+        if (!value || (attachedValue === undefined && value.value.startsWith("-"))) {
+          uncertainties.add("unverified-execution-target");
+        } else {
+          if (target) uncertainties.add("unsupported-shell-syntax");
+          target = value;
+          if (attachedValue === undefined) index += 1;
+        }
+        continue;
+      }
+
+      if (optionName === "-argumentlist") {
+        argumentListSeen = true;
+        const value = attachedValue !== undefined ? { value: attachedValue, dynamic: token.dynamic } : args[index + 1];
+        if (!value || (attachedValue === undefined && value.value.startsWith("-"))) {
+          uncertainties.add("unsupported-shell-syntax");
+        } else {
+          childArgs.push(value);
+          if (attachedValue === undefined) index += 1;
+        }
+        continue;
+      }
+
+      if (START_PROCESS_VALUE_OPTIONS.has(optionName)) {
+        if (attachedValue === undefined) {
+          const value = args[index + 1];
+          if (value && !value.value.startsWith("-")) index += 1;
+          else uncertainties.add("unsupported-shell-syntax");
+        }
+        continue;
+      }
+      if (START_PROCESS_SWITCH_OPTIONS.has(optionName)) continue;
+
+      // Parameter abbreviations and unknown syntax are not parsed as targets.
+      uncertainties.add("unsupported-shell-syntax");
+      continue;
+    }
+
+    if (!target && !argumentListSeen) target = token;
+    else childArgs.push(token);
+  }
+
+  if (!target) {
+    uncertainties.add("unverified-execution-target");
+    return;
+  }
+
+  addPowerShellExecutionTarget(input, target, found, uncertainties);
+  if (isInterpreter(target.value)) {
+    addInterpreterArgumentEntries(input, target.value, childArgs, found, uncertainties);
+  }
+}
+
+function addCmdExecutionTarget(
+  input: ScriptEntryBindingInput,
+  target: Token,
+  args: readonly Token[],
+  found: Array<{ reference: string; source: ScriptEntrySource }>,
+  uncertainties: Set<ScriptEntryUncertainty>,
+): void {
+  if (target.dynamic || /[*?]/.test(target.value)) {
+    uncertainties.add("computed-path");
+    return;
+  }
+  if (!target.value.trim()) {
+    uncertainties.add("unverified-execution-target");
+    return;
+  }
+  if (!isExplicitPath(target.value)) {
+    // A bare name can resolve through the mutable current directory/PATH search.
+    uncertainties.add("ambiguous-command-search");
+    return;
+  }
+  if (!existsAsFileInput(input, target.value)) {
+    // This also rejects absolute targets outside the selected repository without
+    // probing the external path. Level 3 cannot snapshot those files safely.
+    uncertainties.add("unverified-execution-target");
+    return;
+  }
+
+  found.push({ reference: target.value, source: "shell-command" });
+  if (!CMD_EXECUTABLE_EXTENSIONS.has(extensionOf(target.value))) {
+    uncertainties.add("unsupported-execution-target");
+  }
+  if (isInterpreter(target.value)) {
+    addInterpreterArgumentEntries(input, target.value, args, found, uncertainties);
+  }
+}
+
+function addCmdStartEntries(
+  input: ScriptEntryBindingInput,
+  segment: readonly Token[],
+  commandIndex: number,
+  found: Array<{ reference: string; source: ScriptEntrySource }>,
+  uncertainties: Set<ScriptEntryUncertainty>,
+): void {
+  const args = segment.slice(commandIndex + 1);
+  let target: Token | undefined;
+  let targetIndex = -1;
+  let titleSeen = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index]!;
+    const option = token.value.toLowerCase();
+    if (!token.quoted && CMD_START_SWITCH_OPTIONS.has(option)) continue;
+    if (!token.quoted && CMD_START_VALUE_OPTIONS.has(option)) {
+      const value = args[index + 1];
+      if (!value || value.value.startsWith("/")) uncertainties.add("unsupported-shell-syntax");
+      else index += 1;
+      continue;
+    }
+    if (!token.quoted && option.startsWith("/") && !/^[A-Za-z]:/.test(token.value)) {
+      uncertainties.add("unsupported-shell-syntax");
+      continue;
+    }
+    if (!titleSeen && token.quoted) {
+      // START treats its first quoted argument as a window title, including "".
+      titleSeen = true;
+      continue;
+    }
+    target = token;
+    targetIndex = index;
+    break;
+  }
+
+  if (!target) {
+    uncertainties.add("unverified-execution-target");
+    return;
+  }
+  addCmdExecutionTarget(input, target, args.slice(targetIndex + 1), found, uncertainties);
 }
 
 function optionValue(value: string): string | undefined {
@@ -389,17 +667,46 @@ function addShellEntries(input: ScriptEntryBindingInput, engine: "powershell" | 
     let commandValue = commandToken.value;
     let commandName = normalizeCommandName(commandValue);
 
-    if (engine === "cmd" && commandName === "call") {
+    if (engine === "cmd" && commandValue.toLowerCase() === "call") {
       commandIndex += 1;
       commandToken = segment[commandIndex] ?? commandToken;
       commandValue = commandToken.value;
       commandName = normalizeCommandName(commandValue);
     }
 
-    const directEntry = getScriptReference(commandToken, uncertainties);
+    if (engine === "powershell" && isExplicitPath(commandValue)) {
+      addPowerShellPathEntry(input, commandToken, found, uncertainties);
+      if (isInterpreter(commandValue)) {
+        const interpreterArgs = segment.slice(commandIndex + 1);
+        addProgramEntries({
+          engine: "program",
+          workspaceRoot: input.workspaceRoot,
+          cwd: input.cwd,
+          executable: commandValue,
+          args: interpreterArgs.map((token) => token.value),
+        }, found, uncertainties);
+        markInterpreterCommandUncertainty(commandValue, interpreterArgs, uncertainties);
+      }
+      continue;
+    }
+
+    if (engine === "cmd" && isExplicitPath(commandValue)) {
+      addCmdExecutionTarget(input, commandToken, segment.slice(commandIndex + 1), found, uncertainties);
+      continue;
+    }
+
+    if (engine === "cmd" && commandValue.toLowerCase() === "start") {
+      addCmdStartEntries(input, segment, commandIndex, found, uncertainties);
+      continue;
+    }
+
+    const directEntry = getScriptReference(commandToken, uncertainties,
+      engine === "powershell" ? POWERSHELL_RECOGNIZED_EXTENSIONS : CMD_RECOGNIZED_EXTENSIONS);
     if (directEntry && shellEntryExtensionAllowed(engine, directEntry)) {
       if (!path.isAbsolute(directEntry) && !/[\\/]/.test(directEntry)) {
-        if (engine === "cmd" && existsAsFileInput(input, directEntry)) {
+        if (engine === "cmd" && [".exe", ".com"].includes(extensionOf(directEntry))) {
+          uncertainties.add("ambiguous-command-search");
+        } else if (engine === "cmd" && existsAsFileInput(input, directEntry)) {
           found.push({ reference: directEntry, source: "shell-command" });
         } else {
           uncertainties.add("ambiguous-command-search");
@@ -410,41 +717,21 @@ function addShellEntries(input: ScriptEntryBindingInput, engine: "powershell" | 
       continue;
     }
 
-    if (engine === "cmd" && commandName === "start") {
-      for (const token of segment.slice(commandIndex + 1)) {
-        const reference = getScriptReference(token, uncertainties);
-        if (reference && shellEntryExtensionAllowed(engine, reference)) {
-          if (!path.isAbsolute(reference) && !/[\\/]/.test(reference)) uncertainties.add("ambiguous-command-search");
-          else found.push({ reference, source: "shell-command" });
-        }
-      }
+    if (engine === "powershell" && directEntry) {
+      // A bare unsupported file name may resolve through command search or a
+      // shell function; do not treat it as a harmless, statically known input.
+      uncertainties.add("ambiguous-command-search");
       continue;
     }
 
     const builtins = engine === "powershell" ? POWERSHELL_BUILTINS : CMD_BUILTINS;
     if (builtins.has(commandName)) {
+      if (engine === "powershell" && commandName === "start-process") {
+        addPowerShellStartProcessEntries(input, segment, commandIndex, found, uncertainties);
+        continue;
+      }
       if ((commandName === "invoke-expression" || commandName === "iex") && segment.length > commandIndex + 1) {
         uncertainties.add("computed-command");
-      }
-      if (engine === "powershell" && commandName === "start-process") {
-        const args = segment.slice(commandIndex + 1);
-        for (let index = 0; index < args.length; index += 1) {
-          const token = args[index]!;
-          const option = token.value.toLowerCase();
-          if (option === "-filepath" || option === "-argumentlist") {
-            const next = args[index + 1];
-            if (next) {
-              const reference = getScriptReference(next, uncertainties);
-              if (reference) found.push({ reference, source: "shell-command" });
-            }
-          } else {
-            const attached = optionValue(token.value);
-            if (attached && hasScriptExtension(attached)) {
-              const reference = getScriptReference({ value: attached, dynamic: token.dynamic }, uncertainties);
-              if (reference) found.push({ reference, source: "shell-command" });
-            }
-          }
-        }
       }
       continue;
     }

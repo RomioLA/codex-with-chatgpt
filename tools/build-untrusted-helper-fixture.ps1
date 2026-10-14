@@ -39,22 +39,46 @@ if ($null -ne $compiler) {
     exit $LASTEXITCODE
 }
 
+$programFilesX86 = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::ProgramFilesX86)
+if ([string]::IsNullOrWhiteSpace($programFilesX86)) {
+    $programFilesX86 = 'C:\Program Files (x86)'
+}
+Set-Item -Path 'Env:ProgramFiles(x86)' -Value $programFilesX86
+if ([string]::IsNullOrWhiteSpace($env:ComSpec)) {
+    $env:ComSpec = Join-Path $env:SystemRoot 'System32\cmd.exe'
+}
+
 $vswhereCandidates = @(
     (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'),
     (Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe')
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }
-if ($vswhereCandidates.Count -eq 0) {
-    [Console]::Error.WriteLine('MSVC cl.exe was not found in PATH, and vswhere.exe is unavailable.')
-    exit 1
-}
-
-$installationOutput = & ($vswhereCandidates | Select-Object -First 1) -latest -products '*' `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($installationOutput | Select-Object -First 1))) {
-    [Console]::Error.WriteLine('No Visual Studio installation with the MSVC x86/x64 tools was found.')
-    exit 1
+$installationOutput = @()
+if ($vswhereCandidates.Count -gt 0) {
+    $installationOutput = & ($vswhereCandidates | Select-Object -First 1) -latest -products '*' `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 }
 $installationPath = $installationOutput | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($installationPath)) {
+    $visualStudioRoots = @(
+        (Join-Path $programFilesX86 'Microsoft Visual Studio\2022\BuildTools'),
+        (Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\BuildTools')
+    )
+    foreach ($root in $visualStudioRoots) {
+        $msvcRoot = Join-Path $root 'VC\Tools\MSVC'
+        $devCommand = Join-Path $root 'Common7\Tools\VsDevCmd.bat'
+        $hasCompiler = Get-ChildItem -LiteralPath $msvcRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'bin\Hostx64\x64\cl.exe') -PathType Leaf } |
+            Select-Object -First 1
+        if ($hasCompiler -and (Test-Path -LiteralPath $devCommand -PathType Leaf)) {
+            $installationPath = $root
+            break
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($installationPath)) {
+    [Console]::Error.WriteLine('No usable MSVC x86/x64 compiler and Visual Studio developer environment were found.')
+    exit 1
+}
 $devCommand = Join-Path $installationPath 'Common7\Tools\VsDevCmd.bat'
 if (-not (Test-Path -LiteralPath $devCommand -PathType Leaf)) {
     [Console]::Error.WriteLine("VsDevCmd.bat was not found: $devCommand")

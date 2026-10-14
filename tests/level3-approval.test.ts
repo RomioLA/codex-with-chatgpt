@@ -192,6 +192,218 @@ describe("Level 3 one-time local approval", () => {
     cleanup(f.root);
   });
 
+  it("rejects a pre-binding approval record when the current binder finds unresolved execution semantics", () => {
+    const f = fixture("stale-entry-binding");
+    enabled(f);
+    const shell = write(f.root, "tools/pwsh.exe", "isolated PowerShell executable fixture\n");
+    write(f.repo, "entry.ts", "isolated unsupported execution target fixture\n");
+    const pending = createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "powershell",
+      repositoryPath: "repo",
+      executable: shell,
+      command: "& .\\entry.ts",
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    });
+
+    const stateFile = path.join(process.env.C2C_STATE_DIR!, "execution", "level3", f.workspace.id, "state.json");
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+      requests: Array<{ requestId: string; spec: { entryBinding?: unknown } }>;
+    };
+    const stored = state.requests.find((record) => record.requestId === pending.requestId)!;
+    // Simulate a pending record written before this binder learned to report
+    // the existing unsupported PowerShell target as unresolved.
+    stored.spec.entryBinding = { kind: "literal_entries", uncertainties: [] };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+
+    expect(() => approveLevel3Request(f.workspace, pending.requestId, pending.digest, true, { risk: "development" })).toThrowError(
+      expect.objectContaining({ code: "LEVEL3_MATERIAL_CHANGED" }),
+    );
+    cleanup(f.root);
+  });
+
+  it("rejects a pre-binding Start-Process approval record when the current binder discovers its executable material", () => {
+    const f = fixture("stale-start-process-binding");
+    enabled(f);
+    const shell = write(f.root, "tools/pwsh.exe", "isolated PowerShell executable fixture\n");
+    write(f.repo, "entry.exe", "isolated Start-Process target fixture\n");
+    const pending = createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "powershell",
+      repositoryPath: "repo",
+      executable: shell,
+      command: "Start-Process -FilePath .\\entry.exe",
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    });
+
+    const stateFile = path.join(process.env.C2C_STATE_DIR!, "execution", "level3", f.workspace.id, "state.json");
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+      requests: Array<{
+        requestId: string;
+        spec: { materials: string[]; entryBinding?: unknown };
+        snapshot: { materials: unknown[] };
+      }>;
+    };
+    const stored = state.requests.find((record) => record.requestId === pending.requestId)!;
+    // Simulate a pre-binding record: it had neither a material nor its hash in
+    // the approved snapshot, even though the current binder now finds the exe.
+    stored.spec.materials = [];
+    stored.snapshot.materials = [];
+    stored.spec.entryBinding = { kind: "literal_entries", uncertainties: [] };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+
+    expect(() => approveLevel3Request(f.workspace, pending.requestId, pending.digest, true, { risk: "development" })).toThrowError(
+      expect.objectContaining({ code: "LEVEL3_MATERIAL_CHANGED" }),
+    );
+    cleanup(f.root);
+  });
+
+  it.each([
+    "./entry.exe",
+    "call ./entry.exe",
+    'start "" "./entry.exe"',
+  ])("rejects a pre-binding CMD approval record after discovering its executable material: %s", (command) => {
+    const f = fixture("stale-cmd-entry-binding");
+    enabled(f);
+    const shell = write(f.root, "tools/cmd.exe", "isolated CMD executable fixture\n");
+    write(f.repo, "entry.exe", "isolated CMD target fixture\n");
+    const pending = createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "cmd",
+      repositoryPath: "repo",
+      executable: shell,
+      command,
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    });
+
+    const stateFile = path.join(process.env.C2C_STATE_DIR!, "execution", "level3", f.workspace.id, "state.json");
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+      requests: Array<{
+        requestId: string;
+        spec: { materials: string[]; entryBinding?: unknown };
+        snapshot: { materials: unknown[] };
+      }>;
+    };
+    const stored = state.requests.find((record) => record.requestId === pending.requestId)!;
+    stored.spec.materials = [];
+    stored.snapshot.materials = [];
+    stored.spec.entryBinding = { kind: "literal_entries", uncertainties: [] };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+
+    expect(() => approveLevel3Request(f.workspace, pending.requestId, pending.digest, true, { risk: "development" })).toThrowError(
+      expect.objectContaining({ code: "LEVEL3_MATERIAL_CHANGED" }),
+    );
+    cleanup(f.root);
+  });
+
+  it.each([
+    "C:/Windows/System32/whoami.exe",
+    "call C:/Windows/System32/whoami.exe",
+    "start C:/Windows/System32/whoami.exe",
+  ])("rejects an explicit CMD target outside the repository before approval: %s", (command) => {
+    const f = fixture("external-cmd-target");
+    enabled(f);
+    const shell = write(f.root, "tools/cmd.exe", "isolated CMD executable fixture\n");
+
+    expect(() => createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "cmd",
+      repositoryPath: "repo",
+      executable: shell,
+      command,
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    })).toThrowError(expect.objectContaining({ code: "LEVEL3_MATERIAL_CHANGED" }));
+    expect(listLevel3Requests(f.workspace.id)).toHaveLength(0);
+    cleanup(f.root);
+  });
+
+  it.each([
+    "./missing.exe",
+    "call ./missing.exe",
+    'start "" "./missing.exe"',
+  ])("rejects a missing explicit CMD target before approval: %s", (command) => {
+    const f = fixture("missing-cmd-target");
+    enabled(f);
+    const shell = write(f.root, "tools/cmd.exe", "isolated CMD executable fixture\n");
+
+    expect(() => createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "cmd",
+      repositoryPath: "repo",
+      executable: shell,
+      command,
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    })).toThrowError(expect.objectContaining({ code: "LEVEL3_MATERIAL_CHANGED" }));
+    expect(listLevel3Requests(f.workspace.id)).toHaveLength(0);
+    cleanup(f.root);
+  });
+
+  it("keeps unresolved Start-Process targets behind the existing dynamic-code approval", () => {
+    const f = fixture("start-process-dynamic-approval");
+    enabled(f);
+    const shell = write(f.root, "tools/pwsh.exe", "isolated PowerShell executable fixture\n");
+    const pending = createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "powershell",
+      repositoryPath: "repo",
+      executable: shell,
+      command: "Start-Process notepad.exe",
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    });
+    expect(getLevel3Request(f.workspace.id, pending.requestId)?.spec.entryBinding?.kind).toBe("dynamic_code");
+    expect(() => approveLevel3Request(f.workspace, pending.requestId, pending.digest, true, { risk: "development" })).toThrowError(
+      expect.objectContaining({ code: "LEVEL3_RISK_APPROVAL_REQUIRED" }),
+    );
+    expect(approveLevel3Request(f.workspace, pending.requestId, pending.digest, true, {
+      risk: "development",
+      allowDynamic: true,
+    }).status).toBe("approved");
+    cleanup(f.root);
+  });
+
+  it.each([".cmd", ".exe"])("rejects a missing explicit PowerShell %s target before creating an approval request", (extension) => {
+    const f = fixture(`missing-powershell-target-${extension.slice(1)}`);
+    enabled(f);
+    const shell = write(f.root, "tools/pwsh.exe", "isolated PowerShell executable fixture\n");
+    expect(() => createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "powershell",
+      repositoryPath: "repo",
+      executable: shell,
+      command: `& .\\missing${extension}`,
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    })).toThrowError(expect.objectContaining({ code: "LEVEL3_MATERIAL_CHANGED" }));
+    expect(listLevel3Requests(f.workspace.id)).toHaveLength(0);
+    cleanup(f.root);
+  });
+
+  it.each([
+    "Start-Process -FilePath .\\missing.exe",
+    "Start-Process .\\missing.exe",
+  ])("rejects a missing Start-Process target before creating an approval request: %s", (command) => {
+    const f = fixture("missing-start-process");
+    enabled(f);
+    const shell = write(f.root, "tools/pwsh.exe", "isolated PowerShell executable fixture\n");
+    expect(() => createLevel3Request(f.workspace, CLIENT_ID, {
+      engine: "powershell",
+      repositoryPath: "repo",
+      executable: shell,
+      command,
+      cwd: "repo",
+      timeoutSeconds: 30,
+      materials: [],
+    })).toThrowError(expect.objectContaining({ code: "LEVEL3_MATERIAL_CHANGED" }));
+    expect(listLevel3Requests(f.workspace.id)).toHaveLength(0);
+    cleanup(f.root);
+  });
+
   it("rejects changed material and only revokes when called through local approval", () => {
     const f = fixture("material-revoke");
     enabled(f);

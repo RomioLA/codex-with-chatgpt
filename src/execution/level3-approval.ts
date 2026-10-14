@@ -510,6 +510,7 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
   let totalMaterialBytes = 0;
   const entries = bindLevel3ScriptEntries({ engine: raw.engine, workspaceRoot: workspace.root, cwd: cwd.path,
     executable: executableMaterial.path, args, command });
+  if (entries.uncertainties.includes("unverified-execution-target")) fail("LEVEL3_MATERIAL_CHANGED");
   const allMaterials = [...new Set([...raw.materials, ...entries.materials])];
   if (allMaterials.length > MAX_LEVEL3_MATERIALS) fail("INVALID_ARGUMENTS");
   for (const materialInput of allMaterials) {
@@ -677,6 +678,11 @@ function currentSnapshot(workspace: Workspace, record: Level3RequestRecord): Lev
   const current = canonicalizeSpec(workspace, record.spec);
   if (current.repositoryIdentity !== record.repositoryIdentity || current.repositoryPath !== record.repositoryPath) {
     fail("LEVEL3_REPOSITORY_CHANGED");
+  }
+  if (JSON.stringify(current.spec.entryBinding ?? null) !== JSON.stringify(record.spec.entryBinding ?? null)) {
+    // A pending request created by an older binder must not keep a literal
+    // approval status when the current binder discovers unresolved semantics.
+    fail("LEVEL3_MATERIAL_CHANGED");
   }
   if (JSON.stringify(current.snapshot) !== JSON.stringify(record.snapshot)) fail("LEVEL3_MATERIAL_CHANGED");
   return current.snapshot;

@@ -20,6 +20,7 @@ function context(overrides: Partial<ScriptEntryBindingInput> = {}): ScriptEntryB
 
 function writeFixtureFile(input: ScriptEntryBindingInput, name: string): void {
   const file = path.join(input.cwd, name);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, "isolated script binding fixture\n");
 }
 
@@ -49,6 +50,159 @@ describe("Level 3 script entry binding", () => {
       source: "shell-command",
     });
     expect(result.hasUnresolvedSemantics).toBe(false);
+  });
+
+  it("binds an existing PowerShell CMD entry while flagging missing or unsupported targets", () => {
+    const cmdInput = context({ command: "& ./assets/c2c-autostart-task.cmd" });
+    writeFixtureFile(cmdInput, "assets/c2c-autostart-task.cmd");
+    const cmdResult = bindLevel3ScriptEntries(cmdInput);
+    expect(cmdResult.materials).toEqual(["repo/tools/assets/c2c-autostart-task.cmd"]);
+    expect(cmdResult.hasUnresolvedSemantics).toBe(false);
+
+    const missingExe = bindLevel3ScriptEntries(context({ command: "& ./build/native/example.exe" }));
+    expect(missingExe.materials).toEqual([]);
+    expect(missingExe.hasUnresolvedSemantics).toBe(true);
+    expect(missingExe.uncertainties).toContain("unverified-execution-target");
+
+    const tsInput = context({ command: "& ./src/execution/git-commit-entry.ts" });
+    writeFixtureFile(tsInput, "src/execution/git-commit-entry.ts");
+    const tsResult = bindLevel3ScriptEntries(tsInput);
+    expect(tsResult.materials).toEqual(["repo/tools/src/execution/git-commit-entry.ts"]);
+    expect(tsResult.hasUnresolvedSemantics).toBe(true);
+    expect(tsResult.uncertainties).toContain("unsupported-execution-target");
+  });
+
+  it.each([".ps1", ".cmd", ".bat", ".exe", ".com"])(
+    "binds an existing explicit PowerShell & target with %s",
+    (extension) => {
+      const input = context({ command: `& ./tools/entry${extension}` });
+      writeFixtureFile(input, `tools/entry${extension}`);
+      const result = bindLevel3ScriptEntries(input);
+
+      expect(result.materials).toEqual([`repo/tools/tools/entry${extension}`]);
+      expect(result.hasUnresolvedSemantics).toBe(false);
+    },
+  );
+
+  it("binds explicit PowerShell paths in direct command position", () => {
+    const input = context({ command: "./tools/entry.exe" });
+    writeFixtureFile(input, "tools/entry.exe");
+    const result = bindLevel3ScriptEntries(input);
+
+    expect(result.materials).toEqual(["repo/tools/tools/entry.exe"]);
+    expect(result.hasUnresolvedSemantics).toBe(false);
+  });
+
+  it.each([
+    "Start-Process -FilePath ./tools/entry.exe -Wait",
+    "Start-Process -FilePath=./tools/entry.exe -Wait",
+    "Start-Process ./tools/entry.exe -Wait",
+    "Start-Process -WorkingDirectory ./tools -FilePath ./tools/entry.com -Wait",
+  ])("binds the Start-Process target from %s", (command) => {
+    const extension = command.includes("entry.com") ? ".com" : ".exe";
+    const input = context({ command });
+    writeFixtureFile(input, `tools/entry${extension}`);
+    const result = bindLevel3ScriptEntries(input);
+
+    expect(result.materials).toEqual([`repo/tools/tools/entry${extension}`]);
+    expect(result.hasUnresolvedSemantics).toBe(false);
+  });
+
+  it.each([
+    { engine: "cmd", command: "./tools/direct.exe", file: "tools/direct.exe" },
+    { engine: "cmd", command: "call ./tools/call.com", file: "tools/call.com" },
+    { engine: "cmd", command: 'start ./tools/start.exe', file: "tools/start.exe" },
+    { engine: "cmd", command: 'start "Window title" /wait "./tools/start-title.exe"', file: "tools/start-title.exe" },
+    { engine: "powershell", command: "& ./tools/call-operator.exe", file: "tools/call-operator.exe" },
+    { engine: "powershell", command: "./tools/direct.exe", file: "tools/direct.exe" },
+    { engine: "powershell", command: ". ./tools/dot.ps1", file: "tools/dot.ps1" },
+    { engine: "powershell", command: "Start-Process -FilePath ./tools/start-process.exe", file: "tools/start-process.exe" },
+    { engine: "powershell", command: "Start-Process ./tools/start-position.com", file: "tools/start-position.com" },
+    { engine: "program", command: undefined, executable: "C:\\Tools\\node.exe", args: ["./tools/program-entry.js"], file: "tools/program-entry.js" },
+  ] as const)("binds the explicit entry in the $engine matrix: $command", ({ engine, command, executable, args, file }) => {
+    const input = context({ engine, command, executable, args });
+    writeFixtureFile(input, file);
+    const result = bindLevel3ScriptEntries(input);
+
+    expect(result.materials).toEqual([`repo/tools/${file}`]);
+    expect(result.hasUnresolvedSemantics).toBe(false);
+  });
+
+  it.each([
+    "C:/Windows/System32/whoami.exe",
+    "call C:/Windows/System32/whoami.exe",
+    "start C:/Windows/System32/whoami.exe",
+  ])("fails closed for an explicit CMD target outside the repository: %s", (command) => {
+    const result = bindLevel3ScriptEntries(context({ engine: "cmd", command }));
+
+    expect(result.materials).toEqual([]);
+    expect(result.hasUnresolvedSemantics).toBe(true);
+    expect(result.uncertainties).toContain("unverified-execution-target");
+  });
+
+  it("does not treat a non-interpreter CMD argument as another execution material", () => {
+    const input = context({ engine: "cmd", command: "call ./tools/entry.exe ./data/ordinary.ps1" });
+    writeFixtureFile(input, "tools/entry.exe");
+    writeFixtureFile(input, "data/ordinary.ps1");
+    const result = bindLevel3ScriptEntries(input);
+
+    expect(result.materials).toEqual(["repo/tools/tools/entry.exe"]);
+    expect(result.hasUnresolvedSemantics).toBe(false);
+  });
+
+  it.each([
+    "Start-Process -FilePath ./build/native/example.exe",
+    "Start-Process ./build/native/example.exe",
+  ])("marks a missing Start-Process target unresolved in %s", (command) => {
+    const result = bindLevel3ScriptEntries(context({ command }));
+
+    expect(result.materials).toEqual([]);
+    expect(result.hasUnresolvedSemantics).toBe(true);
+    expect(result.uncertainties).toContain("unverified-execution-target");
+  });
+
+  it.each([
+    ["Start-Process notepad.exe", "ambiguous-command-search"],
+    ["Start-Process -FilePath $env:TOOL", "computed-path"],
+    ["Start-Process -FilePath ./tools/*.exe", "computed-path"],
+    ["Start-Process -FilePath", "unverified-execution-target"],
+  ] as const)("fails closed for unresolved Start-Process target %s", (command, uncertainty) => {
+    const result = bindLevel3ScriptEntries(context({ command }));
+
+    expect(result.hasUnresolvedSemantics).toBe(true);
+    expect(result.uncertainties).toContain(uncertainty);
+  });
+
+  it("keeps non-interpreter Start-Process arguments out of the execution material set", () => {
+    const input = context({ command: "Start-Process -FilePath ./tools/entry.exe -ArgumentList ./data/ordinary.ps1" });
+    writeFixtureFile(input, "tools/entry.exe");
+    writeFixtureFile(input, "data/ordinary.ps1");
+    const result = bindLevel3ScriptEntries(input);
+
+    expect(result.materials).toEqual(["repo/tools/tools/entry.exe"]);
+    expect(result.hasUnresolvedSemantics).toBe(false);
+  });
+
+  it.each([
+    "& ./python.exe ./src/main.py",
+    "Start-Process -FilePath ./python.exe -ArgumentList ./src/main.py",
+    "Start-Process ./python.exe ./src/main.py",
+  ])("binds an interpreter script argument for %s", (command) => {
+    const input = context({ command });
+    writeFixtureFile(input, "python.exe");
+    writeFixtureFile(input, "src/main.py");
+    const result = bindLevel3ScriptEntries(input);
+
+    expect(result.materials).toEqual(["repo/tools/python.exe", "repo/tools/src/main.py"]);
+    expect(result.hasUnresolvedSemantics).toBe(false);
+  });
+
+  it.each(["entry.ts", "& entry.ts"])("does not assume bare PowerShell command %s is statically resolved", (command) => {
+    const result = bindLevel3ScriptEntries(context({ command }));
+
+    expect(result.entries).toEqual([]);
+    expect(result.hasUnresolvedSemantics).toBe(true);
+    expect(result.uncertainties).toContain("ambiguous-command-search");
   });
 
   it("binds cmd call scripts and Python/Node file arguments in chained commands", () => {
