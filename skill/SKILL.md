@@ -1,22 +1,22 @@
 ---
 name: codex-with-chatgpt
 description: >
-  Use ChatGPT (web) for planning, review, and locally permissioned file changes
-  during Codex coding sessions; Codex keeps command and test execution. Use when the user says
-  "使用 Codex with ChatGPT ..." / "Set up Codex with ChatGPT" / "用 ChatGPT 规划",
-  when they ask to connect ChatGPT to the current workspace, disconnect it,
+  Legacy Codex-with-ChatGPT planning/orchestration workflow. Use only when the user explicitly asks
+  for the old Codex with ChatGPT workflow, such as "使用 Codex with ChatGPT ..." / "Set up Codex with ChatGPT" /
+  "用 ChatGPT 规划", or explicitly asks to connect/disconnect that legacy workflow,
   or run a task through the ChatGPT planning loop.
 ---
 
-# Codex with ChatGPT
+# Codex with ChatGPT — Legacy Workflow
 
-ChatGPT thinks. Codex works.
+This Skill documents a legacy Codex-with-ChatGPT planning/orchestration workflow. Use it only when the user
+explicitly requests that workflow. It is not the authority for ordinary C2C Local V1.3 tool selection or
+capabilities. For ordinary local Workspace, source, Git, Host Observation, process/network inspection, or
+controlled execution tasks, follow `skills/c2c-local/SKILL.md` and prefer C2C Local.
 
-You (Codex) own shell, git, build, test, and recovery execution. ChatGPT owns
-high-level reasoning and may change files through C2C when OAuth scopes and the
-user's local permission mode allow it. The Bridge also gives ChatGPT read access
-to the current workspace, so control messages stay tiny (< 1 KB) and ChatGPT
-pulls the content it needs itself.
+When explicitly selected, the legacy workflow coordinates ChatGPT planning/review with a Codex coding session.
+Its historical division of work and browser procedures apply only inside that requested workflow and must not
+be read as current C2C Local V1.3 capability or tool-routing rules.
 
 **Golden rules**
 
@@ -107,14 +107,19 @@ pulls the content it needs itself.
   current content hash.
 - OAuth scopes are an independent gate. A local mode change does not add token
   scopes. If a scope is missing, explain that the connector needs the required
-  authorization; do not treat a local mode change as a substitute.
+  authorization; do not treat a local mode change as a substitute. Current C2C Local V1.3
+  OAuth and local policy behavior is defined by `skills/c2c-local/SKILL.md`.
 - ChatGPT cannot change the local permission mode. Never run the permission
   elevation command on the user's behalf. If the user chooses to change it,
   give the local command: `c2c permission readonly|1|2|status -w <workspace>`.
 - External deletion is unavailable at every level. Moves stay inside the
-  workspace, and directory creation is currently workspace-only. C2C provides
-  no shell or command-execution tool; Codex remains responsible for commands,
-  builds, and tests.
+  workspace, and directory creation is currently workspace-only. The following
+  historical baseline statement — “C2C provides no shell or command-execution
+  tool; Codex remains responsible for commands, builds, and tests” — does not
+  describe V1.3. Current C2C Local provides bounded execution jobs, structured
+  Git Write, and individually approved Level 3 requests under separate local
+  policies; see `skills/c2c-local/SKILL.md`. This legacy workflow does not
+  override those current capabilities or their tool-selection rules.
 
 ## In-app browser (ChatGPT)
 

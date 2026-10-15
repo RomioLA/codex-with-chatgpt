@@ -3,6 +3,67 @@
 此参考说明指定最终源码的实际命令与副作用。它不授权额外部署、重启、Host Run 修改、
 权限提升、配对或浏览器操作；执行已获用户授权的步骤即可。
 
+## 受控 Git 与 execution
+
+`execution_start` 不接受任意 command、shell、executable、cwd、环境变量或自由参数；它只运行
+本机 trusted-command registry 中已批准的固定 package script recipe。对应的 repository、recipe kind
+或 target 未获本机批准时，`COMMAND_NOT_APPROVED` 表示 `execution.run` 请求已经到达 C2C，
+但匹配的 trusted-command approval 不存在。不要建议通过 Level 3 或 Remote 绕过。
+
+`execution_status`、`execution_list`、`execution_job_output` 和 `execution_cancel` 分别用于 job
+状态、列表、清理后的输出及取消；它们受各自 OAuth scope、job ownership 和本机 execution 状态约束。
+
+Git Write 默认没有 repository policy。MCP/ChatGPT 不能创建或批准 Git policy。由本机用户/操作员准备
+JSON policy 后，先运行不带 `--approve` 的 preview 并检查返回的 digest：
+
+```powershell
+c2c git-write approve -w <workspace> --repository <workspace-relative-path> --policy <local-json-policy>
+```
+
+核对真实 repository/worktree、Git bundle、允许的 operations、branches、remotes、author 等预览内容后，
+使用同一 policy 显式批准：
+
+```powershell
+c2c git-write approve -w <workspace> --repository <workspace-relative-path> --policy <local-json-policy> --approve --digest <preview-digest>
+```
+
+后续 `git_write` 仍受 repository policy、`expectedHead`、`expectedBranch`、status 和允许操作范围约束。
+`NOT_APPROVED` 表示 OAuth/tool routing 已到达 C2C，但本机 repository Git policy 未批准；它不是 OAuth
+失败，也不是 MCP 网络故障。
+
+Level 3 默认关闭。`LEVEL3_DISABLED` 表示 `execution.level3` 请求已经到达 C2C，但本机 Level 3 capability
+当前关闭；它不是 OAuth scope 不足、MCP 网络错误或 ChatGPT 安全层拦截。只有本机用户明确选择开启后，
+本机才执行：
+
+```powershell
+c2c level3 enable -w <workspace> --approve --json
+```
+
+ChatGPT/MCP 不得自行执行该 enable 来给自己提权。enable 只允许创建 Level 3 pending request，不会执行
+命令。每项 request 仍须由本机操作者 inspect、核对精确 command digest、按风险分类并 approve；之后 MCP
+方可调用 `level3_start`。Level 3 不等于永久或 unrestricted shell。
+
+## 故障分类
+
+先根据错误判断请求到达了哪一层；不要将这些信号一概处理成 OAuth reconnect。
+
+| 信号 | 含义与处理 |
+|---|---|
+| `INSUFFICIENT_SCOPE` | OAuth token 缺少该工具要求的 scope。检查实际 token authority；正式 ChatGPT 重新授权可展示当前完整 `SUPPORTED_SCOPES`，其他 client 仍是精确 requested-scope。旧 grant 不会靠 refresh 增加 scope。 |
+| `LOCAL_PERMISSION_DENIED` | 请求已到 C2C，但本机 `readonly/level1/level2` 文件 permission mode 拒绝该文件操作。与 OAuth scope 独立。 |
+| `NOT_APPROVED` | Git Write 请求已到 C2C，但该 repository/worktree 没有匹配的本机 Git policy approval。不是 OAuth 或 transport 错误。 |
+| `COMMAND_NOT_APPROVED` | bounded execution 请求已到 C2C，但本机 trusted-command registry 中没有匹配 repository/kind/target recipe。不要用 Level 3 或 Remote 绕开。 |
+| `LEVEL3_DISABLED` | `execution.level3` 请求已到 C2C，但本机 Level 3 未开启。只有本机用户可以显式 enable。 |
+| Level 3 request pending / not approved | 精确命令仍在等待本机 inspect、digest 核对、风险分类与 approve；尚未获准运行。 |
+| ChatGPT platform/tool invocation rejection | 请求未到达 C2C。检查平台侧 connector/tool invocation 状态；不要将其归类为上表中的 C2C policy 错误。 |
+| MCP `-32603` / network / connector unavailable | transport/runtime 类故障。先判断 Bridge、Tunnel、connector 可用性和请求是否到达；只有 C2C 本身不可用时才考虑独立恢复通道。 |
+
+正式 ChatGPT OAuth 授权的 scope 扩展只适用于已注册 `clientName === "ChatGPT"` 且 redirect hostname 为
+`chatgpt.com` 的请求，并在签发 authorization code 前展示 `SUPPORTED_SCOPES`。其他 client 不自动扩权。
+旧 token/refresh grant 不会自动获得新 scope；使用实际工具调用结果判定当前权限，不因一个工具失败循环
+触发 reconnect。OAuth scope 与本机 workspace permission、Git policy、trusted-command registry、Level 3
+审批是独立门槛。
+
 ## 本机命令
 
 CLI 来自当前真实 checkout 的 `bin/c2c.js`。在该部署中是
@@ -55,8 +116,14 @@ on-request 与 auto_review 部署约束保持独立。
 |---|---|
 | `workspace_info` 根路径/ID 与目标不符 | 停止该 connector 的操作；选择对应 workspace 的 connector，并重新读取 identity/permission；不统一 workspace=codex |
 | 本机 CLI 与 MCP 的 workspaceId/mode 不一致 | 先核对 Windows 用户、有效 state root、显式 `-w`、connector identity；不要提升权限、删除权限文件或重启来掩盖错误 |
-| `LOCAL_PERMISSION_DENIED` | 回读 permission_status，解释本机模式限制；仅在用户明确选择后由本机改变模式；不能远程提权 |
-| `INSUFFICIENT_SCOPE` | 检查实际 token 的授权范围；本机 level1/2 不补 scope；确需新增 scope 时走用户明确同意的授权流程，不自行反复 pair |
+| `LOCAL_PERMISSION_DENIED` | 回读 permission_status，解释本机文件模式限制；仅在用户明确选择后由本机改变模式；不能远程提权 |
+| `INSUFFICIENT_SCOPE` | OAuth scope 门槛拒绝；检查当前 token authority。不要将其与本机 policy 拒绝混淆，也不要因单次失败循环 reconnect |
+| `NOT_APPROVED` | Git 请求已到达 C2C，但本机 repository policy 未批准；按上方 preview/digest 流程由本机操作员处理 |
+| `COMMAND_NOT_APPROVED` | execution 请求已到达 C2C，但 trusted-command recipe 未批准；不得通过 Level 3 或 Remote 绕过 |
+| `LEVEL3_DISABLED` | Level 3 请求已到达 C2C，但本机 capability 关闭；仅本机用户可显式开启 |
+| Level 3 pending / not approved | 等待本机逐条 inspect、核对精确 digest、风险分类与 approve；此时命令尚未获准启动 |
+| ChatGPT platform/tool invocation rejection | 请求尚未到达 C2C；按平台/connector 调用状态排查，不归因于 C2C policy |
+| MCP `-32603` / network / connector unavailable | transport/runtime 故障；与 OAuth scope、本机文件模式或专用 policy 错误分开定位 |
 | `STALE_FILE` / `AMBIGUOUS_EDIT` / 目标已存在 | 重读内容和完整 hash，重新评估修改或明确匹配范围；不取消 hash 校验、不覆盖用户新内容 |
 | `AUDIT_FAILED` 且 `details.operationApplied=true` | 文件操作已执行，但审计写入失败；先回读目标/源的实际状态并报告，不因错误响应自动重做修改、移动或删除 |
 | 越界、敏感文件、external delete/move | 尊重源码拒绝；不改 override、借 shell 或另一个 connector 绕过限制 |

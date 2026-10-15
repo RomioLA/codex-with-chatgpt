@@ -1,18 +1,24 @@
 ---
 name: c2c-local
 description: >
-  使用 RomioLA C2C Local 连接本机 workspace、通过 MCP 读写文件，或排查其权限、
-  Windows 登录自启、Named Tunnel 恢复或 Host Observation 主机诊断。适用于明确提到 C2C Local、
-  OpenAI\c2c-local 状态目录、readonly/level1/level2 本机权限模型，或 system.read 的任务。
-  旧 Codex with ChatGPT 规划循环属于另一个 Skill；普通源码任务本身不要求启动 C2C。
+  将 RomioLA C2C Local 作为普通本机 Workspace 开发、调查、Git、受控执行和运维任务的默认工具，
+  包括文件读写、Host Observation、进程与网络查询，以及权限或 Windows 登录自启诊断。
+  仅在 C2C 不可用、明确需要 Windows GUI/UAC、灾难恢复，或当前能力无法完成任务时考虑 Remote Desktop Commander。
 ---
 
 # C2C Local
 
-本 Skill 描述 C2C Local 的实际文件能力及本机运维流程。ChatGPT 可在 OAuth scope、
-本机权限和用户任务授权共同允许时，通过 MCP 读取、创建、编辑、替换或移动文件。
-Codex/本机用户负责 CLI、shell、Git、构建、测试和恢复操作；MCP 没有这些执行工具。
-本机权限是能力上限，不是对任意文件操作的任务授权。
+本 Skill 描述 C2C Local V1.3 的实际能力与本机运维流程。对于本机 Workspace 文件、源码、Git、
+进程、网络、Host Observation 和受控执行任务，默认优先使用 C2C Local。
+
+只有 C2C Bridge/Tunnel/connector 本身不可用而需要恢复 C2C、任务明确需要 Windows GUI 或 UAC/elevation、
+灾难恢复，或 C2C 已确认不提供所需能力时，才使用 Remote Desktop Commander。不得仅因方便、历史习惯
+或旧 Skill 文案而优先使用 Remote。GUI/UAC 目前仍不是 C2C 的目标能力；C2C 自身停止时，不能依靠
+已经停止的 C2C 自救，此时独立 Remote 通道可作为恢复观察/操作通道。
+
+ChatGPT 可在 OAuth scope、本机专用策略、workspace 文件权限模式和用户任务授权共同允许时，通过 MCP
+使用文件、Git Write、bounded execution 和 Level 3 request/start 能力。本机权限是能力上限，不是对
+任意操作的任务授权。C2C 不提供任意无审批 shell 或远程权限提升。
 
 ## V1 baseline 与当前 authority
 
@@ -22,11 +28,11 @@ Codex/本机用户负责 CLI、shell、Git、构建、测试和恢复操作；MC
 checkout、生产部署或运行状态。该版本的登录链路与验收记录只描述该 baseline。
 当前任务以实际源码版本和结构化结果为准，不凭旧聊天或 baseline 推断 HEAD。
 
-旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 描述另一个工作流，不是本 Skill 的
-authority。不要继承它的“统一 workspace=codex”、复杂任务必须使用旧 C2C，或
-“C2C 只用于读取、分析和复核”规则。不要把两套规则合并。
-明确的 C2C Local 任务只走本 Skill；不运行旧 `[C2C]` 规划循环、日常自动更新或
-旧浏览器连接修复流程。单纯查看/改文件不需要 GUI、重新配对或重启服务。
+旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 与 [legacy Codex-with-ChatGPT workflow](../../skill/SKILL.md)
+描述显式调用的旧规划/编排流程，不是普通 C2C Local 工具选择或权限规则的 authority。
+不要继承它的“统一 workspace=codex”或“C2C 只用于读取、分析和复核”规则，也不要把两套规则合并。
+只有用户明确要求旧 Codex with ChatGPT workflow 时才使用该 legacy Skill；普通本机任务按本 Skill 选择
+C2C Local。单纯查看/改文件不需要 GUI、重新配对或重启服务。
 
 ## State 与 workspace 身份
 
@@ -102,10 +108,26 @@ checked. Repository paths are matched relative to the repository root, then mapp
 to workspace-relative paths for the connected workspace rules. Either layer denying
 a path hides it; repository negation cannot reopen a workspace-level deny.
 
-新授权默认只有读取 scopes。workspace 修改/移动需要 `workspace.write`，删除需要
-`workspace.delete`，外部读/写分别需要 `filesystem.external.read` / `filesystem.external.write`。
-本机模式和 OAuth scope 两道门槛都必须通过；切换模式不会给已有 token 增加 scope。
-旧读取授权的 refresh 也不会自动得到写权限。
+### 四类独立权限门槛
+
+1. **OAuth scopes** 决定远程 token 是否有资格调用某类 MCP capability。正式 ChatGPT OAuth 请求同时满足
+   已注册 `clientName === "ChatGPT"` 且 redirect hostname 为 `chatgpt.com` 时，授权流程使用当前
+   `SUPPORTED_SCOPES` 完整集合，并在签发 authorization code 前由授权页展示。其他 OAuth client 仍按
+   exact-requested-scope 处理，不会自动扩权。旧 access/refresh grant 不会因为这项规则自动获得新 scope；
+   实际权限以当前工具调用结果和该 token 的 authority 为准。不要因一次工具失败反复触发 reconnect。
+   `INSUFFICIENT_SCOPE` 是 OAuth scope 问题，必须与本机 policy 拒绝区分。
+2. **workspace local permission mode** 为 `readonly`、`level1`、`level2`。`level2` 是文件 permission
+   mode 的最高档，只控制对应文件能力；它不等于 Git Write 授权、execution trusted-command approval
+   或 Level 3 approval。workspace 修改/移动需 `workspace.write`，删除需 `workspace.delete`；外部读/写
+   分别需 `filesystem.external.read` / `filesystem.external.write`，并同时通过本机模式门槛。
+3. **专用本机 policy** 独立控制额外 capability：Git Write 按 repository/worktree 单独批准；bounded
+   execution 按 repository 和固定 package script recipe 进入本机 trusted-command registry。
+4. **Level 3** 默认关闭。只有本机用户先明确执行 `c2c level3 enable -w <workspace> --approve` 才能创建
+   Level 3 pending request。之后每个精确 request 仍需本机 inspect、digest 核对、按 risk 分类和 approve；
+   MCP 才能调用 `level3_start`。开启本身不运行命令，也不授予永久 unrestricted shell。
+
+OAuth scopes 和本机策略是两层独立门槛：scope 获准不代表本机 policy 已批准，本机模式也不能补足 OAuth
+scope。不得通过提高 Level 3 或切换 Remote 绕过 Git/recipe policy 拒绝。
 
 权限变更只能由本机用户明确决定，通过本机 CLI 执行：
 
@@ -137,8 +159,9 @@ node "C:\codex\codex-with-chatgpt\bin\c2c.js" permission 2 -w "完整目标 work
 已授权。远程 ChatGPT 不得借其他 MCP 工具绕过 Host Observation 的 scope 或能力范围。
 
 七个工具逐次要求 OAuth scope `system.read`；它与本机文件权限模式独立，不增加文件修改或
-删除能力。它不属于默认 scope，refresh 不会扩展旧 token。若工具未暴露或 token 缺少 scope，
-如实报告缺口，不自动部署或触发 reOAuth；生产部署与 connector 重新授权需要用户单独授权。
+删除能力。正式 ChatGPT 重新授权链能够包含 `system.read`，不应把它描述为必然需要逐项增量 reOAuth。
+旧 token/refresh grant 不自动获得新 scope；按实际工具调用与当前 token authority 判断。`system.read`
+和 `readonly/level1/level2` 独立，获准读取主机诊断不会增加文件写权限。
 
 使用流程、7 个工具的参数边界和数据处理规则见
 [Host Observation 操作指引](references/host-observation.md)。
