@@ -148,11 +148,10 @@ export function normalizeExportedTaskXml(value: Buffer): Buffer {
     return Buffer.from(value);
   }
   if (!/^\s*<\?xml\b/i.test(text)) return Buffer.from(value);
-  const normalized = text.replace(
-    /^(\s*<\?xml\b[^>]*\bencoding\s*=\s*)(["'])UTF-16\2/i,
-    "$1$2UTF-8$2"
-  );
-  return normalized === text ? Buffer.from(value) : Buffer.from(normalized, "utf8");
+  if (!/^(\s*<\?xml\b[^>]*\bencoding\s*=\s*)(["'])UTF-16\2/i.test(text)) {
+    return Buffer.from(value);
+  }
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]);
 }
 
 function runCommand(command: string, args: string[]): { status: number | null; output: string; error?: Error } {

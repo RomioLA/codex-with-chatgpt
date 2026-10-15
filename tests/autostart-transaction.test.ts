@@ -264,9 +264,10 @@ describe("exported Scheduled Task XML normalization", () => {
     );
 
     const normalized = normalizeExportedTaskXml(raw);
-    expect(normalized.toString("utf8")).toContain('encoding="UTF-8"');
-    expect(normalized.toString("utf8")).toContain("测试任务");
-    expect(normalized.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(false);
+    expect(normalized.subarray(0, 2).equals(Buffer.from([0xff, 0xfe]))).toBe(true);
+    const decoded = normalized.subarray(2).toString("utf16le");
+    expect(decoded).toContain('encoding="UTF-16"');
+    expect(decoded).toContain("测试任务");
   });
 
   it("preserves valid BOM-tagged UTF-16 task XML byte-for-byte", () => {
