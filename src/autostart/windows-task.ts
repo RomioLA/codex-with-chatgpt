@@ -127,6 +127,34 @@ function decodeWindowsOutput(value: Buffer): string {
   catch { return value.toString("utf8"); }
 }
 
+/**
+ * Some Windows schtasks builds emit /Query /XML as UTF-8 bytes while leaving
+ * the XML declaration at encoding="UTF-16". .NET XmlReader correctly rejects
+ * that contradiction. Normalize only this proven BOM-less UTF-8 case so the
+ * validated snapshot can also be used for rollback. Unknown encodings remain
+ * untouched and therefore fail closed in validateTaskXml.
+ */
+export function normalizeExportedTaskXml(value: Buffer): Buffer {
+  if (!value.length) return value;
+  const hasBom = (value[0] === 0xff && value[1] === 0xfe)
+    || (value[0] === 0xfe && value[1] === 0xff)
+    || (value[0] === 0xef && value[1] === 0xbb && value[2] === 0xbf);
+  if (hasBom) return Buffer.from(value);
+
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(value);
+  } catch {
+    return Buffer.from(value);
+  }
+  if (!/^\s*<\?xml\b/i.test(text)) return Buffer.from(value);
+  const normalized = text.replace(
+    /^(\s*<\?xml\b[^>]*\bencoding\s*=\s*)(["'])UTF-16\2/i,
+    "$1$2UTF-8$2"
+  );
+  return normalized === text ? Buffer.from(value) : Buffer.from(normalized, "utf8");
+}
+
 function runCommand(command: string, args: string[]): { status: number | null; output: string; error?: Error } {
   const result = runCommandRaw(command, args);
   return {
@@ -406,7 +434,7 @@ export class WindowsTaskScheduler implements AutostartTaskAdapter {
       throw new WindowsTaskInspectionError("Task Scheduler returned an empty XML definition for the existing task.");
     }
 
-    const xml = Buffer.from(result.stdout);
+    const xml = normalizeExportedTaskXml(result.stdout);
     let tempPath: string;
     try { tempPath = this.temporaryXmlPath(xml); }
     catch (error) {

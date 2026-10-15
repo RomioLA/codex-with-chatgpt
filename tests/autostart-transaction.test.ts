@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AutostartService, taskNameForWorkspace, type AutostartRegistration } from "../src/autostart/registration.js";
-import { buildLogonTaskXml, WindowsAutostartAdapter, WindowsRunKeyAutostart, WindowsTaskScheduler } from "../src/autostart/windows-task.js";
+import { buildLogonTaskXml, normalizeExportedTaskXml, WindowsAutostartAdapter, WindowsRunKeyAutostart, WindowsTaskScheduler } from "../src/autostart/windows-task.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { makeTmpDir } from "./helpers.js";
 
@@ -254,6 +254,31 @@ afterEach(() => {
   xmlValidationStderrNoise = undefined;
   if (previousStateOverride === undefined) delete process.env.C2C_STATE_DIR;
   else process.env.C2C_STATE_DIR = previousStateOverride;
+});
+
+describe("exported Scheduled Task XML normalization", () => {
+  it("normalizes BOM-less UTF-8 bytes whose declaration incorrectly says UTF-16", () => {
+    const raw = Buffer.from(
+      '<?xml version="1.0" encoding="UTF-16"?>\r\r\n<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><Description>测试任务</Description></RegistrationInfo></Task>',
+      "utf8"
+    );
+
+    const normalized = normalizeExportedTaskXml(raw);
+    expect(normalized.toString("utf8")).toContain('encoding="UTF-8"');
+    expect(normalized.toString("utf8")).toContain("测试任务");
+    expect(normalized.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(false);
+  });
+
+  it("preserves valid BOM-tagged UTF-16 task XML byte-for-byte", () => {
+    const text = '<?xml version="1.0" encoding="UTF-16"?><Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task" />';
+    const raw = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]);
+    expect(normalizeExportedTaskXml(raw).equals(raw)).toBe(true);
+  });
+
+  it("leaves unknown or invalid encodings untouched so validation can fail closed", () => {
+    const raw = Buffer.from([0xc3, 0x28, 0x00, 0xff, 0x41]);
+    expect(normalizeExportedTaskXml(raw).equals(raw)).toBe(true);
+  });
 });
 
 describe("autostart transactional registration", () => {
