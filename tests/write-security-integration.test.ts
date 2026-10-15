@@ -256,7 +256,13 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
     const { client } = await session(fileScopes);
     const originalBase = bridge.localBaseUrl();
     const observe = async (mode: string) => {
-      expect(await call(client, "permission_status", {})).toEqual({ workspaceId: bridge.workspace.id, mode });
+      expect(await call(client, "permission_status", {})).toEqual({
+        workspaceId: bridge.workspace.id,
+        mode,
+        baselineMode: mode === "readonly" ? "readonly" : "level1",
+        effectiveMode: mode,
+        sessionElevation: { active: mode === "level2", expiresOn: mode === "level2" ? "logout-or-reboot" : null },
+      });
       const response = await fetch(`${originalBase}/admin/info`, { headers: { authorization: `Bearer ${bridge.adminToken}` } });
       expect(response.status).toBe(200);
       expect((await response.json() as { permissionMode: string }).permissionMode).toBe(mode);

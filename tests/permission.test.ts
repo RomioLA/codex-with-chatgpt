@@ -1,11 +1,19 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const sessionIdentity = vi.hoisted(() => ({ fingerprint: "a".repeat(64) as string | null }));
+vi.mock("../src/permission/session-identity.js", () => ({
+  getCurrentSessionIdentityFingerprint: () => sessionIdentity.fingerprint,
+}));
+
 import {
   checkMovePermission,
   checkPermission,
+  ensurePermissionMigrated,
   readPermission,
+  readPermissionStatus,
   setPermission,
   type MovePermissionCheckInput,
   type PermissionCheckInput,
@@ -26,6 +34,7 @@ beforeEach(() => {
   previousStateDir = process.env.C2C_STATE_DIR;
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-permission-test-"));
   usedWorkspaceIds = new Set();
+  sessionIdentity.fingerprint = "a".repeat(64);
   process.env.C2C_STATE_DIR = stateDir;
 });
 
@@ -56,6 +65,9 @@ describe("permission state", () => {
   it("defaults to readonly when no file exists", () => {
     usedWorkspaceIds.add(WORKSPACE_A);
     expect(readPermission(WORKSPACE_A)).toBe("readonly");
+    expect(readPermissionStatus(WORKSPACE_A)).toMatchObject({
+      baselineMode: "readonly", effectiveMode: "readonly", sessionElevation: { active: false },
+    });
   });
 
   it("persists level1 and reads it back", () => {
@@ -64,10 +76,48 @@ describe("permission state", () => {
     expect(readPermission(WORKSPACE_A)).toBe("level1");
   });
 
-  it("persists level2 and reads it back", () => {
+  it("stores level2 as a current-session grant over a persistent level1 baseline", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    expect(setPermission(WORKSPACE_A, "level2")).toBe("level2");
+    expect(readPermission(WORKSPACE_A)).toBe("level2");
+    expect(readPermissionStatus(WORKSPACE_A)).toEqual({
+      mode: "level2",
+      baselineMode: "level1",
+      effectiveMode: "level2",
+      sessionElevation: { active: true, expiresOn: "logout-or-reboot" },
+    });
+    const persisted = JSON.parse(fs.readFileSync(stateFile(WORKSPACE_A), "utf8")) as Record<string, unknown>;
+    expect(persisted).toMatchObject({ version: 2, workspaceId: WORKSPACE_A, baselineMode: "level1" });
+    expect(persisted).not.toHaveProperty("mode");
+    expect(persisted.sessionGrant).toMatchObject({ identityFingerprint: sessionIdentity.fingerprint });
+  });
+
+  it("persists readonly or level1 and revokes the current Level 2 grant", () => {
     usedWorkspaceIds.add(WORKSPACE_A);
     setPermission(WORKSPACE_A, "level2");
-    expect(readPermission(WORKSPACE_A)).toBe("level2");
+    expect(readPermissionStatus(WORKSPACE_A).sessionElevation.active).toBe(true);
+
+    setPermission(WORKSPACE_A, "readonly");
+    expect(readPermissionStatus(WORKSPACE_A)).toMatchObject({
+      baselineMode: "readonly", effectiveMode: "readonly", sessionElevation: { active: false },
+    });
+    setPermission(WORKSPACE_A, "level2");
+    setPermission(WORKSPACE_A, "level1");
+    expect(readPermissionStatus(WORKSPACE_A)).toMatchObject({
+      baselineMode: "level1", effectiveMode: "level1", sessionElevation: { active: false },
+    });
+  });
+
+  it("does not let a stored session grant elevate a readonly baseline", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    setPermission(WORKSPACE_A, "level2");
+    const file = stateFile(WORKSPACE_A);
+    const persisted = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    persisted.baselineMode = "readonly";
+    fs.writeFileSync(file, JSON.stringify(persisted));
+    expect(readPermissionStatus(WORKSPACE_A)).toMatchObject({
+      baselineMode: "readonly", effectiveMode: "readonly", sessionElevation: { active: false },
+    });
   });
 
   it("isolates permission state by workspace ID", () => {
@@ -79,22 +129,84 @@ describe("permission state", () => {
     expect(readPermission(WORKSPACE_B)).toBe("readonly");
   });
 
-  it("re-reads persisted state instead of keeping an in-memory mode", () => {
+  it("keeps the same-session grant across process-style rereads", () => {
     usedWorkspaceIds.add(WORKSPACE_A);
-    setPermission(WORKSPACE_A, "level1");
-
-    const file = stateFile(WORKSPACE_A);
-    const persisted = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
-    persisted.mode = "level2";
-    fs.writeFileSync(file, JSON.stringify(persisted));
-
+    setPermission(WORKSPACE_A, "level2");
+    // A new Bridge/runtime process resolves the same Windows boot/logon tuple.
     expect(readPermission(WORKSPACE_A)).toBe("level2");
+    expect(readPermissionStatus(WORKSPACE_A).sessionElevation.active).toBe(true);
+  });
+
+  it("drops the grant when boot or logon identity changes", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    setPermission(WORKSPACE_A, "level2");
+    sessionIdentity.fingerprint = "b".repeat(64);
+    expect(readPermissionStatus(WORKSPACE_A)).toEqual({
+      mode: "level1", baselineMode: "level1", effectiveMode: "level1",
+      sessionElevation: { active: false, expiresOn: null },
+    });
+  });
+
+  it("migrates legacy level2 only on local startup/CLI and preserves just this session", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    fs.mkdirSync(path.dirname(stateFile(WORKSPACE_A)), { recursive: true });
+    fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify({
+      version: 1, workspaceId: WORKSPACE_A, mode: "level2", updatedAt: "legacy",
+    }));
+
+    expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level1");
+    expect((JSON.parse(fs.readFileSync(stateFile(WORKSPACE_A), "utf8")) as { version: number }).version).toBe(1);
+
+    expect(ensurePermissionMigrated(WORKSPACE_A)).toMatchObject({
+      baselineMode: "level1", effectiveMode: "level2", sessionElevation: { active: true },
+    });
+    expect((JSON.parse(fs.readFileSync(stateFile(WORKSPACE_A), "utf8")) as { version: number }).version).toBe(2);
+
+    sessionIdentity.fingerprint = "b".repeat(64);
+    expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level1");
+  });
+
+  it("keeps readonly legacy state readonly during migration", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    fs.mkdirSync(path.dirname(stateFile(WORKSPACE_A)), { recursive: true });
+    fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify({
+      version: 1, workspaceId: WORKSPACE_A, mode: "readonly", updatedAt: "legacy",
+    }));
+    expect(ensurePermissionMigrated(WORKSPACE_A)).toMatchObject({
+      baselineMode: "readonly", effectiveMode: "readonly", sessionElevation: { active: false },
+    });
+  });
+
+  it("preserves a legacy level1 baseline during migration", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    fs.mkdirSync(path.dirname(stateFile(WORKSPACE_A)), { recursive: true });
+    fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify({
+      version: 1, workspaceId: WORKSPACE_A, mode: "level1", updatedAt: "legacy",
+    }));
+    expect(ensurePermissionMigrated(WORKSPACE_A)).toMatchObject({
+      baselineMode: "level1", effectiveMode: "level1", sessionElevation: { active: false },
+    });
+  });
+
+  it("migrates legacy level2 to baseline when Windows session identity is unavailable", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    sessionIdentity.fingerprint = null;
+    fs.mkdirSync(path.dirname(stateFile(WORKSPACE_A)), { recursive: true });
+    fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify({
+      version: 1, workspaceId: WORKSPACE_A, mode: "level2", updatedAt: "legacy",
+    }));
+
+    expect(ensurePermissionMigrated(WORKSPACE_A)).toMatchObject({
+      baselineMode: "level1", effectiveMode: "level1", sessionElevation: { active: false },
+    });
+    sessionIdentity.fingerprint = "a".repeat(64);
+    expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level1");
   });
 
   it.each([
     ["malformed JSON", "{"],
     ["invalid mode", JSON.stringify({ version: 1, workspaceId: WORKSPACE_A, mode: "level3", updatedAt: "now" })],
-    ["unknown version", JSON.stringify({ version: 2, workspaceId: WORKSPACE_A, mode: "level2", updatedAt: "now" })],
+    ["unknown version", JSON.stringify({ version: 3, workspaceId: WORKSPACE_A, mode: "level2", updatedAt: "now" })],
     ["mismatched workspace", JSON.stringify({ version: 1, workspaceId: WORKSPACE_B, mode: "level2", updatedAt: "now" })],
     ["missing required field", JSON.stringify({ version: 1, workspaceId: WORKSPACE_A, mode: "level2" })],
   ])("fails closed for %s", (_caseName, contents) => {

@@ -1,4 +1,10 @@
-export { PERMISSION_MODES, isPermissionMode, type PermissionMode } from "./mode.js";
+export {
+  PERMISSION_MODES,
+  PERMISSION_BASELINE_MODES,
+  isPermissionMode,
+  type PermissionMode,
+  type PermissionBaselineMode,
+} from "./mode.js";
 export { checkMovePermission, checkPermission } from "./policy.js";
 export type {
   MovePermissionCheckInput,
@@ -6,4 +12,10 @@ export type {
   PermissionLocation,
   PermissionOperation,
 } from "./policy.js";
-export { readPermission, setPermission } from "./store.js";
+export {
+  ensurePermissionMigrated,
+  readPermission,
+  readPermissionStatus,
+  setPermission,
+  type PermissionStatus,
+} from "./store.js";

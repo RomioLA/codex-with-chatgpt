@@ -1,5 +1,5 @@
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
@@ -12,6 +12,11 @@ import { setPermission } from "../src/permission/store.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { approveGitRepository, previewGitRepositoryApproval } from "../src/git-write/index.js";
 import { git, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+
+const sessionIdentity = vi.hoisted(() => ({ fingerprint: "e".repeat(64) }));
+vi.mock("../src/permission/session-identity.js", () => ({
+  getCurrentSessionIdentityFingerprint: () => sessionIdentity.fingerprint,
+}));
 
 interface CapturedExecution {
   request: Parameters<ExecutionRunner["start"]>[0];

@@ -14,6 +14,11 @@ import { getWriteAuditPath } from "../src/write/safety.js";
 import { nullLogger } from "../src/logger/index.js";
 import { makeTmpDir, write } from "./helpers.js";
 
+const sessionIdentity = vi.hoisted(() => ({ fingerprint: "c".repeat(64) }));
+vi.mock("../src/permission/session-identity.js", () => ({
+  getCurrentSessionIdentityFingerprint: () => sessionIdentity.fingerprint,
+}));
+
 const scopes = ["workspace.read", "workspace.write", "workspace.delete", "filesystem.external.read", "filesystem.external.write"];
 const staleHash = "0".repeat(64);
 const hash = (text: string | Buffer) => createHash("sha256").update(text).digest("hex");
@@ -88,7 +93,18 @@ afterAll(async () => {
 describe("MCP file tools over real Streamable HTTP", () => {
   it.each(["readonly", "level1", "level2"] as PermissionMode[])("permission_status reports %s and cannot change mode", async (mode) => {
     setPermission(bridge.workspace.id, mode);
-    expect(await call("permission_status", {})).toEqual({ workspaceId: bridge.workspace.id, mode });
+    const baselineMode = mode === "readonly" ? "readonly" : "level1";
+    const expected = {
+      workspaceId: bridge.workspace.id,
+      mode,
+      baselineMode,
+      effectiveMode: mode,
+      sessionElevation: { active: mode === "level2", expiresOn: mode === "level2" ? "logout-or-reboot" : null },
+    };
+    const stateFile = path.join(state, "permissions", `${bridge.workspace.id}.json`);
+    const before = fs.readFileSync(stateFile, "utf8");
+    expect(await call("permission_status", {})).toEqual(expected);
+    expect(fs.readFileSync(stateFile, "utf8")).toBe(before);
     const { tools } = await client.listTools();
     const status = tools.find((tool) => tool.name === "permission_status")!;
     expect(status.annotations?.readOnlyHint).toBe(true);

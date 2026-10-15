@@ -31,9 +31,9 @@ C2C Local uses a machine-side permission mode in addition to OAuth scopes:
 
 | Mode | Main behavior |
 | --- | --- |
-| `readonly` | Read-only workspace access. |
-| `level1` | Workspace create/edit/replace/internal move plus permitted external text reads. |
-| `level2` | Adds limited workspace file deletion and permitted external create/edit/replace. External deletion remains blocked. |
+| `readonly` | Persistent baseline; read-only workspace access. |
+| `level1` | Persistent baseline; workspace create/edit/replace/internal move plus permitted external text reads. |
+| `level2` | Temporary elevation for the current Windows logon session; adds limited workspace deletion and permitted external create/edit/replace. Logout or reboot returns to the persistent baseline. External deletion remains blocked. |
 
 Check or change the local mode from the machine:
 
@@ -44,7 +44,7 @@ c2c permission 1 -w <workspace>
 c2c permission 2 -w <workspace>
 ```
 
-Sensitive-file rules, canonical path containment, OAuth scopes, and operation-specific checks remain independent gates.
+`permission 2` sets the persistent baseline to `level1` and adds a current Windows session grant. CLI and MCP status expose `baselineMode`, `effectiveMode`, and `sessionElevation.active`, never the underlying identity. If Windows boot, user SID, session ID, or token logon ID cannot be confirmed, access falls back to the baseline. Missing or malformed state remains `readonly`; a new workspace must be initialized locally with `permission 1`. Sensitive-file rules, canonical path containment, OAuth scopes, and operation-specific checks remain independent gates.
 
 ## Nested Git repositories and worktrees
 

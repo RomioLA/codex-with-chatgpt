@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supervisor.js";
 import { setPermission } from "../src/permission/store.js";
@@ -8,6 +8,11 @@ import { createLevel3Request, approveLevel3Request, setLevel3Enabled, revokeLeve
 import type { NativeRunnerCompletion } from "../src/execution/native-runner.js";
 import { isolateStateDir, makeTmpDir, makeGitRepo, write, git } from "./helpers.js";
 import { approveGitRepository, previewGitRepositoryApproval } from "../src/git-write/index.js";
+
+const sessionIdentity = vi.hoisted(() => ({ fingerprint: "f".repeat(64) }));
+vi.mock("../src/permission/session-identity.js", () => ({
+  getCurrentSessionIdentityFingerprint: () => sessionIdentity.fingerprint,
+}));
 
 class Runner implements ExecutionRunner {
   requests: Array<Parameters<ExecutionRunner["start"]>[0]> = [];

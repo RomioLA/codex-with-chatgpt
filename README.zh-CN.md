@@ -31,9 +31,9 @@ C2C Local 的文件能力同时受 OAuth scope 和本机 permission mode 控制�
 
 | 模式 | 主要行为 |
 | --- | --- |
-| `readonly` | Workspace 只读。 |
-| `level1` | 允许 Workspace 创建/编辑/替换/内部移动，并可读取策略允许的外部文本文件。 |
-| `level2` | 在 level1 基础上增加受限的 Workspace 单文件删除，以及策略允许的外部创建/编辑/替换；外部删除仍禁止。 |
+| `readonly` | 持久基线；Workspace 只读。 |
+| `level1` | 持久基线；允许 Workspace 创建/编辑/替换/内部移动，并可读取策略允许的外部文本文件。 |
+| `level2` | 仅当前 Windows 登录会话有效；在 level1 基础上增加受限的 Workspace 单文件删除，以及策略允许的外部创建/编辑/替换；外部删除仍禁止。注销或重启后回到持久基线。 |
 
 本机查看或切换权限：
 
@@ -45,6 +45,7 @@ c2c permission 2 -w <workspace>
 ```
 
 敏感文件策略、规范化路径边界、OAuth scope 和具体操作检查仍然分别生效。ChatGPT 不能通过 MCP 自行提高本机权限。
+`permission 2` 会把持久基线设为 `level1` 并创建当前 Windows 登录会话 grant；CLI/MCP 状态同时报告 `baselineMode`、`effectiveMode` 和 `sessionElevation.active`，不返回底层 session identity。无法确认 Windows boot、用户 SID、session ID 或 token logon ID 时按基线执行。缺失或损坏的权限状态仍回退 `readonly`；新 workspace 需由本机用户显式运行 `permission 1` 初始化可写基线。
 
 ## 嵌套 Git 仓库与 worktree
 

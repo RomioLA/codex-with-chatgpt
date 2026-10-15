@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { z } from "zod";
-import { checkMovePermission, checkPermission, readPermission, type PermissionOperation } from "../permission/index.js";
+import { checkMovePermission, checkPermission, readPermission, readPermissionStatus, type PermissionOperation } from "../permission/index.js";
 import { HostFilesystem, HostPathError, type HostPath } from "../workspace/host-filesystem.js";
 import { parseHostPathInput } from "../workspace/host-path-input.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
@@ -107,12 +107,18 @@ export function registerFileTools(server: McpServer, workspace: Workspace, logge
   }
 
   server.registerTool("permission_status", {
-    title: "Local permission status", description: "Read the local workspace permission mode. Cannot change permissions.",
-    inputSchema: {}, outputSchema: { workspaceId: z.string(), mode: z.enum(["readonly", "level1", "level2"]) },
+    title: "Local permission status", description: "Read the persistent baseline and current session permission mode. Cannot change permissions.",
+    inputSchema: {}, outputSchema: {
+      workspaceId: z.string(),
+      mode: z.enum(["readonly", "level1", "level2"]),
+      baselineMode: z.enum(["readonly", "level1"]),
+      effectiveMode: z.enum(["readonly", "level1", "level2"]),
+      sessionElevation: z.object({ active: z.boolean(), expiresOn: z.literal("logout-or-reboot").nullable() }),
+    },
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async (_args, extra) => run("permission_status", () => {
     requireScope(extra.authInfo, "workspace.read");
-    return { workspaceId: workspace.id, mode: readPermission(workspace.id) };
+    return { workspaceId: workspace.id, ...readPermissionStatus(workspace.id) };
   }));
 
   // Separate workspace/external tools share implementation, never an ambiguous model location flag.

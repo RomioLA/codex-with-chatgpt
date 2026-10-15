@@ -70,7 +70,15 @@ import { resolveRepositoryIdentity } from "../execution/repository-identity.js";
 import { EXECUTION_KINDS, type ExecutionKind, type PackageManager } from "../execution/job-types.js";
 import { registerV13Cli } from "./v13.js";
 import { importMediaAsset } from "../media/import.js";
-import { isPermissionMode, readPermission, setPermission, type PermissionMode } from "../permission/index.js";
+import {
+  ensurePermissionMigrated,
+  isPermissionMode,
+  readPermission,
+  readPermissionStatus,
+  setPermission,
+  type PermissionMode,
+  type PermissionStatus,
+} from "../permission/index.js";
 import {
   AutostartService,
   AutostartUnsupportedError,
@@ -761,9 +769,11 @@ permissionCmd
     try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const mode = rawMode.trim().toLowerCase();
-      let actualMode: PermissionMode;
+      let permissionStatus: PermissionStatus;
+      let elevationUnavailable = false;
+      const level2Requested = mode === "2" || mode === "level2";
       if (mode === "status") {
-        actualMode = readPermission(workspace.id);
+        permissionStatus = ensurePermissionMigrated(workspace.id);
       } else {
         const requestedMode = mode === "1" ? "level1" : mode === "2" ? "level2" : mode;
         if (!isPermissionMode(requestedMode)) {
@@ -771,16 +781,35 @@ permissionCmd
         }
         // This is a user-local control-plane mutation. Any future remote process runner
         // must not be able to invoke this elevation path on the user's behalf.
-        actualMode = setPermission(workspace.id, requestedMode);
+        setPermission(workspace.id, requestedMode);
+        permissionStatus = readPermissionStatus(workspace.id);
+        elevationUnavailable = requestedMode === "level2" && !permissionStatus.sessionElevation.active;
       }
       const payload = {
-        ok: true,
+        ok: !elevationUnavailable,
         workspaceId: workspace.id,
         workspaceName: workspace.name,
-        mode: actualMode,
+        mode: permissionStatus.effectiveMode,
+        baselineMode: permissionStatus.baselineMode,
+        effectiveMode: permissionStatus.effectiveMode,
+        sessionElevation: permissionStatus.sessionElevation,
+        ...(elevationUnavailable ? { error: "无法确认当前 Windows 登录会话身份，Level 2 未启用；基线已设为 Level 1。" } : {}),
+        ...(level2Requested ? {
+          message: elevationUnavailable
+            ? "无法确认当前 Windows 登录会话身份，Level 2 未启用；基线已设为 Level 1。"
+            : "Level 2 已为当前 Windows 登录会话启用。注销或重启后将自动恢复为 Level 1。",
+        } : {}),
       };
       if (opts.json) say(JSON.stringify(payload));
-      else check(`Permission: ${actualMode}（${workspace.name}）`);
+      else if (elevationUnavailable) cross(payload.error!);
+      else if (level2Requested) say("Level 2 已为当前 Windows 登录会话启用。注销或重启后将自动恢复为 Level 1。");
+      else if (mode === "status") {
+        say(`权限基线：${permissionStatus.baselineMode}；当前有效权限：${permissionStatus.effectiveMode}`);
+        if (permissionStatus.sessionElevation.active) {
+          say("Level 2 已为当前 Windows 登录会话启用。注销或重启后将自动恢复为基线权限。");
+        }
+      } else check(`Permission baseline: ${permissionStatus.baselineMode}（${workspace.name}）`);
+      if (elevationUnavailable) process.exitCode = 1;
     } catch (error) {
       handleCliError(error, opts.json);
     }

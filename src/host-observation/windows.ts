@@ -1,8 +1,71 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { ObservationError, type ObservationProvider, type QueryInput, type ListenerInput } from "./types.js";
+
+// Small fixed script for the local permission gate. Identity values stay inside
+// the local process and this script has no caller-controlled input.
+const WINDOWS_SESSION_IDENTITY_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+public static class C2CSessionIdentity {
+ [StructLayout(LayoutKind.Sequential)] struct Luid { public uint LowPart; public int HighPart; }
+ [StructLayout(LayoutKind.Sequential)] struct TokenStatistics {
+  public Luid TokenId; public Luid AuthenticationId; public long ExpirationTime;
+  public int TokenType; public int ImpersonationLevel; public int DynamicCharged;
+  public int DynamicAvailable; public int GroupCount; public int PrivilegeCount; public Luid ModifiedId;
+ }
+ [StructLayout(LayoutKind.Sequential)] struct BootEnvironmentInformation {
+  public Guid BootIdentifier; public uint FirmwareType; public ulong BootFlags;
+ }
+ [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int kind, out TokenStatistics value, int length, out int needed);
+ [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int kind, IntPtr buffer, uint length, out uint returned);
+ static Guid ReadBootIdentifier() {
+  const int size=32; IntPtr buffer=Marshal.AllocHGlobal(size);
+  try {
+   uint returned; int status=NtQuerySystemInformation(90,buffer,size,out returned);
+   if(status!=0 || returned<size) throw new InvalidOperationException();
+   var info=Marshal.PtrToStructure<BootEnvironmentInformation>(buffer);
+   if(info.BootIdentifier==Guid.Empty) throw new InvalidOperationException();
+   return info.BootIdentifier;
+  } finally { Marshal.FreeHGlobal(buffer); }
+ }
+ static long ReadBootTimeFileTime() {
+  const int size=48; IntPtr buffer=Marshal.AllocHGlobal(size);
+  try {
+   uint returned; int status=NtQuerySystemInformation(3,buffer,size,out returned);
+   long ticks=Marshal.ReadInt64(buffer,0);
+   if(status!=0 || returned<size || ticks<=0) throw new InvalidOperationException();
+   return ticks;
+  } finally { Marshal.FreeHGlobal(buffer); }
+ }
+ public static Dictionary<string,object> Read() {
+  var result=new Dictionary<string,object>();
+  using(var identity=WindowsIdentity.GetCurrent()) {
+   if(identity.User==null) throw new InvalidOperationException();
+   TokenStatistics stats; int needed;
+   if(!GetTokenInformation(identity.Token,10,out stats,Marshal.SizeOf(typeof(TokenStatistics)),out needed)) throw new InvalidOperationException();
+   if(stats.AuthenticationId.LowPart==0 && stats.AuthenticationId.HighPart==0) throw new InvalidOperationException();
+   result["userSid"]=identity.User.Value;
+   result["logonId"]=unchecked((uint)stats.AuthenticationId.HighPart).ToString("x8")+stats.AuthenticationId.LowPart.ToString("x8");
+  }
+  result["sessionId"]=Process.GetCurrentProcess().SessionId;
+  result["bootId"]=ReadBootIdentifier().ToString("D");
+  result["bootTime"]=DateTime.FromFileTimeUtc(ReadBootTimeFileTime()).ToString("o");
+  return result;
+ }
+}
+'@
+[C2CSessionIdentity]::Read() | ConvertTo-Json -Depth 4 -Compress
+`;
 
 // The entire interpreter body is source-controlled. JSON stdin is DATA only.
 // No remote value enters command arguments, a script fragment, WQL, or Invoke-Expression.
@@ -159,21 +222,50 @@ $out | ConvertTo-Json -Depth 12 -Compress
 `;
 
 let active = 0;
-export function runWindowsQuery(operation: "context" | "processes" | "listeners" | "network" | "metadata", data: object = {}): Promise<any> {
-  if (process.platform !== "win32") return Promise.reject(new ObservationError("NOT_SUPPORTED", "Host Observation V1 requires Windows"));
+function fixedPowerShellExecutable(): string | undefined {
   // Fixed executable, no PATH/cwd executable resolution or caller-selectable runtime.
   const candidates = [
     path.join(process.env.ProgramFiles ?? "C:\\Program Files", "PowerShell", "7", "pwsh.exe"),
     // Existing Codex Desktop bundled PS7; no download/install and no new dependency.
     path.join(os.homedir(), ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "native", "powershell", "pwsh.exe"),
   ];
-  const executable = candidates.find(candidate => fs.existsSync(candidate));
+  return candidates.find(candidate => fs.existsSync(candidate));
+}
+
+function fixedPowerShellArgs(script = WINDOWS_QUERY_SCRIPT): string[] {
+  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")];
+}
+
+/**
+ * Read the current process's Windows logon identity for local permission checks.
+ * This operation is internal and is never registered as an MCP Host Observation tool.
+ */
+export function readWindowsSessionIdentitySync(): unknown | null {
+  if (process.platform !== "win32") return null;
+  const executable = fixedPowerShellExecutable();
+  if (!executable) return null;
+  try {
+    const stdout = execFileSync(executable, fixedPowerShellArgs(WINDOWS_SESSION_IDENTITY_SCRIPT), {
+      windowsHide: true,
+      timeout: 15_000,
+      maxBuffer: 64 * 1024,
+      encoding: "utf8",
+    });
+    return JSON.parse(stdout.replace(/^\uFEFF/, "")) as unknown;
+  } catch {
+    // The permission layer fails closed when the OS identity cannot be confirmed.
+    return null;
+  }
+}
+
+export function runWindowsQuery(operation: "context" | "processes" | "listeners" | "network" | "metadata", data: object = {}): Promise<any> {
+  if (process.platform !== "win32") return Promise.reject(new ObservationError("NOT_SUPPORTED", "Host Observation V1 requires Windows"));
+  const executable = fixedPowerShellExecutable();
   if (!executable) return Promise.reject(new ObservationError("NOT_SUPPORTED", "PowerShell 7 is required for fixed Windows queries"));
   if (active >= 4) return Promise.reject(new ObservationError("QUERY_BUSY", "Host query concurrency limit reached"));
   active++;
   return new Promise((resolve, reject) => {
-    const child = execFile(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
-      Buffer.from(WINDOWS_QUERY_SCRIPT, "utf16le").toString("base64")],
+    const child = execFile(executable, fixedPowerShellArgs(),
     { windowsHide: true, timeout: 15000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" }, (error, stdout) => {
       active--;
       // Never return stderr/errors containing raw process data or paths to callers/logs.

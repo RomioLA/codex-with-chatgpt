@@ -17,7 +17,7 @@ import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { probeBridge, writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 import { acquireBridgeInstanceLock, type BridgeInstanceLock } from "./instance-lock.js";
-import { readPermission } from "../permission/index.js";
+import { ensurePermissionMigrated, readPermission } from "../permission/index.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../execution/supervisor.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
@@ -106,6 +106,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
   }
+  // Upgrade the old persisted mode before any MCP request can observe it. This
+  // local startup migration may grant Level 2 only to the current Windows logon.
+  ensurePermissionMigrated(workspace.id);
 
   const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });

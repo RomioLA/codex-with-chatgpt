@@ -232,14 +232,24 @@ for the full schema and status contract.
 
 ## Local file permissions
 
-Permission mode is stored per workspace under the active C2C state directory.
-Missing, malformed, mismatched, or unsupported permission state falls back to
-`readonly`. The local CLI accepts `c2c permission readonly|1|2|status`; the MCP
-`permission_status` tool only reads the mode and cannot change it.
+Permission state is stored per workspace under the active C2C state directory.
+The persistent baseline is `readonly` or `level1`; missing, malformed,
+mismatched, or unsupported state falls back to `readonly`. The local CLI accepts
+`c2c permission readonly|1|2|status`. `readonly` and `1` persist the selected
+baseline and revoke any current-session elevation. `2` sets the baseline to
+`level1` and records a Level 2 grant for the current Windows logon session.
+The grant binds the Windows boot identifier and boot time, user SID, process
+session ID, and token AuthenticationId (logon LUID). If any identity component
+cannot be read or validated, the grant is inactive. Logout or reboot changes
+that identity and returns effective permission to the baseline; no shutdown
+cleanup is required. The MCP `permission_status` tool reports the compatibility
+`mode`, `baselineMode`, `effectiveMode`, and whether the session grant is active,
+but cannot create a grant or expose its identity fingerprint.
 
 `readonly` permits workspace reads only. `level1` permits workspace file
 creation and modification, workspace moves, and non-sensitive external reads.
-`level2` adds workspace deletion and external file creation or modification.
+`level2` is a current-session elevation over the persistent baseline and adds
+workspace deletion and external file creation or modification.
 Current deletion is one regular workspace file per call, guarded by its
 expected content hash. Moves are workspace-to-workspace only. Directory
 creation is workspace-only. External deletion is a hard deny in every mode.

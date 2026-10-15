@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import {
@@ -85,6 +87,25 @@ describe("Level 3 one-time local approval", () => {
     expect("snapshot" in preview).toBe(false);
     expect("manifestPath" in preview).toBe(false);
     expect(JSON.stringify(preview)).not.toContain("fileIdentity");
+    cleanup(f.root);
+  });
+
+  it("keeps the Level 3 feature switch enabled across a fresh runtime process", () => {
+    const f = fixture("persistent-feature-switch");
+    enabled(f);
+    expect(isLevel3Enabled(f.workspace.id)).toBe(true);
+
+    const sourceUrl = pathToFileURL(path.resolve("src/execution/level3-approval.ts")).href;
+    const child = spawnSync(process.execPath, [
+      "--import", "tsx", "--input-type=module", "-e",
+      `import { isLevel3Enabled } from ${JSON.stringify(sourceUrl)}; console.log(JSON.stringify(isLevel3Enabled(${JSON.stringify(f.workspace.id)})));`,
+    ], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: { ...process.env, C2C_STATE_DIR: process.env.C2C_STATE_DIR },
+    });
+    expect(child.status, `${child.stdout}\n${child.stderr}`).toBe(0);
+    expect(child.stdout.trim()).toBe("true");
     cleanup(f.root);
   });
 

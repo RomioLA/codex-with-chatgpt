@@ -12,6 +12,11 @@ import {
 } from "../src/autostart/windows-task.js";
 import { parseTaskLaunchPayload } from "../src/autostart/task-launcher.js";
 import { readPermission, setPermission } from "../src/permission/index.js";
+
+const sessionIdentity = vi.hoisted(() => ({ fingerprint: "d".repeat(64) }));
+vi.mock("../src/permission/session-identity.js", () => ({
+  getCurrentSessionIdentityFingerprint: () => sessionIdentity.fingerprint,
+}));
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
