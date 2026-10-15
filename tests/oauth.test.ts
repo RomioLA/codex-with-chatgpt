@@ -185,6 +185,84 @@ describe("discovery metadata", () => {
 });
 
 describe("explicit OAuth capabilities", () => {
+  it("uses one full-scope consent for the registered ChatGPT app on chatgpt.com", async () => {
+    const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const registration = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: [redirectUri] }),
+    });
+    expect(registration.status).toBe(201);
+    const { client_id: clientId } = await registration.json() as { client_id: string };
+    const { verifier, challenge } = pkceVerifierAndChallenge();
+    const authorizeUrl = new URL(`${base}/oauth/authorize`);
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("state", "chatgpt-full-consent");
+    authorizeUrl.searchParams.set("code_challenge", challenge);
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+    authorizeUrl.searchParams.set("scope", "workspace.read execution.read offline_access");
+
+    const pageResponse = await fetch(authorizeUrl, { redirect: "manual" });
+    expect(pageResponse.status).toBe(200);
+    const html = await pageResponse.text();
+    const requestId = html.match(/name="request_id" value="([a-f0-9]+)"/)?.[1];
+    expect(requestId).toBeTruthy();
+    for (const label of [
+      "Read limited host system diagnostics",
+      "Start execution jobs",
+      "Cancel execution jobs",
+      "Perform locally authorized Git writes",
+      "Request and run individually approved local commands (Level 3)",
+    ]) expect(html).toContain(label);
+
+    const pairing = bridge.pairing.create();
+    const consent = await fetch(`${base}/oauth/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ request_id: requestId!, pairing_code: pairing.code }),
+      redirect: "manual",
+    });
+    expect(consent.status).toBe(302);
+    const location = consent.headers.get("location");
+    expect(location).toBeTruthy();
+    const code = new URL(location!).searchParams.get("code");
+    expect(code).toBeTruthy();
+
+    const tokenResponse = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code!,
+        code_verifier: verifier,
+        client_id: clientId,
+        redirect_uri: redirectUri,
+      }),
+    });
+    expect(tokenResponse.status).toBe(200);
+    const token = await tokenResponse.json() as Record<string, string>;
+    expect(token.scope.split(" ")).toEqual([...SUPPORTED_SCOPES]);
+  });
+
+  it("does not expand a ChatGPT-named client when its redirect is not chatgpt.com", async () => {
+    const registration = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: "ChatGPT", redirect_uris: [REDIRECT_URI] }),
+    });
+    expect(registration.status).toBe(201);
+    const { client_id: clientId } = await registration.json() as { client_id: string };
+    const { verifier, challenge } = pkceVerifierAndChallenge();
+    const pairing = bridge.pairing.create();
+    const requested = ["workspace.read", "offline_access"];
+    const authorization = await authorizeWithPairing(clientId, challenge, pairing.code, "non-chatgpt-redirect", requested.join(" "));
+    const token = await exchangeToken(clientId, authorization.code!, verifier);
+    expect(token.status).toBe(200);
+    expect(token.body.scope.split(" ")).toEqual(requested);
+  });
+
   it("upgrades only through explicit authorization and leaves old access/refresh grants unchanged", async () => {
     const executionScopes = ["execution.jobs.read", "execution.run", "execution.cancel"];
     const legacyScopes = ["workspace.read", "workspace.search", "git.read", "execution.read", "offline_access"];

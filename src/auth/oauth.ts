@@ -243,10 +243,26 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       fail("invalid_request", "PKCE with S256 is required");
       return;
     }
-    const scopes = filterScopes(query.scope);
+    let scopes = filterScopes(query.scope);
     if (scopes.length === 0) {
       fail("invalid_scope", "No supported scopes were requested");
       return;
+    }
+
+    // ChatGPT's current browser linking UI can persist tool-specific incremental
+    // scopes one at a time and, for some app-backed connections, cannot reopen
+    // the browser settings flow for the next missing scope. This private bridge
+    // is intentionally provisioned as a full-capability ChatGPT connector; local
+    // permission gates still independently protect writes, Git, and Level 3.
+    //
+    // Bound the compatibility policy to the registered ChatGPT client plus a
+    // chatgpt.com redirect so unrelated OAuth clients keep exact requested-scope
+    // semantics. The consent page is rendered from this expanded set before any
+    // authorization code is issued.
+    let redirectHost = "";
+    try { redirectHost = new URL(redirectUri).hostname.toLowerCase(); } catch { /* validated above */ }
+    if (client.clientName === "ChatGPT" && redirectHost === "chatgpt.com") {
+      scopes = [...SUPPORTED_SCOPES];
     }
     const request: PendingAuthRequest = {
       id: randomBytes(16).toString("hex"),
