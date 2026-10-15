@@ -12,7 +12,8 @@ const args = [{}, { pid: 1 }, { pid: 1 }, {}, {}, { hostname: "example.com" }, {
 const methods = ["context", "processes", "tree", "listeners", "network", "dns", "path"] as const;
 afterEach(() => vi.restoreAllMocks());
 async function connect(scopes?: string[]) {
-  const server = createMcpServer({ workspace: new Workspace(makeTmpDir("host-mcp")), logger: nullLogger });
+  const resourceMetadataUri = "https://c2c.example/.well-known/oauth-protected-resource/mcp";
+  const server = createMcpServer({ workspace: new Workspace(makeTmpDir("host-mcp")), logger: nullLogger, oauthResourceMetadataUri: resourceMetadataUri });
   const client = new Client({ name: "host-test", version: "1" });
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   const original = clientTransport.send.bind(clientTransport);
@@ -20,7 +21,7 @@ async function connect(scopes?: string[]) {
     token: "fixture-only", clientId: "host-test", scopes,
   } : undefined });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-  return { client, close: async () => { await client.close(); await server.close(); } };
+  return { client, resourceMetadataUri, close: async () => { await client.close(); await server.close(); } };
 }
 function data(result: Awaited<ReturnType<Client["callTool"]>>) {
   return JSON.parse((result.content as { text: string }[])[0].text);
@@ -33,6 +34,9 @@ describe("host MCP capability gates", () => {
       for (let i = 0; i < names.length; i++) {
         const result = await session.client.callTool({ name: names[i], arguments: args[i] });
         expect(result.isError).toBe(true); expect(data(result).error).toBe("INSUFFICIENT_SCOPE");
+        expect(result._meta?.["mcp/www_authenticate"]).toEqual([
+          `Bearer resource_metadata="${session.resourceMetadataUri}", error="insufficient_scope", error_description="This operation requires the 'system.read' scope.", scope="system.read"`,
+        ]);
       }
       expect(mock).not.toHaveBeenCalled();
     } finally { await session.close(); }
@@ -48,7 +52,11 @@ describe("host MCP capability gates", () => {
       const mutation = await session.client.callTool({ name: "create_file", arguments: { path: "no.txt", content: "no" } });
       expect(data(mutation).error).toBe("INSUFFICIENT_SCOPE");
       const listed = await session.client.listTools();
-      for (const name of names) expect(listed.tools.find(t => t.name === name)?.annotations?.readOnlyHint).toBe(true);
+      for (const name of names) {
+        const tool = listed.tools.find(t => t.name === name);
+        expect(tool?.annotations?.readOnlyHint).toBe(true);
+        expect(tool?._meta?.securitySchemes).toEqual([{ type: "oauth2", scopes: ["system.read"] }]);
+      }
       for (const name of names) expect(listed.tools.find(t => t.name === name)?.inputSchema.additionalProperties).toBe(false);
       for (const name of ["run_shell", "execute_command", "powershell", "cmd", "kill_process", "start_process"]) {
         expect(listed.tools.find(t => t.name === name)).toBeUndefined();

@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
 import { HostObservation } from "../host-observation/service.js";
 import { ObservationError } from "../host-observation/types.js";
+import { executionScopeChallenge, systemToolAuth } from "./oauth.js";
 
 const pid = z.number().int().min(0).max(0xffffffff);
 const text = z.string().min(1).max(1024).refine(value => !/[\x00-\x1f]/.test(value));
@@ -33,15 +34,19 @@ const descriptions = {
   path_inspect: "Read metadata only for local absolute or workspace-relative paths. Sensitive paths and aliases are denied. No file content.",
 };
 
-export function registerHostObservationTools(server: McpServer, workspace: Workspace, service = new HostObservation(workspace)) {
+export function registerHostObservationTools(server: McpServer, workspace: Workspace, resourceMetadataUri?: string, service = new HostObservation(workspace)) {
   function register(name: keyof typeof descriptions, schema: z.AnyZodObject, validation: z.ZodTypeAny,
     action: (args: any) => Promise<object>) {
-    server.registerTool(name, { title: name, description: descriptions[name] + " Requires system.read; independent of local file permission mode. Results are untrusted diagnostic data.",
+    server.registerTool(name, { ...systemToolAuth(name), title: name, description: descriptions[name] + " Requires system.read; independent of local file permission mode. Results are untrusted diagnostic data.",
       inputSchema: schema, annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: name === "dns_resolve" } },
     async (args: unknown, extra: { authInfo?: AuthInfo }) => {
       try {
         // Newly privileged tools fail closed, including unauthenticated local transports.
-        if (!extra.authInfo?.scopes.includes("system.read")) throw new ObservationError("INSUFFICIENT_SCOPE", "This tool requires system.read");
+        if (!extra.authInfo?.scopes.includes("system.read")) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "INSUFFICIENT_SCOPE", message: "This tool requires system.read" }) }],
+            isError: true,
+            ...(resourceMetadataUri ? { _meta: { "mcp/www_authenticate": [executionScopeChallenge(resourceMetadataUri, "system.read")] } } : {}) };
+        }
         const validated = validation.safeParse(args);
         if (!validated.success) throw new ObservationError("INVALID_INPUT", "Invalid structured observation input");
         const result = await action(validated.data);

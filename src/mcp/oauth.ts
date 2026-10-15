@@ -14,12 +14,30 @@ export const EXECUTION_TOOL_SCOPES = {
   git_branches: "git.read",
 } as const;
 
+export const SYSTEM_TOOL_SCOPES = {
+  host_context: "system.read",
+  process_query: "system.read",
+  process_tree: "system.read",
+  network_listeners: "system.read",
+  network_status: "system.read",
+  dns_resolve: "system.read",
+  path_inspect: "system.read",
+} as const;
+
 type ExecutionTool = keyof typeof EXECUTION_TOOL_SCOPES;
 type ExecutionScope = (typeof EXECUTION_TOOL_SCOPES)[ExecutionTool];
+type SystemTool = keyof typeof SYSTEM_TOOL_SCOPES;
+type OAuthScope = ExecutionScope | (typeof SYSTEM_TOOL_SCOPES)[SystemTool];
 type OAuthScheme = { type: "oauth2"; scopes: ExecutionScope[] };
+type SystemOAuthScheme = { type: "oauth2"; scopes: (typeof SYSTEM_TOOL_SCOPES)[SystemTool][] };
 
 export function executionToolAuth(name: ExecutionTool) {
   const securitySchemes: OAuthScheme[] = [{ type: "oauth2", scopes: [EXECUTION_TOOL_SCOPES[name]] }];
+  return { securitySchemes, _meta: { securitySchemes } };
+}
+
+export function systemToolAuth(name: SystemTool) {
+  const securitySchemes: SystemOAuthScheme[] = [{ type: "oauth2", scopes: [SYSTEM_TOOL_SCOPES[name]] }];
   return { securitySchemes, _meta: { securitySchemes } };
 }
 
@@ -29,7 +47,7 @@ function quote(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-export function executionScopeChallenge(resourceMetadataUri: string, scope: ExecutionScope): string {
+export function executionScopeChallenge(resourceMetadataUri: string, scope: OAuthScope): string {
   return `Bearer resource_metadata=${quote(resourceMetadataUri)}, error="insufficient_scope", ` +
     `error_description=${quote(`This operation requires the '${scope}' scope.`)}, scope=${quote(scope)}`;
 }
@@ -50,8 +68,8 @@ export function installExecutionOAuthListing(server: McpServer): () => void {
       return {
         ...result,
         tools: result.tools.map((tool) => {
-          if (!isExecutionTool(tool.name)) return tool;
-          const auth = executionToolAuth(tool.name);
+          const auth = authForTool(tool.name);
+          if (!auth) return tool;
           return { ...tool, securitySchemes: auth.securitySchemes, _meta: { ...tool._meta, ...auth._meta } };
         }),
       };
@@ -60,6 +78,8 @@ export function installExecutionOAuthListing(server: McpServer): () => void {
   return () => { server.server.setRequestHandler = original; };
 }
 
-function isExecutionTool(name: string): name is ExecutionTool {
-  return Object.hasOwn(EXECUTION_TOOL_SCOPES, name);
+function authForTool(name: string): ReturnType<typeof executionToolAuth> | ReturnType<typeof systemToolAuth> | null {
+  if (Object.hasOwn(EXECUTION_TOOL_SCOPES, name)) return executionToolAuth(name as ExecutionTool);
+  if (Object.hasOwn(SYSTEM_TOOL_SCOPES, name)) return systemToolAuth(name as SystemTool);
+  return null;
 }

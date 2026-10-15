@@ -77,7 +77,10 @@ function observePid(pid: number): "present" | "missing" | "unknown" {
     process.kill(pid, 0);
     return "present";
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH" ? "missing" : "unknown";
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "missing";
+    if (process.platform === "win32" && code === "EPERM") return "present";
+    return "unknown";
   }
 }
 

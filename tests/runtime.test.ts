@@ -259,4 +259,132 @@ describe("findBridgeObservation", () => {
       await bridge.close();
     }
   });
+
+  it.skipIf(process.platform !== "win32")("treats EPERM from process.kill as present on Windows", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-windows-eperm");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const auth = path.join(makeTmpDir("obs-windows-eperm-auth"), "store.json");
+    dirs.push(path.dirname(auth));
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: true,
+      authStoreFile: auth,
+    });
+    const originalKill = process.kill;
+    try {
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+        if (pid === process.pid && signal === 0) {
+          throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+        }
+        return originalKill(pid, signal as number);
+      }) as typeof process.kill);
+
+      const observation = await findBridgeObservation(bridge.workspace.id);
+      expect(observation.state).toBe("healthy");
+      const reused = await ensureBridge(root);
+      expect(reused).toMatchObject({
+        spawned: false,
+        runtime: { pid: process.pid, port: bridge.port, workspaceId: bridge.workspace.id },
+      });
+      writeRuntimeState({ ...reused.runtime, adminToken: "stale-test-token" });
+      await expect(ensureBridge(root)).rejects.toThrow(/admin authentication or identity mismatch/);
+      killSpy.mockRestore();
+    } finally {
+      vi.restoreAllMocks();
+      await bridge.close();
+    }
+  });
+
+  it("rejects reuse when health matches but the PID probe has an unknown error", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-pid-unknown-health");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
+    const originalKill = process.kill;
+    try {
+      writeRuntimeState({
+        ...stubRuntime(bridge.workspace.id, bridge.workspace.root, process.pid, bridge.port),
+        adminToken: bridge.adminToken,
+      });
+      vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+        if (pid === process.pid && signal === 0) {
+          throw Object.assign(new Error("access denied"), { code: "EACCES" });
+        }
+        return originalKill(pid, signal as number);
+      }) as typeof process.kill);
+
+      const observation = await findBridgeObservation(bridge.workspace.id);
+      expect(observation).toMatchObject({ state: "unknown", reason: "pid_unknown" });
+      await expect(ensureBridge(root)).rejects.toThrow(/uncertain.*pid_unknown/);
+    } finally {
+      vi.restoreAllMocks();
+      await bridge.close();
+    }
+  });
+
+  it.skipIf(process.platform !== "win32")("keeps Windows EPERM unknown when health probe fails", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-windows-eperm-probe-failed");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const workspace = new Workspace(root);
+    writeRuntimeState(stubRuntime(workspace.id, workspace.root, process.pid, 1));
+    const originalKill = process.kill;
+    vi.stubGlobal("fetch", () => Promise.reject(new Error("health endpoint unavailable")));
+    vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === process.pid && signal === 0) {
+        throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+      }
+      return originalKill(pid, signal as number);
+    }) as typeof process.kill);
+
+    try {
+      const observation = await findBridgeObservation(workspace.id);
+      expect(observation).toMatchObject({ state: "unknown", reason: "probe_failed" });
+      await expect(ensureBridge(root)).rejects.toThrow(/uncertain.*probe_failed/);
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps EPERM unknown when the reported platform is not Windows", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-nonwindows-eperm");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
+    const originalKill = process.kill;
+    try {
+      writeRuntimeState({
+        ...stubRuntime(bridge.workspace.id, bridge.workspace.root, process.pid, bridge.port),
+        adminToken: bridge.adminToken,
+      });
+      vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+        if (pid === process.pid && signal === 0) {
+          throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+        }
+        return originalKill(pid, signal as number);
+      }) as typeof process.kill);
+      const processProxy = new Proxy(process, {
+        get(target, property) {
+          if (property === "platform") return "linux";
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      vi.stubGlobal("process", processProxy);
+
+      const observation = await findBridgeObservation(bridge.workspace.id);
+      expect(observation).toMatchObject({ state: "unknown", reason: "pid_unknown" });
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      await bridge.close();
+    }
+  });
 });

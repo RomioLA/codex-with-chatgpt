@@ -865,7 +865,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
   );
 
   registerFileTools(server, workspace, ctx.logger);
-  registerHostObservationTools(server, workspace);
+  registerHostObservationTools(server, workspace, ctx.oauthResourceMetadataUri);
   registerV13Tools(server, ctx);
   finishOAuthListingRegistration();
   return server;
