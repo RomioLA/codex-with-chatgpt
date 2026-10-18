@@ -27,16 +27,16 @@ export function canTransitionExecutionState(from: ExecutionJobState, to: Executi
   return ALLOWED[from].includes(to);
 }
 
-export function transitionExecutionJob(
-  job: ExecutionJob,
+export function transitionExecutionJob<T extends ExecutionJob>(
+  job: T,
   state: ExecutionJobState,
-  patch: Partial<ExecutionJob> = {},
+  patch: Partial<T> = {},
   at = new Date().toISOString()
-): ExecutionJob {
+): T {
   if (!canTransitionExecutionState(job.state, state)) {
     throw new Error(`Invalid execution job transition: ${job.state} -> ${state}`);
   }
-  const next: ExecutionJob = { ...job, ...patch, state };
+  const next = { ...job, ...patch, state } as T;
   if (state === "running" && next.startedAt === null) next.startedAt = at;
   if (TERMINAL.has(state) && next.finishedAt === null) next.finishedAt = at;
   return next;

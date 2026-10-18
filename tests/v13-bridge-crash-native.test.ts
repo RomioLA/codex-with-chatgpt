@@ -33,7 +33,7 @@ it.skipIf(process.platform !== "win32")("actual Bridge process crash empties Nat
     const b=await startBridge({workspaceRoot:${JSON.stringify(root)},port:0,persistRuntime:false,authStoreFile:${JSON.stringify(path.join(state,"crash-auth.json"))}});
     const w=b.executionSupervisor.workspace;setPermission(w.id,'level1');setLevel3Enabled(w.id,true,true);
     const r=createLevel3Request(w,'bridge-crash-client',{engine:'program',repositoryPath:'.',executable:process.execPath,args:['entry.cjs'],cwd:'.',materials:['child.cjs'],timeoutSeconds:60});
-    approveLevel3Request(w,r.requestId,r.digest,true,{risk:'development'});
+    if(r.status==='pending')approveLevel3Request(w,r.requestId,r.digest,true,{risk:'development'});
     const input={requestId:r.requestId,digest:r.digest,oauthClientId:'bridge-crash-client',scopes:['execution.level3'],idempotencyKey:'bridge-crash-key-0123456789'};
     const result=b.executionSupervisor.startLevel3(input);if(!result.ok)throw new Error(result.error);
     fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({input,jobId:result.job.jobId}),{flag:'wx'});`;

@@ -265,7 +265,7 @@ function makeExecutionDistributionFixture(root: string): {
   const launcherHash = sha256File(launcherPath);
   fs.writeFileSync(path.join(moduleDirectory, "c2c-execution-helper-integrity.json"), JSON.stringify({
     version: 2,
-    protocolVersion: 5,
+    protocolVersion: 7,
     helperPath: "build/native/c2c-execution-helper.exe",
     sha256: helperHash,
     launcherPath: "build/native/c2c-execution-launcher.exe",
@@ -562,7 +562,7 @@ describe("Windows execution lifecycle acceptance", () => {
     const launcherHash = sha256File(launcherCandidate);
     fs.writeFileSync(path.join(moduleDirectory, "c2c-execution-helper-integrity.json"), JSON.stringify({
       version: 2,
-      protocolVersion: 5,
+      protocolVersion: 7,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: trustedHelperHash,
       launcherPath: "build/native/c2c-execution-launcher.exe",

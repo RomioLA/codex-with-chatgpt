@@ -2,16 +2,17 @@ import { randomBytes, createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { readPermission } from "../permission/store.js";
+import { readCurrentSessionGrant, readPermission, readPermissionStatus } from "../permission/store.js";
 import type { Workspace } from "../workspace/manager.js";
-import type { ExecutionJob, ExecutionKind, OutputStream, PackageManager } from "./job-types.js";
-import { isExecutionKind } from "./job-types.js";
+import type { ExecutionJob, ExecutionKind, FullAccessExecutionJob, OutputStream, PackageManager, RepositoryExecutionAuthorization, RepositoryExecutionJob } from "./job-types.js";
+import { isExecutionKind, isFullAccessExecutionJob } from "./job-types.js";
 import { checkExecutionPermission } from "./permission.js";
+import { beginEventLoopTraceSpan, isEventLoopTraceEnabled } from "../diagnostics/event-loop-trace.js";
 import { resolveRepositoryIdentity, RepositoryIdentityError, type RepositoryIdentity } from "./repository-identity.js";
 import { findTrustedCommand, CommandNotApprovedError, type TrustedCommand } from "./trusted-registry.js";
 import { ExecutionJobStore, MAX_JOBS_PER_WORKSPACE, type ReadJobOutputResult } from "./job-store.js";
 import { transitionExecutionJob } from "./state-machine.js";
-import { WindowsNativeExecutionRunner, type NativeRunnerHandle } from "./native-runner.js";
+import { NativeRunnerOutputError, WindowsNativeExecutionRunner, type NativeRunnerHandle, type NativeRunnerRequest } from "./native-runner.js";
 import { ExecutionTempOwner } from "./execution-temp.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
 import type { Logger } from "../logger/index.js";
@@ -24,6 +25,7 @@ import { hasGitReviewHold, requireGitReview } from "./git-review-hold.js";
 import { verifyGitPostconditions } from "../git-write/planner.js";
 import { confirmGitWriteState, listGitRepositoryApprovals, type GitWriteOperation } from "../git-write/index.js";
 import { acquireRepositoryWriteLock } from "./repository-write-lock.js";
+import { resolveFullAccessCommand, verifyFullAccessCommand, type FullAccessCommandInput } from "./full-access-command.js";
 
 export const MAX_EXECUTION_TIMEOUT_SECONDS = 3600;
 export const MAX_GLOBAL_EXECUTIONS = 2;
@@ -42,6 +44,13 @@ interface StartExecutionInput {
   scopes: readonly string[];
 }
 
+type StartFullAccessInput = FullAccessCommandInput & {
+  timeoutSeconds: number;
+  idempotencyKey: string;
+  oauthClientId: string;
+  scopes: readonly string[];
+};
+
 export type ExecutionServiceErrorCode =
   | "INVALID_ARGUMENTS"
   | "INSUFFICIENT_SCOPE"
@@ -59,8 +68,8 @@ export type ExecutionServiceErrorCode =
   | "CANCEL_NOT_ALLOWED"
   | "SUPERVISOR_CLOSING";
 
-export type StartExecutionResult =
-  | { ok: true; job: ExecutionJob; duplicate: boolean }
+export type StartExecutionResult<T extends ExecutionJob = ExecutionJob> =
+  | { ok: true; job: T; duplicate: boolean }
   | { ok: false; error: string };
 
 export type CancelExecutionResult =
@@ -68,16 +77,8 @@ export type CancelExecutionResult =
   | { ok: false; error: "NOT_FOUND" | "CANCEL_NOT_ALLOWED" | "STORE_CORRUPT" };
 
 export interface ExecutionRunner {
-  start(request: {
-    jobId: string;
-    repository: RepositoryIdentity;
-    trustedCommand: TrustedCommand;
-    timeoutSeconds: number;
-    stateDirectory: string;
-    tempLease: ReturnType<ExecutionTempOwner["create"]>;
-    genericCommand?: GenericCommand;
-  }, callbacks: {
-    onOutput: (stream: OutputStream, data: Buffer) => void;
+  start(request: NativeRunnerRequest, callbacks: {
+    onOutput: (stream: OutputStream, data: Buffer) => void | Promise<void>;
     onDiagnostic?: (message: string) => void;
   }): NativeRunnerHandle;
 }
@@ -93,10 +94,15 @@ interface ActiveExecution {
   finished: Promise<void>;
   releaseWriteLock?: () => void;
   treeConfirmed?: boolean;
+  tempCleanupConfirmed: boolean;
+  outputTail: Promise<void>;
+  outputFailure: unknown | null;
+  outputClosed: boolean;
+  outputFinalization: Promise<void> | null;
 }
 
 const supervisors = new Set<ExecutionSupervisor>();
-const globalSlots = new Map<string, { workspaceId: string; repositoryIdentity: string }>();
+const globalSlots = new Map<string, { workspaceId: string; repositoryIdentity: string | null }>();
 
 function scheduleAll(): void {
   for (const supervisor of supervisors) supervisor.schedule();
@@ -183,13 +189,18 @@ export class ExecutionSupervisor {
     return null;
   }
 
-  startLevel3(input: { requestId: string; digest: string; oauthClientId: string; scopes: readonly string[]; idempotencyKey: string }): StartExecutionResult {
+  startLevel3(input: { requestId: string; digest: string; oauthClientId: string; scopes: readonly string[]; idempotencyKey: string }): StartExecutionResult<RepositoryExecutionJob> {
     const denied = this.controlledGate(input.scopes, "execution.level3", input.oauthClientId, input.idempotencyKey);
     if (denied) return { ok: false, error: denied };
     const hash = createHash("sha256").update(input.idempotencyKey).digest("hex");
     const previous = this.store.findIdempotent(input.oauthClientId, hash);
-    if (previous) return previous.authorization?.type === "level3" && previous.authorization.requestId === input.requestId && previous.authorization.digest === input.digest
-      ? { ok: true, job: previous, duplicate: true } : { ok: false, error: "IDEMPOTENCY_CONFLICT" };
+    if (previous) {
+      if (!isFullAccessExecutionJob(previous) && previous.authorization?.type === "level3" &&
+          previous.authorization.requestId === input.requestId && previous.authorization.digest === input.digest) {
+        return { ok: true, job: previous, duplicate: true };
+      }
+      return { ok: false, error: "IDEMPOTENCY_CONFLICT" };
+    }
     try {
       this.store.prepareCapacity();
       const authorization = consumeLevel3Request(this.workspace, input.requestId, input.oauthClientId, input.digest);
@@ -198,7 +209,7 @@ export class ExecutionSupervisor {
     } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
   }
 
-  startGitWrite(input: { repositoryPath: string; operation: GitWriteOperation; timeoutSeconds: number; oauthClientId: string; scopes: readonly string[]; idempotencyKey: string }): StartExecutionResult {
+  startGitWrite(input: { repositoryPath: string; operation: GitWriteOperation; timeoutSeconds: number; oauthClientId: string; scopes: readonly string[]; idempotencyKey: string }): StartExecutionResult<RepositoryExecutionJob> {
     const denied = this.controlledGate(input.scopes, "git.write", input.oauthClientId, input.idempotencyKey);
     if (denied) return { ok: false, error: denied };
     if (!Number.isSafeInteger(input.timeoutSeconds) || input.timeoutSeconds < 1 || input.timeoutSeconds > MAX_EXECUTION_TIMEOUT_SECONDS) return { ok: false, error: "INVALID_ARGUMENTS" };
@@ -206,7 +217,7 @@ export class ExecutionSupervisor {
     const previous = this.store.findIdempotent(input.oauthClientId, hash);
     if (previous) {
       try {
-        if (previous.authorization?.type !== "git") throw new Error("IDEMPOTENCY_CONFLICT");
+        if (isFullAccessExecutionJob(previous) || previous.authorization?.type !== "git") throw new Error("IDEMPOTENCY_CONFLICT");
         const old = readGitJobPlan(this.workspace, previous.authorization.requestId, previous.authorization.digest);
         const original = { ...old.operation };
         if (input.operation.expectedStatusHash === undefined) delete original.expectedStatusHash;
@@ -224,9 +235,10 @@ export class ExecutionSupervisor {
     } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
   }
 
-  private enqueueControlled(repository: RepositoryIdentity, authorization: NonNullable<ExecutionJob["authorization"]>, timeoutSeconds: number, idempotencyKeyHash: string, oauthClientId: string): StartExecutionResult {
-    const job: ExecutionJob = {
+  private enqueueControlled(repository: RepositoryIdentity, authorization: RepositoryExecutionAuthorization, timeoutSeconds: number, idempotencyKeyHash: string, oauthClientId: string): StartExecutionResult<RepositoryExecutionJob> {
+    const job: RepositoryExecutionJob = {
       jobId: randomBytes(24).toString("base64url"), workspaceId: this.workspace.id,
+      executionContext: "repository",
       repositoryIdentity: repository.identity, repositoryPath: repository.workspaceRelativePath, oauthClientId,
       recipe: { kind: "package_script", target: "v13", packageManager: "npm", scriptHash: authorization.digest }, authorization,
       state: "queued", createdAt: new Date(this.now()).toISOString(), startedAt: null, finishedAt: null, timeoutSeconds,
@@ -237,10 +249,10 @@ export class ExecutionSupervisor {
     try { this.store.create(job); } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
     this.logger.info("Controlled execution authorized", { workspaceId: this.workspace.id, jobId: job.jobId, oauthClientId, capability: authorization.type, requestId: authorization.requestId, digest: authorization.digest });
     this.schedule();
-    return { ok: true, job: this.store.get(job.jobId) ?? job, duplicate: false };
+    return { ok: true, job: (this.store.get(job.jobId) as RepositoryExecutionJob | null) ?? job, duplicate: false };
   }
 
-  start(input: StartExecutionInput): StartExecutionResult {
+  start(input: StartExecutionInput): StartExecutionResult<RepositoryExecutionJob> {
     if (!this.accepting) return { ok: false, error: "SUPERVISOR_CLOSING" };
     if (this.store.corruption) return { ok: false, error: "STORE_CORRUPT" };
     if (!input || typeof input !== "object" || !isExecutionKind(input.kind) || !validTarget(input.kind, input.target)) {
@@ -275,7 +287,7 @@ export class ExecutionSupervisor {
     const idempotencyKeyHash = createHash("sha256").update(input.idempotencyKey, "utf8").digest("hex");
     const duplicate = this.store.findIdempotent(input.oauthClientId, idempotencyKeyHash);
     if (duplicate) {
-      const sameRequest = duplicate.repositoryIdentity === repository.identity &&
+      const sameRequest = !isFullAccessExecutionJob(duplicate) && duplicate.repositoryIdentity === repository.identity &&
         duplicate.recipe.kind === input.kind &&
         duplicate.recipe.target === input.target &&
         duplicate.timeoutSeconds === input.timeoutSeconds;
@@ -303,9 +315,10 @@ export class ExecutionSupervisor {
     }
 
     const now = new Date(this.now()).toISOString();
-    const job: ExecutionJob = {
+    const job: RepositoryExecutionJob = {
       jobId: randomBytes(24).toString("base64url"),
       workspaceId: this.workspace.id,
+      executionContext: "repository",
       repositoryIdentity: repository.identity,
       repositoryPath: repository.workspaceRelativePath,
       oauthClientId: input.oauthClientId,
@@ -333,7 +346,103 @@ export class ExecutionSupervisor {
       return { ok: false, error: (error as Error).message === "JOB_STORE_FULL" ? "JOB_STORE_FULL" : "INVALID_ARGUMENTS" };
     }
     this.schedule();
-    return { ok: true, job: this.store.get(job.jobId) ?? job, duplicate: false };
+    return { ok: true, job: (this.store.get(job.jobId) as RepositoryExecutionJob | null) ?? job, duplicate: false };
+  }
+
+  private currentFullAccessGrant(): { identityFingerprint: string; grantId: string } | null {
+    try {
+      const permission = readPermissionStatus(this.workspace.id);
+      if (permission.effectiveMode !== "level2" || !permission.sessionElevation.active) return null;
+      return readCurrentSessionGrant(this.workspace.id);
+    } catch {
+      return null;
+    }
+  }
+
+  private hasCurrentFullAccessGrant(job: FullAccessExecutionJob): boolean {
+    const current = this.currentFullAccessGrant();
+    return current !== null && current.identityFingerprint === job.authorization.sessionGrantFingerprint &&
+      current.grantId === job.authorization.sessionGrantId;
+  }
+
+  async startFullAccess(input: StartFullAccessInput): Promise<StartExecutionResult<FullAccessExecutionJob>> {
+    if (!this.accepting) return { ok: false, error: "SUPERVISOR_CLOSING" };
+    if (this.store.corruption) return { ok: false, error: "STORE_CORRUPT" };
+    if (!input || typeof input !== "object" ||
+        !["program", "powershell", "cmd"].includes(input.engine) ||
+        !Number.isSafeInteger(input.timeoutSeconds) || input.timeoutSeconds < 1 || input.timeoutSeconds > MAX_EXECUTION_TIMEOUT_SECONDS ||
+        typeof input.idempotencyKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(input.idempotencyKey) ||
+        typeof input.oauthClientId !== "string" || input.oauthClientId.length < 1 || input.oauthClientId.length > 200) {
+      return { ok: false, error: "INVALID_ARGUMENTS" };
+    }
+    if (!Array.isArray(input.scopes) || !input.scopes.includes("execution.run")) {
+      return { ok: false, error: "INSUFFICIENT_SCOPE" };
+    }
+    const sessionGrant = this.currentFullAccessGrant();
+    if (!sessionGrant) return { ok: false, error: "FULL_ACCESS_REQUIRED" };
+
+    let command;
+    try {
+      command = await resolveFullAccessCommand(input, this.workspace.root);
+    } catch (error) {
+      return { ok: false, error: cleanCode((error as Error).message) };
+    }
+    const idempotencyKeyHash = createHash("sha256").update(input.idempotencyKey, "utf8").digest("hex");
+    const requestHash = createHash("sha256").update(JSON.stringify({ command, timeoutSeconds: input.timeoutSeconds }), "utf8").digest("hex");
+    const previous = this.store.findIdempotent(input.oauthClientId, idempotencyKeyHash);
+    if (previous) {
+      const sameRequest = isFullAccessExecutionJob(previous) &&
+        previous.authorization.requestHash === requestHash && previous.timeoutSeconds === input.timeoutSeconds;
+      return sameRequest
+        ? { ok: true, job: previous, duplicate: true }
+        : { ok: false, error: "IDEMPOTENCY_CONFLICT" };
+    }
+
+    try { this.store.prepareCapacity(); } catch (error) {
+      return { ok: false, error: cleanCode((error as Error).message) };
+    }
+    const job: FullAccessExecutionJob = {
+      jobId: randomBytes(24).toString("base64url"),
+      workspaceId: this.workspace.id,
+      oauthClientId: input.oauthClientId,
+      executionContext: "host",
+      repositoryIdentity: null,
+      repositoryPath: null,
+      recipe: null,
+      authorization: {
+        type: "full_access",
+        permissionMode: "level2",
+        sessionGrantFingerprint: sessionGrant.identityFingerprint,
+        sessionGrantId: sessionGrant.grantId,
+        requestHash,
+      },
+      fullAccessCommand: command,
+      state: "queued",
+      createdAt: new Date(this.now()).toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      timeoutSeconds: input.timeoutSeconds,
+      idempotencyKeyHash,
+      tempOwnership: null,
+      exitCode: null,
+      failureCode: null,
+      stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+      stderr: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+    };
+    try { this.store.create(job); } catch (error) {
+      return { ok: false, error: cleanCode((error as Error).message) };
+    }
+    this.logger.info("Full Access execution queued", {
+      workspaceId: this.workspace.id,
+      jobId: job.jobId,
+      oauthClientId: input.oauthClientId,
+      engine: command.engine,
+      executable: command.executable,
+      cwd: command.cwd,
+      requestHash,
+    });
+    this.schedule();
+    return { ok: true, job: (this.store.get(job.jobId) as FullAccessExecutionJob | null) ?? job, duplicate: false };
   }
 
   getForClient(jobId: string, clientId: string): ExecutionJob | null {
@@ -389,13 +498,26 @@ export class ExecutionSupervisor {
     while (globalSlots.size < MAX_GLOBAL_EXECUTIONS) {
       const workspaceActive = [...globalSlots.values()].filter((slot) => slot.workspaceId === this.workspace.id).length;
       if (workspaceActive >= MAX_WORKSPACE_EXECUTIONS) break;
-      const busyRepositories = new Set([...globalSlots.values()].map((slot) => slot.repositoryIdentity));
-      const next = this.allQueuedOldestFirst().find((job) => !busyRepositories.has(job.repositoryIdentity));
+      const busyRepositories = new Set([...globalSlots.values()]
+        .flatMap((slot) => slot.repositoryIdentity === null ? [] : [slot.repositoryIdentity]));
+      const next = this.allQueuedOldestFirst().find((job) =>
+        isFullAccessExecutionJob(job) || !busyRepositories.has(job.repositoryIdentity));
       if (!next) break;
       const workspaceSlot = `${this.workspace.id}:${next.jobId}`;
       if (globalSlots.has(workspaceSlot)) break;
-      globalSlots.set(workspaceSlot, { workspaceId: this.workspace.id, repositoryIdentity: next.repositoryIdentity });
-      this.startQueued(next, workspaceSlot);
+      globalSlots.set(workspaceSlot, {
+        workspaceId: this.workspace.id,
+        repositoryIdentity: isFullAccessExecutionJob(next) ? null : next.repositoryIdentity,
+      });
+      void this.startQueued(next, workspaceSlot).catch((error: unknown) => {
+        const current = this.store.get(next.jobId);
+        if (current?.state === "queued") {
+          this.store.replace(transitionExecutionJob(current, "failed", { failureCode: cleanCode((error as Error).message) }));
+          if (!isFullAccessExecutionJob(current)) this.auditControlledCompletion(current.jobId);
+        }
+        globalSlots.delete(workspaceSlot);
+        scheduleAll();
+      });
     }
   }
 
@@ -405,47 +527,54 @@ export class ExecutionSupervisor {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
-  private startQueued(job: ExecutionJob, workspaceSlot: string): void {
+  private async startQueued(job: ExecutionJob, workspaceSlot: string): Promise<void> {
     const permission = readPermission(this.workspace.id);
     if (permission === "readonly") {
       globalSlots.delete(workspaceSlot);
       this.cancelQueuedForDowngrade();
       return;
     }
-    let repository: RepositoryIdentity;
-    let trustedCommand: TrustedCommand;
+    let repository: RepositoryIdentity | undefined;
+    let trustedCommand: TrustedCommand | undefined;
     let genericCommand: GenericCommand | undefined;
     let releaseWriteLock: (() => void) | undefined;
+    const fullAccessJob = isFullAccessExecutionJob(job);
     try {
-      repository = resolveRepositoryIdentity(this.workspace, job.repositoryPath);
-      if (repository.identity !== job.repositoryIdentity) throw new RepositoryIdentityError("PATH_CHANGED");
-      if (job.authorization) {
-        releaseWriteLock = acquireRepositoryWriteLock(repository, job.jobId);
-        if (job.authorization.type === "git" && hasGitReviewHold(this.workspace, job.repositoryPath)) throw new Error("GIT_REVIEW_REQUIRED");
-        const resolved = job.authorization.type === "level3"
-          ? resolveConsumedLevel3Request(this.workspace, job.authorization.requestId, job.oauthClientId, job.authorization.digest)
-          : resolveGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
-        if (resolved.repository.identity !== repository.identity) throw new RepositoryIdentityError("PATH_CHANGED");
-        genericCommand = resolved.genericCommand;
-        trustedCommand = { workspaceId: this.workspace.id, repositoryIdentity: repository.identity,
-          canonicalRepositoryPath: repository.canonicalPath, kind: "package_script", target: "v13", packageManager: "npm",
-          scriptHash: job.authorization.digest, packageJsonHash: job.authorization.digest, approvedAt: job.createdAt, approvalSource: "local-cli" };
-      } else trustedCommand = findTrustedCommand({
-        workspaceId: this.workspace.id,
-        repositoryIdentity: repository.identity,
-        canonicalRepositoryPath: repository.canonicalPath,
-        kind: job.recipe.kind,
-        target: job.recipe.target,
-      });
+      if (fullAccessJob) {
+        if (!this.hasCurrentFullAccessGrant(job)) throw new Error("FULL_ACCESS_REQUIRED");
+        await verifyFullAccessCommand(job.fullAccessCommand);
+        if (!this.hasCurrentFullAccessGrant(job)) throw new Error("FULL_ACCESS_REQUIRED");
+      } else {
+        repository = resolveRepositoryIdentity(this.workspace, job.repositoryPath);
+        if (repository.identity !== job.repositoryIdentity) throw new RepositoryIdentityError("PATH_CHANGED");
+        if (job.authorization) {
+          releaseWriteLock = acquireRepositoryWriteLock(repository, job.jobId);
+          if (job.authorization.type === "git" && hasGitReviewHold(this.workspace, job.repositoryPath)) throw new Error("GIT_REVIEW_REQUIRED");
+          const resolved = job.authorization.type === "level3"
+            ? resolveConsumedLevel3Request(this.workspace, job.authorization.requestId, job.oauthClientId, job.authorization.digest)
+            : resolveGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
+          if (resolved.repository.identity !== repository.identity) throw new RepositoryIdentityError("PATH_CHANGED");
+          genericCommand = resolved.genericCommand;
+          trustedCommand = { workspaceId: this.workspace.id, repositoryIdentity: repository.identity,
+            canonicalRepositoryPath: repository.canonicalPath, kind: "package_script", target: "v13", packageManager: "npm",
+            scriptHash: job.authorization.digest, packageJsonHash: job.authorization.digest, approvedAt: job.createdAt, approvalSource: "local-cli" };
+        } else trustedCommand = findTrustedCommand({
+          workspaceId: this.workspace.id,
+          repositoryIdentity: repository.identity,
+          canonicalRepositoryPath: repository.canonicalPath,
+          kind: job.recipe.kind,
+          target: job.recipe.target,
+        });
+      }
     } catch (error) {
       releaseWriteLock?.();
       globalSlots.delete(workspaceSlot);
       const failureCode = error instanceof RepositoryIdentityError
         ? error.code === "REPARSE_POINT" ? "REPARSE_POINT" : "REPOSITORY_IDENTITY_CHANGED"
-        : job.authorization ? cleanCode((error as Error).message) : "COMMAND_NOT_APPROVED";
+        : fullAccessJob || job.authorization ? cleanCode((error as Error).message) : "COMMAND_NOT_APPROVED";
       const failed = transitionExecutionJob(job, "failed", { failureCode });
       this.store.replace(failed);
-      this.auditControlledCompletion(job.jobId);
+      if (!fullAccessJob) this.auditControlledCompletion(job.jobId);
       scheduleAll();
       return;
     }
@@ -463,15 +592,31 @@ export class ExecutionSupervisor {
         nonce: tempLease.nonce,
         createdAtMs: tempLease.createdAtMs,
       } });
-      const handle = this.runner.start({
+      const runnerRequest: NativeRunnerRequest = fullAccessJob ? {
         jobId: job.jobId,
-        repository,
-        trustedCommand,
+        timeoutSeconds: job.timeoutSeconds,
+        stateDirectory: this.store.directory,
+        tempLease,
+        fullAccess: {
+          workspaceId: job.workspaceId,
+          oauthClientId: job.oauthClientId,
+          permissionMode: job.authorization.permissionMode,
+          sessionGrantFingerprint: job.authorization.sessionGrantFingerprint,
+          sessionGrantId: job.authorization.sessionGrantId ?? "",
+          idempotencyKeyHash: job.idempotencyKeyHash,
+          requestHash: job.authorization.requestHash,
+          command: job.fullAccessCommand,
+        },
+      } : {
+        jobId: job.jobId,
+        repository: repository!,
+        trustedCommand: trustedCommand!,
         timeoutSeconds: job.timeoutSeconds,
         stateDirectory: this.store.directory,
         tempLease,
         ...(genericCommand ? { genericCommand } : {}),
-      }, {
+      };
+      const handle = this.runner.start(runnerRequest, {
         onOutput: (stream, data) => this.onOutput(job.jobId, stream, data, active),
         onDiagnostic: (message) => this.logger.warn("Execution helper diagnostic", {
           workspaceId: this.workspace.id,
@@ -490,16 +635,29 @@ export class ExecutionSupervisor {
         sanitizers,
         decoders,
         finished: Promise.resolve(),
+        outputTail: Promise.resolve(),
+        outputFailure: null,
+        outputClosed: false,
+        outputFinalization: null,
+        tempCleanupConfirmed: false,
         releaseWriteLock,
         treeConfirmed: false,
       };
       this.active.set(job.jobId, active);
       active.finished = handle.completion
-        .then((completion) => {
+        .then(async (completion) => {
           active.treeConfirmed = completion.result.outcome !== 3;
-          this.completeJob(job.jobId, active, completion.result, completion.tempCleanupConfirmed === true);
+          active.tempCleanupConfirmed = completion.tempCleanupConfirmed === true;
+          await this.completeJob(job.jobId, active, completion.result, completion.tempCleanupConfirmed === true);
         })
-        .catch(() => this.failUnconfirmed(job.jobId, active, "HELPER_UNCONFIRMED"))
+        .catch((error: unknown) => {
+          if (error instanceof NativeRunnerOutputError) {
+            active.treeConfirmed = error.helperResult.outcome !== 3;
+            active.tempCleanupConfirmed = error.tempCleanupConfirmed;
+          }
+          return this.failUnconfirmed(job.jobId, active,
+            error instanceof Error && error.message === "OUTPUT_PERSISTENCE_FAILED" ? "OUTPUT_PERSISTENCE_FAILED" : "HELPER_UNCONFIRMED");
+        })
         .finally(() => this.releaseActive(job.jobId, active));
     } catch (error) {
       releaseWriteLock?.();
@@ -511,14 +669,26 @@ export class ExecutionSupervisor {
             : "HELPER_START_FAILED"),
       });
       this.store.replace(failed);
-      this.auditControlledCompletion(job.jobId);
+      if (!fullAccessJob) this.auditControlledCompletion(job.jobId);
       globalSlots.delete(workspaceSlot);
       scheduleAll();
     }
   }
 
-  private onOutput(jobId: string, stream: OutputStream, data: Buffer, active: ActiveExecution): void {
-    if (!active || this.store.get(jobId)?.state === "interrupted") return;
+  private onOutput(jobId: string, stream: OutputStream, data: Buffer, active: ActiveExecution): Promise<void> {
+    if (!active || this.store.get(jobId)?.state === "interrupted") return Promise.resolve();
+    if (active.outputClosed) return Promise.reject(new Error("OUTPUT_PERSISTENCE_FAILED"));
+    const operation = active.outputTail.then(async () => {
+      if (active.outputFailure) throw active.outputFailure;
+      await this.acceptOutput(jobId, stream, data, active);
+    });
+    active.outputTail = operation.then(() => undefined, (error: unknown) => {
+      if (active.outputFailure === null) active.outputFailure = error;
+    });
+    return operation;
+  }
+
+  private async acceptOutput(jobId: string, stream: OutputStream, data: Buffer, active: ActiveExecution): Promise<void> {
     if (this.store.get(jobId)?.authorization && data.includes(0)) {
       // Generic programs can emit UTF-16 or binary data. Do not pass NUL-
       // interleaved secrets around the UTF-8 text sanitizer.
@@ -528,27 +698,39 @@ export class ExecutionSupervisor {
     const text = active.decoders[stream].write(data);
     if (!text) return;
     const safe = active.sanitizers[stream].push(text);
-    if (safe) this.store.appendSanitized(jobId, stream, safe);
+    if (safe) await this.store.appendSanitized(jobId, stream, safe);
     const reason = active.sanitizers[stream].restrictedReason;
     if (reason) this.store.markOutputRestricted(jobId, stream, reason);
   }
 
-  private finishSanitizers(jobId: string, active: ActiveExecution): void {
+  private async finishSanitizers(jobId: string, active: ActiveExecution): Promise<void> {
     for (const stream of ["stdout", "stderr"] as const) {
       const tail = active.decoders[stream].end();
       if (tail) {
         const safeTail = active.sanitizers[stream].push(tail);
-        if (safeTail) this.store.appendSanitized(jobId, stream, safeTail);
+        if (safeTail) await this.store.appendSanitized(jobId, stream, safeTail);
       }
       const safe = active.sanitizers[stream].finish();
-      if (safe) this.store.appendSanitized(jobId, stream, safe);
+      if (safe) await this.store.appendSanitized(jobId, stream, safe);
       const reason = active.sanitizers[stream].restrictedReason;
       if (reason) this.store.markOutputRestricted(jobId, stream, reason);
     }
   }
 
-  private completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3 | 4 | 5; exitCode: number; win32Error: number }, tempCleanupConfirmed: boolean): void {
-    this.finishSanitizers(jobId, active);
+  private finalizeOutput(jobId: string, active: ActiveExecution): Promise<void> {
+    if (active.outputFinalization) return active.outputFinalization;
+    active.outputClosed = true;
+    active.outputFinalization = (async () => {
+      await active.outputTail;
+      if (active.outputFailure) throw active.outputFailure;
+      await this.finishSanitizers(jobId, active);
+      await this.store.flushOutput(jobId);
+    })();
+    return active.outputFinalization;
+  }
+
+  private async completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3 | 4 | 5; exitCode: number; win32Error: number }, tempCleanupConfirmed: boolean): Promise<void> {
+    await this.finalizeOutput(jobId, active);
     const job = this.store.get(jobId);
     if (!job || job.state === "interrupted" || job.finishedAt) return;
     let terminal: ExecutionJob["state"];
@@ -580,17 +762,47 @@ export class ExecutionSupervisor {
       terminal = "failed";
       failureCode = "NONZERO_EXIT";
     }
-    this.store.replace(transitionExecutionJob({
+    const final = transitionExecutionJob({
       ...job,
       tempOwnership: tempCleanupConfirmed ? null : job.tempOwnership,
-    }, terminal, { exitCode, failureCode }));
+    }, terminal, { exitCode, failureCode });
+    this.store.replace(final);
+    if (isFullAccessExecutionJob(final)) {
+      this.logger.info("Full Access execution finished", {
+        workspaceId: final.workspaceId,
+        jobId: final.jobId,
+        oauthClientId: final.oauthClientId,
+        state: final.state,
+        exitCode: final.exitCode,
+        failureCode: final.failureCode,
+      });
+    }
   }
 
-  private failUnconfirmed(jobId: string, active: ActiveExecution, code: string): void {
-    this.finishSanitizers(jobId, active);
+  private async failUnconfirmed(jobId: string, active: ActiveExecution, code: string): Promise<void> {
+    try {
+      await this.finalizeOutput(jobId, active);
+    } catch (error) {
+      if (error instanceof Error && error.message === "OUTPUT_PERSISTENCE_FAILED") code = "OUTPUT_PERSISTENCE_FAILED";
+    }
     const job = this.store.get(jobId);
     if (!job || job.finishedAt) return;
-    this.store.replace(transitionExecutionJob(job, "interrupted", { exitCode: null, failureCode: cleanCode(code) }));
+    this.store.replace(transitionExecutionJob({
+      ...job,
+      tempOwnership: active.tempCleanupConfirmed ? null : job.tempOwnership,
+    }, "interrupted", { exitCode: null, failureCode: cleanCode(code) }));
+  }
+
+  private async interruptAfterOutput(jobId: string, active: ActiveExecution, code: string): Promise<void> {
+    let failureCode = code;
+    try {
+      await this.finalizeOutput(jobId, active);
+    } catch {
+      failureCode = "OUTPUT_PERSISTENCE_FAILED";
+    }
+    const job = this.store.get(jobId);
+    if (!job || job.finishedAt) return;
+    this.store.replace(transitionExecutionJob(job, "interrupted", { failureCode }));
   }
 
   private releaseActive(jobId: string, active: ActiveExecution): void {
@@ -605,7 +817,7 @@ export class ExecutionSupervisor {
 
   private auditControlledCompletion(jobId: string): void {
     const job = this.store.get(jobId);
-    if (!job?.authorization) return;
+    if (!job?.authorization || isFullAccessExecutionJob(job)) return;
     try {
       if (job.authorization.type === "level3") {
         completeLevel3Request(this.workspace.id, job.authorization.requestId, job.oauthClientId, job.state === "succeeded" ? "completed" : "failed", jobCanBeArchived(job));
@@ -659,9 +871,8 @@ export class ExecutionSupervisor {
       const job = this.store.get(jobId);
       if (!job || job.finishedAt || this.active.get(jobId) !== active) return;
       active.handle.abandon(); // EOF delegates cleanup to the per-job helper.
-      this.store.replace(transitionExecutionJob(job, "interrupted", {
-        failureCode: "TREE_TERMINATION_UNCONFIRMED",
-      }));
+      void this.interruptAfterOutput(jobId, active, "TREE_TERMINATION_UNCONFIRMED")
+        .catch(() => this.logger.error("Failed to persist execution interruption after output flush", { workspaceId: this.workspace.id, jobId }));
     }, this.cancelGraceMs);
     active.graceTimer.unref?.();
   }
@@ -684,16 +895,27 @@ export class ExecutionSupervisor {
 
   reconcilePermission(): void {
     if (this.closed) return;
-    if (readPermission(this.workspace.id) === "readonly") this.cancelQueuedForDowngrade();
-    for (const job of this.store.listAll()) {
-      if (!job.authorization || (job.state !== "queued" && job.state !== "running")) continue;
-      let authorized = false;
-      try {
-        authorized = job.authorization.type === "level3"
-          ? isLevel3Enabled(this.workspace.id) && ["consumed", "launching"].includes(getLevel3Request(this.workspace.id, job.authorization.requestId)?.status ?? "")
-          : listGitRepositoryApprovals(this.workspace.id).some((approval) => approval.repositoryIdentity === job.repositoryIdentity);
-      } catch { /* corrupt or revoked authority fails closed */ }
-      if (!authorized) this.cancel(job.jobId, job.oauthClientId);
+    const span = isEventLoopTraceEnabled() ? beginEventLoopTraceSpan("permission_poll", {}, true) : null;
+    let resultCategory: "success" | "failure" = "success";
+    try {
+      if (readPermission(this.workspace.id) === "readonly") this.cancelQueuedForDowngrade();
+      for (const job of this.store.listAll()) {
+        if ((job.state !== "queued" && job.state !== "running") ||
+            (!job.authorization && !isFullAccessExecutionJob(job))) continue;
+        let authorized = false;
+        try {
+          if (isFullAccessExecutionJob(job)) authorized = this.hasCurrentFullAccessGrant(job);
+          else if (job.authorization) authorized = job.authorization.type === "level3"
+              ? isLevel3Enabled(this.workspace.id) && ["consumed", "launching"].includes(getLevel3Request(this.workspace.id, job.authorization.requestId)?.status ?? "")
+              : listGitRepositoryApprovals(this.workspace.id).some((approval) => approval.repositoryIdentity === job.repositoryIdentity);
+        } catch { /* corrupt or revoked authority fails closed */ }
+        if (!authorized) this.cancel(job.jobId, job.oauthClientId);
+      }
+    } catch (error) {
+      resultCategory = "failure";
+      throw error;
+    } finally {
+      span?.({ resultCategory });
     }
   }
 
@@ -721,7 +943,7 @@ export class ExecutionSupervisor {
       const job = this.store.get(jobId);
       if (job && !job.finishedAt) {
         active.handle.abandon();
-        this.store.replace(transitionExecutionJob(job, "interrupted", { failureCode: "SHUTDOWN_UNCONFIRMED" }));
+        await this.interruptAfterOutput(jobId, active, "SHUTDOWN_UNCONFIRMED");
       }
     }
     if (!this.store.corruption) {

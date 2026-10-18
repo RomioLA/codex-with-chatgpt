@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ListToolsRequestSchema, ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
 export const EXECUTION_TOOL_SCOPES = {
+  execution_run: "execution.run",
   execution_start: "execution.run",
   execution_status: "execution.jobs.read",
   execution_job_output: "execution.jobs.read",
@@ -10,6 +11,7 @@ export const EXECUTION_TOOL_SCOPES = {
   level3_request: "execution.level3",
   level3_request_status: "execution.level3",
   level3_start: "execution.level3",
+  git_compare: "git.read",
   git_write: "git.write",
   git_branches: "git.read",
 } as const;

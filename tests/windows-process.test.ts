@@ -45,8 +45,9 @@ describe("Windows background subprocess windowsHide: true (RED verification)", (
     makeGitRepo(tmpDir);
     spawnSyncCalls.length = 0;
     runGit(tmpDir, ["status", "--porcelain"]);
-    const gitCall = spawnSyncCalls.find((c) => c.file === "git");
+    const gitCall = spawnSyncCalls.find((c) => path.win32.isAbsolute(c.file) && path.basename(c.file).toLowerCase() === "git.exe");
     expect(gitCall).toBeDefined();
+    expect(gitCall?.file).not.toBe("git");
     expect(gitCall?.options).toHaveProperty("windowsHide", true);
   });
 

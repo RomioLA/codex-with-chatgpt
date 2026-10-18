@@ -2,7 +2,7 @@
 
 日期：2026-10-04
 
-状态：需求基线
+状态：需求基线（2026-10-17 已补充 Full Access / Remote Parity 最终裁决）
 
 适用仓库：`RomioLA/codex-with-chatgpt`
 
@@ -10,7 +10,23 @@
 
 本文不是实现方案，不要求按照某一种内部代码结构完成；实现可以调整，但不得在没有用户明确确认的情况下缩减本文已经确认的权限能力、禁止项和人工授权边界。
 
+## 0. 2026-10-17 产品裁决：Full Access / Remote Parity
+
+本节是对本文早期权限设计的后续明确裁决。若本文后续旧段落与本节冲突，以本节为准。
+
+- C2C 的最高本机权限模式定义为 **Full Access**。当前 V1.3.2 实现中，最高有效本机权限仍使用 `level2` 名称；产品语义按 Full Access 理解。
+- 用户在本机明确选择 Full Access，本身就是对普通本机操作的授权边界。ChatGPT 仍不得自行从低权限提升到 Full Access。
+- Full Access 的目标是在相同 Windows 用户、登录会话和 elevation 上，对非 GUI 的本机开发和主机操作达到 Remote Desktop Commander 的实际能力覆盖。
+- Full Access 不得把“逐命令人工批准”“逐命令 digest 确认”“trusted-command 预登记”“单独开启 Level 3”作为普通通用命令执行的必经条件。
+- PowerShell、CMD、直接程序、Node、Python、包管理器、测试、构建、lint、typecheck、Git、进程及其他同用户权限下的普通本机操作，都属于 Full Access 必须覆盖的能力范围。
+- C2C 可以保留或加强 OAuth/client binding、workspace/repository identity、Job Object、输出脱敏、审计、stale protection、reparse/path validation、crash safety 等机制；这些是安全与可靠性增强，不能被用来把 Full Access 静默降级成比 Remote 更弱的权限层。
+- 历史 Level 3 单次审批、trusted-command registry、Git repository approval 可以继续服务 restricted mode、兼容性、结构化安全路径或历史行为，但不得覆盖 Full Access 的最终产品合同。
+- 如果未来因为安全原因确实需要降低 Full Access 已有能力，必须作为产品合同变更明确提出并获得用户/产品 owner 确认，不能作为普通实现细节静默收紧。
+- 具体非回退验收矩阵见 `docs/remote-parity-acceptance.md`，仓库级开发约束见根目录 `AGENTS.md`。
+
 ---
+
+
 
 ## 1. 背景
 
@@ -252,21 +268,20 @@ ChatGPT 可以读取并知道当前权限等级，但不能自行把自己从低
 
 这项能力的目的，是让 C2C 不再只能处理当前 repo，而是在用户明确给予高权限后，可以帮助处理 repo 外的真实开发环境和相关文件。
 
-### 6.4 workspace 外：暂时禁止删除
+### 6.4 workspace 外：Full Access 允许按当前 Windows 用户权限删除
 
-这是当前明确的硬限制。
+2026-10-17 产品裁决后，最高权限模式不再把 workspace 外删除作为永久硬禁令。
 
-即使处于权限 2，也暂时不允许通过 C2C 删除 workspace 外的文件或目录。
+当用户已在本机明确选择 Full Access（当前 V1.3.2 实现名为 effective `level2`）时，C2C 应能够在与 Remote 相同的 Windows 用户、session 和 elevation 权限范围内执行必要的 workspace 外删除，包括普通文件、目录及开发/维护所需的递归清理。
 
-包括：
+仍然必须保留：
 
-- 不允许删除 workspace 外普通文件；
-- 不允许删除 workspace 外目录；
-- 不允许递归删除 workspace 外目录；
-- 不允许通过“移动到回收站”等方式变相提供 workspace 外删除工具；
-- 不允许 ChatGPT 自行解除这条限制。
+- ChatGPT 不能自行从低权限提升到 Full Access；
+- 敏感路径、credential、受保护 C2C 自身状态等明确产品级保护；
+- 路径 canonicalization / reparse / identity / audit 等安全检查；
+- 对真实 OS 权限、sharing/ACL、UAC/elevation 边界的尊重。
 
-未来如果确实需要“workspace 外删除”，必须作为新的能力单独讨论和确认，不能因为已经拥有权限 2 就自动开放。
+不得通过逐命令审批、trusted-command allowlist 或单独 Level 3 开关重新把 Full Access 的普通删除能力封死。
 
 ---
 
@@ -284,7 +299,7 @@ ChatGPT 可以读取并知道当前权限等级，但不能自行把自己从低
 | workspace 外读取 | 禁止 | 允许 | 允许 |
 | workspace 外创建 | 禁止 | 禁止 | 允许 |
 | workspace 外修改 / 覆盖 | 禁止 | 禁止 | 允许 |
-| workspace 外删除 | 禁止 | 禁止 | **禁止** |
+| workspace 外删除 | 禁止 | 禁止 | **允许（Full Access；受同用户 OS 权限与明确产品级敏感保护约束）** |
 
 这张表是当前权限设计的最重要产品合同之一。
 
@@ -499,22 +514,26 @@ PowerShell ...
 - Node / Python 等项目工具；
 - 必要的 PowerShell / CMD 操作。
 
-### 11.3 仍需在实现设计阶段明确的部分
+### 11.3 Full Access 命令执行已冻结的产品结论
 
-以下内容在本轮没有完全冻结，应由实现设计单独给出方案，不能由开发者默默假设：
+2026-10-17 后，最高权限模式的通用命令执行不再属于“是否开放”的待设计项。
 
-- 权限 1 具体允许哪些命令；
-- 权限 2 是否直接允许任意 shell；
-- 如何防止 shell 绕过“workspace 外禁止删除”；
-- 是否需要命令白名单 / 黑名单；
-- 是否需要 cwd 限制；
-- 是否需要进程超时；
-- 如何管理长时间运行的进程；
-- 如何分页读取 stdout / stderr；
-- 如何停止进程；
-- 是否需要对高风险系统命令单独确认。
+Full Access 必须允许：
 
-因此：命令执行是明确需要的能力方向，但具体安全模型仍需单独设计和审核。
+- PowerShell / CMD；
+- 直接可执行程序；
+- Node / Python；
+- package manager、测试、build、lint、typecheck；
+- 普通 Git 命令和开发工具；
+- 合法 cwd；
+- 长时间任务、状态、stdout/stderr 与取消；
+- 在相同 Windows 用户 / session / elevation 下 Remote 能完成的普通非 GUI 本机操作。
+
+普通 Full Access 命令不得要求逐命令人工审批、digest 确认、trusted-command 预登记或额外 Level 3 feature switch。
+
+仍可继续设计和强化的是“如何更可靠地执行”，例如 Job Object、审计、输出脱敏、超时、幂等、crash recovery、路径与 material 验证。Restricted mode 的命令边界也可以继续较窄。
+
+如果某类操作要作为 Full Access 的明确例外，必须写入产品需求和 Remote Parity 验收矩阵，不能由实现者默默假设。
 
 ---
 
@@ -628,7 +647,7 @@ STALE_FILE
 - 当前为只读，不能写 workspace；
 - 当前为权限 1，不能删除 workspace 内文件；
 - 当前为权限 1，不能写 workspace 外文件；
-- 当前为权限 2，但 workspace 外删除仍被永久规则禁止；
+- 当前权限不足以完成所请求操作，或目标命中 Full Access 仍保留的明确产品级敏感保护；
 - 目标属于敏感文件；
 - 文件在读取后已经变化；
 - 路径无效；
@@ -638,7 +657,7 @@ STALE_FILE
 
 ---
 
-## 17. 不允许通过其他工具绕过权限
+## 17. Restricted mode 不允许通过其他工具绕过权限；Full Access 不再人为降级
 
 权限模型必须针对“最终效果”，而不仅仅针对某几个工具名。
 
@@ -646,31 +665,32 @@ STALE_FILE
 
 - 权限 1 禁止删除，不能再提供一个 `shell rm` 来绕过；
 - 权限 1 禁止 workspace 外写入，不能通过 move / copy / shell 间接写到外面；
-- 权限 2 禁止 workspace 外删除，不能通过 PowerShell、CMD、Node、Python 或移动到回收站绕过。
+- readonly / 权限 1 的限制不能通过通用命令执行旁路。
 
-如果未来开放通用 shell，就必须同时解决这一问题。
+但 Full Access 的目标恰恰是允许同一 Windows 用户权限范围内的通用本机操作。不能继续用 restricted mode 的禁止项反向约束 Full Access，造成 Remote 可以做而 C2C Full Access 做不了。
 
-在无法可靠保证边界之前，应宁可限制某些高风险命令，也不要让命令执行破坏文件权限合同。
+因此实现必须区分：
+
+- restricted mode：命令执行不得绕过其权限边界；
+- Full Access：不以 C2C 独有的逐命令审批、allowlist 或 Level 3 gate 人为降级能力，但仍保留敏感信息保护、审计、OS 权限和明确产品级例外。
 
 ---
 
-## 18. 第一阶段不要求复制 Remote Desktop Commander 全部功能
+## 18. V1.3.2 最终目标包含 Full Access Remote Parity
 
-长期目标可以让 C2C 具备非常完整的本机开发能力，但第一阶段不需要为了“功能数量看起来一样”而复制 Remote Desktop Commander 的全部接口。
+此前“第一阶段不要求达到 Remote 能力”的阶段性原则已经被 2026-10-17 产品裁决取代。
 
-优先级应是：
+内部实现仍可以分阶段完成，但在 V1.3.2 最终 Release Gate 上：
 
-1. 权限模型正确；
-2. workspace 内写入可靠；
-3. workspace 外读取可靠；
-4. workspace 内删除和 workspace 外写入按权限 2 正确开放；
-5. workspace 外删除始终被阻止；
-6. 用户可以在本机方便切权限；
-7. ChatGPT 不能自行提权；
-8. 重启后 C2C 自动恢复；
-9. 再完善命令执行、长进程和更多本机能力。
+1. readonly / restricted 权限边界必须正确；
+2. ChatGPT 仍不能自行提权；
+3. Full Access 必须达到 `docs/remote-parity-acceptance.md` 定义的关键 Remote parity；
+4. 普通通用命令执行不能再依赖逐命令人工审批、trusted-command 预登记或单独 Level 3 开关；
+5. 长任务、输出、取消、Git、进程和本机开发操作必须有可用链路；
+6. C2C 安全增强不能以迫使日常任务重新退回 Remote 为代价；
+7. 重启与连接恢复仍需保持可诊断、可恢复。
 
-这不是限制最终能力，而是避免在安全边界还没有完成时先开放一个无限制 shell，导致前面的权限层形同虚设。
+如果某项 parity 尚未实现，应明确报告 `NOT_YET_IMPLEMENTED` 或 `FAIL`，而不是把它重新定义为“第一阶段不要求”。
 
 ---
 
@@ -703,23 +723,20 @@ ChatGPT
 
 不允许删除文件，也不允许修改 workspace 外内容。
 
-### 19.3 高权限开发
+### 19.3 Full Access 高权限开发
 
-用户本机切换到权限 2：
+用户本机切换到最高权限（当前 V1.3.2 实现名为 effective `level2`）：
 
 ```text
 ChatGPT
 → 完成权限 1 的全部工作
 → 可以删除 workspace 内文件
-→ 可以创建 / 修改 workspace 外文件
-→ 可以完成需要跨目录的开发任务
+→ 可以创建 / 修改 / 删除 workspace 外普通文件和目录
+→ 可以运行 PowerShell / CMD / exe / Node / Python / Git 等通用命令
+→ 可以完成需要跨目录、进程与主机操作的开发任务
 ```
 
-但仍然：
-
-```text
-workspace 外删除 = 禁止
-```
+普通操作不再需要逐命令本机审批。仍受相同 Windows 用户/session/elevation、敏感保护、审计以及明确产品级例外约束。
 
 ### 19.4 权限不足
 
@@ -770,7 +787,8 @@ ChatGPT 不能自己执行“把权限改成 2”。
 - workspace 外创建成功；
 - workspace 外修改成功；
 - workspace 外覆盖在设计允许的条件下成功；
-- workspace 外删除失败；
+- workspace 外删除成功（目标在同用户 OS 权限范围内且不命中明确产品级保护）；
+- PowerShell / CMD / exe / Node / Python 等普通通用执行不需要逐命令审批；
 - 敏感文件保护仍然有效。
 
 ### 20.4 提权控制
@@ -795,11 +813,12 @@ ChatGPT 不能自己执行“把权限改成 2”。
 - ChatGPT 读取文件后，如果其他执行者先修改该文件，旧写入不能静默覆盖新版本；
 - C2C 应拒绝陈旧写入并要求重新读取。
 
-### 20.7 禁止绕过
+### 20.7 权限边界与 Full Access
 
 - 权限 1 不能通过其他工具绕过 workspace 内删除限制；
 - 权限 1 不能通过其他工具绕过 workspace 外写入限制；
-- 权限 2 不能通过其他工具绕过 workspace 外删除禁令。
+- Full Access 不得被 restricted mode 的旧禁令人为降级；
+- Full Access 普通命令执行不得重新引入逐命令审批、trusted-command 依赖或额外 Level 3 开关。
 
 ---
 
@@ -816,27 +835,27 @@ ChatGPT 不能自己执行“把权限改成 2”。
 - 权限 1：workspace 外不可写、不可删；
 - 权限 2：workspace 内可删；
 - 权限 2：workspace 外可写；
-- 权限 2：workspace 外仍不可删；
-- workspace 外删除暂时不开放；
+- Full Access（当前实现名 effective `level2`）：workspace 外删除属于目标能力；
+- Full Access：普通通用命令执行以 Remote parity 为目标，不逐命令审批；
 - 权限必须由用户本机控制；
 - ChatGPT 不得自行提权；
 - 权限需要本机持久化；
 - 不应因为没有完整 GUI 就无法切换权限；
 - 第一阶段应提供简单本机命令，适合进一步做桌面快捷方式；
 - 希望解决 Windows 重启后 C2C 经常需要 Codex 手工恢复的问题；
-- 长期需要命令执行能力，才能让 ChatGPT 真正完成修改后的验证工作；
-- 权限机制不能被 shell 或其他间接工具轻易绕过。
+- Full Access 必须具备通用命令执行能力，让 ChatGPT 真正完成修改、验证和本机维护闭环；
+- restricted mode 的权限机制不能被 shell 或其他间接工具轻易绕过；
+- Full Access 的安全机制不得被用作 Remote parity 的能力降级理由。
 
 ### 仍需实现设计进一步确定
 
-- 权限 2 默认是否跨重启永久保持，还是提供默认降级；
-- 命令执行具体如何映射到权限 1 / 权限 2；
-- 是否采用命令白名单、黑名单或更强的沙箱；
-- 如何在 Windows 上可靠约束 shell 对 workspace 外删除；
+- Full Access 当前 session-scoped `level2` 与未来正式命名/UX 如何统一；
+- restricted mode 具体允许哪些命令；
+- Full Access generic execution 的最佳 MCP 工具形态与短任务/长任务 UX；
+- 如何在不降低 Full Access 能力的前提下继续加强 audit、secret protection、Job Object、crash recovery；
 - 完整文件覆盖和“等价删除”之间的防护规则；
-- 高风险批量删除是否需要额外限制；
-- 未来是否增加托盘或小型本地 GUI；
-- 是否以后增加单独的“workspace 外删除”更高权限层。
+- 高风险批量操作是否需要速率限制、审计提示等非阻断式保护；
+- 未来是否增加托盘或小型本地 GUI。
 
 这些待设计项不能反向修改前面已经确认的权限矩阵，除非用户重新明确确认。
 
@@ -867,8 +886,8 @@ c2c permission status
 | workspace 删除 | 权限 2 仅可删除一个普通文件，并要求当前内容 hash；**目录删除和递归删除尚未实现** |
 | workspace 外读取 | 权限 1、2 可读取受敏感文件规则保护的文本文件 |
 | workspace 外写入 | 权限 2 可创建、编辑或替换文件；**workspace 外目录创建尚未实现** |
-| workspace 外移动或删除 | **没有跨边界移动工具；外部删除在所有权限级别都硬拒绝** |
+| workspace 外移动或删除 | **当前实现仍未提供完整工具；这是 Full Access Remote Parity 的待实现差距，不再是产品级永久禁令** |
 
 因此，前文 6.2 所述 workspace 目录和递归删除仍属于未完成要求，不是当前可调用能力。
-前文权限矩阵继续描述目标边界；实施现状以本附录和
+前文权限矩阵与第 0 节继续描述目标边界；当前实现不足必须按 Remote Parity gap 追踪，不能反向把缺失能力解释成产品禁止。实施现状以本附录和
 [Host Filesystem 路径边界](host-filesystem-boundary.zh-CN.md)为准。

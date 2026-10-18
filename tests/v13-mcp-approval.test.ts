@@ -11,6 +11,7 @@ import { nullLogger } from "../src/logger/index.js";
 import { setPermission } from "../src/permission/store.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { approveGitRepository, previewGitRepositoryApproval } from "../src/git-write/index.js";
+import { resolveGitExecutable } from "../src/git-write/security.js";
 import { git, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 const sessionIdentity = vi.hoisted(() => ({ fingerprint: "e".repeat(64) }));
@@ -85,6 +86,7 @@ describe("V1.3 Level 3 over authenticated Streamable HTTP", () => {
   let legacy: Client | undefined;
   let workspace: Workspace;
   let executable: string;
+  let gitExecutable: string;
   let runner: ControlledRunner;
   let originalStateDir: string | undefined;
 
@@ -94,6 +96,8 @@ describe("V1.3 Level 3 over authenticated Streamable HTTP", () => {
     const root = makeTmpDir("v13-mcp-level3-workspace");
     makeGitRepo(root);
     executable = write(root, "approved-program.exe", "mock executable; injected runner prevents process launch\n");
+    gitExecutable = resolveGitExecutable().path;
+    write(root, "safe-task.js", "console.log('safe task fixture');\n");
     write(root, "approval-material.txt", "the exact reviewed material\n");
     workspace = new Workspace(root);
     setPermission(workspace.id, "level2");
@@ -160,6 +164,60 @@ describe("V1.3 Level 3 over authenticated Streamable HTTP", () => {
       return status.job.state;
     }, "succeeded");
     runner.runs.delete(started.job.job_id);
+  }, 30_000);
+
+  it.skipIf(process.platform !== "win32")("auto-authorizes safe-development Level 3 requests over MCP without a local approval round-trip", async () => {
+    setLevel3Enabled(workspace.id, true, true);
+    const noGitWriteToken = bridge!.authStore.issueTokens({
+      clientId: "level3-git-no-write-client",
+      scopes: ["execution.level3", "execution.jobs.read"],
+    }).accessToken;
+    const noGitWriteClient = await connectClient("level3-git-no-write", bridge!.localBaseUrl(), noGitWriteToken);
+    const requested = structuredJsonOf<{
+      request_id: string;
+      digest: string;
+      state: string;
+      approval_required: boolean;
+      risk_class: string;
+    }>(await noGitWriteClient.callTool({
+      name: "level3_request",
+      arguments: {
+        repository_path: ".",
+        engine: "program",
+        executable: gitExecutable,
+        args: ["add", "--", "safe-task.js"],
+        cwd: ".",
+        timeout_seconds: 30,
+        materials: [],
+      },
+    }));
+
+    expect(requested.state).toBe("approved");
+    expect(requested.approval_required).toBe(false);
+    expect(requested.risk_class).toBe("safe-development");
+    expect(getLevel3Request(workspace.id, requested.request_id)?.status).toBe("approved");
+
+    const started = structuredJsonOf<{ job: { job_id: string; state: string } }>(await noGitWriteClient.callTool({
+      name: "level3_start",
+      arguments: {
+        request_id: requested.request_id,
+        digest: requested.digest,
+        idempotency_key: "v132-safe-auto-start-000001",
+      },
+    }));
+    expect(["queued", "running"]).toContain(started.job.state);
+    const jobId = started.job.job_id;
+    expect(runner.runs.get(jobId)?.request.genericCommand?.args.slice(-3)).toEqual(["add", "--", "safe-task.js"]);
+    runner.finish(jobId, 0);
+    await waitForState(async () => {
+      const status = structuredJsonOf<{ job: { state: string } }>(await noGitWriteClient.callTool({
+        name: "execution_status",
+        arguments: { job_id: jobId },
+      }));
+      return status.job.state;
+    }, "succeeded");
+    runner.runs.delete(jobId);
+    await noGitWriteClient.close();
   });
 
   it("keeps requests inert until local approval and limits status/start authority by client and scope", async () => {

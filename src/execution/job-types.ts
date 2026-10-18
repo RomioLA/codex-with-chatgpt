@@ -23,6 +23,36 @@ export interface ExecutionRecipe {
   scriptHash: string;
 }
 
+export type FullAccessCommand =
+  | {
+      engine: "program";
+      executable: string;
+      executableFileIdentity: string;
+      executableHash: string;
+      args: string[];
+      cwd: string;
+      cwdFileIdentity: string;
+    }
+  | {
+      engine: "powershell" | "cmd";
+      executable: string;
+      executableFileIdentity: string;
+      executableHash: string;
+      command: string;
+      cwd: string;
+      cwdFileIdentity: string;
+    };
+
+export type RepositoryExecutionAuthorization = { type: "level3" | "git"; requestId: string; digest: string };
+export type FullAccessExecutionAuthorization = {
+  type: "full_access";
+  permissionMode: "level2";
+  sessionGrantFingerprint: string;
+  /** Missing only on persisted jobs created before revocable grant generations existed. */
+  sessionGrantId?: string;
+  requestHash: string;
+};
+
 export interface ExecutionTempOwnership {
   rootFileIdentity: string;
   directoryFileIdentity: string;
@@ -30,30 +60,10 @@ export interface ExecutionTempOwnership {
   createdAtMs: number;
 }
 
-export interface ExecutionJob {
+interface ExecutionJobBase {
   jobId: string;
   workspaceId: string;
-  repositoryIdentity: string;
-  repositoryPath: string;
   oauthClientId: string;
-  recipe: ExecutionRecipe;
-  /** V1.3 capabilities are explicit; they never inherit recipe authorization. */
-  authorization?: {
-    type: "level3" | "git";
-    requestId: string;
-    digest: string;
-  };
-  gitResult?: {
-    integrity?: "verified" | "unexpected" | "not_verified";
-    confirmation: "confirmed" | "changed" | "identity_changed" | "unavailable";
-    confirmationScope: "local_repository";
-    remoteOutcome: "not_applicable" | "not_attempted" | "reported_success" | "unknown";
-    partialSuccessPossible: boolean;
-    headBefore: string | null;
-    headAfter: string | null;
-    branchBefore: string | null;
-    branchAfter: string | null;
-  };
   state: ExecutionJobState;
   createdAt: string;
   startedAt: string | null;
@@ -65,6 +75,43 @@ export interface ExecutionJob {
   failureCode: string | null;
   stdout: ExecutionStreamMeta;
   stderr: ExecutionStreamMeta;
+}
+
+export interface RepositoryExecutionJob extends ExecutionJobBase {
+  /** Omitted only by persisted V1 jobs written before the context discriminator existed. */
+  executionContext?: "repository";
+  repositoryIdentity: string;
+  repositoryPath: string;
+  recipe: ExecutionRecipe;
+  /** V1.3 controlled capabilities never inherit recipe authorization. */
+  authorization?: RepositoryExecutionAuthorization;
+  gitResult?: {
+    integrity?: "verified" | "unexpected" | "not_verified";
+    confirmation: "confirmed" | "changed" | "identity_changed" | "unavailable";
+    confirmationScope: "local_repository";
+    remoteOutcome: "not_applicable" | "not_attempted" | "reported_success" | "unknown";
+    partialSuccessPossible: boolean;
+    headBefore: string | null;
+    headAfter: string | null;
+    branchBefore: string | null;
+    branchAfter: string | null;
+  };
+}
+
+export interface FullAccessExecutionJob extends ExecutionJobBase {
+  executionContext: "host";
+  repositoryIdentity: null;
+  repositoryPath: null;
+  recipe: null;
+  authorization: FullAccessExecutionAuthorization;
+  fullAccessCommand: FullAccessCommand;
+  gitResult?: never;
+}
+
+export type ExecutionJob = RepositoryExecutionJob | FullAccessExecutionJob;
+
+export function isFullAccessExecutionJob(job: ExecutionJob): job is FullAccessExecutionJob {
+  return job.executionContext === "host" && job.authorization.type === "full_access";
 }
 
 export interface ExecutionStreamMeta {

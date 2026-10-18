@@ -27,11 +27,12 @@ function makeJob(workspaceId: string): ExecutionJob {
   };
 }
 
-function finish(store: ExecutionJobStore, job: ExecutionJob): void {
+async function finish(store: ExecutionJobStore, job: ExecutionJob): Promise<void> {
   const current = store.get(job.jobId);
   if (!current) throw new Error("Missing execution output fixture job");
   const running = transitionExecutionJob(current, "running", { startedAt: new Date().toISOString() });
   store.replace(running);
+  await store.flushOutput(job.jobId);
   store.replace(transitionExecutionJob(running, "succeeded", { exitCode: 0 }));
 }
 
@@ -50,15 +51,15 @@ function collectPages(store: ExecutionJobStore, jobId: string, stream: OutputStr
 }
 
 describe("execution output UTF-8 pagination", () => {
-  it("preserves Chinese, Japanese, and emoji across 1-byte, 2-byte, and mixed pages", () => {
+  it("preserves Chinese, Japanese, and emoji across 1-byte, 2-byte, and mixed pages", async () => {
     const directory = makeTmpDir("execution-output-utf8");
     const store = new ExecutionJobStore("utf8-output", { directory });
     const job = makeJob("utf8-output");
     store.create(job);
     const expected = "A中日あ😀B";
-    store.appendSanitized(job.jobId, "stdout", expected);
-    store.appendSanitized(job.jobId, "stderr", expected);
-    finish(store, job);
+    await store.appendSanitized(job.jobId, "stdout", expected);
+    await store.appendSanitized(job.jobId, "stderr", expected);
+    await finish(store, job);
 
     for (const stream of ["stdout", "stderr"] as const) {
       for (const pageBytes of [1, 2, 3, 4, 7]) {
@@ -75,24 +76,24 @@ describe("execution output UTF-8 pagination", () => {
     expect(emoji).toMatchObject({ ok: true, nextOffset: emojiOffset + 4, text: "😀" });
   });
 
-  it("rejects an input byte offset that splits a UTF-8 sequence", () => {
+  it("rejects an input byte offset that splits a UTF-8 sequence", async () => {
     const directory = makeTmpDir("execution-output-utf8-boundary");
     const store = new ExecutionJobStore("utf8-boundary", { directory });
     const job = makeJob("utf8-boundary");
     store.create(job);
-    store.appendSanitized(job.jobId, "stdout", "中");
-    finish(store, job);
+    await store.appendSanitized(job.jobId, "stdout", "中");
+    await finish(store, job);
 
     expect(store.readOutput(job.jobId, "stdout", 1, 1)).toEqual({ ok: false, error: "INVALID_OFFSET" });
   });
 
-  it("keeps the retained offset on a UTF-8 boundary after truncation", () => {
+  it("keeps the retained offset on a UTF-8 boundary after truncation", async () => {
     const directory = makeTmpDir("execution-output-utf8-truncate");
     const store = new ExecutionJobStore("utf8-truncate", { directory });
     const job = makeJob("utf8-truncate");
     store.create(job);
-    store.appendSanitized(job.jobId, "stdout", "xx😀" + "z".repeat(MAX_OUTPUT_BYTES_PER_STREAM - 3));
-    finish(store, job);
+    await store.appendSanitized(job.jobId, "stdout", "xx😀" + "z".repeat(MAX_OUTPUT_BYTES_PER_STREAM - 3));
+    await finish(store, job);
 
     const meta = store.get(job.jobId)!.stdout;
     expect(meta.truncated).toBe(true);

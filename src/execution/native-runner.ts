@@ -5,16 +5,16 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { TrustedCommand } from "./trusted-registry.js";
 import type { RepositoryIdentity } from "./repository-identity.js";
-import type { GenericCommand, HelperRequest, HelperResultFrame } from "./helper-protocol.js";
-import { HelperOutputDecoder, HELPER_CANCEL_BYTE, serializeHelperRequest } from "./helper-protocol.js";
-import type { OutputStream } from "./job-types.js";
+import type { FullAccessHelperRequest, GenericCommand, HelperRequest, HelperResultFrame } from "./helper-protocol.js";
+import { EXECUTION_HELPER_PROTOCOL_VERSION, HelperOutputDecoder, HELPER_CANCEL_BYTE, serializeFullAccessHelperRequest, serializeHelperRequest } from "./helper-protocol.js";
+import type { FullAccessCommand, OutputStream } from "./job-types.js";
 import { redact } from "../logger/index.js";
 import type { ExecutionTempLease } from "./execution-temp.js";
 import { resolveTrustedRuntime, type TrustedRuntime } from "./runtime-discovery.js";
 import { runExecutionTempCleanup } from "./execution-temp-cleanup.js";
 
 export interface NativeRunnerCallbacks {
-  onOutput: (stream: OutputStream, data: Buffer) => void;
+  onOutput: (stream: OutputStream, data: Buffer) => void | Promise<void>;
   onDiagnostic?: (message: string) => void;
 }
 
@@ -24,21 +24,56 @@ export interface NativeRunnerCompletion {
   tempCleanupConfirmed?: boolean;
 }
 
+export class NativeRunnerOutputError extends Error {
+  constructor(
+    cause: unknown,
+    readonly helperResult: HelperResultFrame,
+    readonly helperExitCode: number | null,
+    readonly tempCleanupConfirmed: boolean,
+  ) {
+    super("OUTPUT_PERSISTENCE_FAILED", { cause });
+    this.name = "NativeRunnerOutputError";
+  }
+}
+
 export interface NativeRunnerHandle {
   completion: Promise<NativeRunnerCompletion>;
   cancel(): void;
   abandon(): void;
 }
 
-export interface NativeRunnerRequest {
+interface NativeRunnerBaseRequest {
   jobId: string;
-  repository: RepositoryIdentity;
-  trustedCommand: TrustedCommand;
   timeoutSeconds: number;
   stateDirectory: string;
   tempLease: ExecutionTempLease;
-  genericCommand?: GenericCommand;
 }
+
+export interface FullAccessNativeLaunch {
+  workspaceId: string;
+  oauthClientId: string;
+  permissionMode: "level2";
+  sessionGrantFingerprint: string;
+  sessionGrantId: string;
+  idempotencyKeyHash: string;
+  requestHash: string;
+  command: FullAccessCommand;
+}
+
+export type NativeRunnerRequest = NativeRunnerBaseRequest & (
+  | {
+      repository: RepositoryIdentity;
+      trustedCommand: TrustedCommand;
+      genericCommand?: GenericCommand;
+      fullAccess?: never;
+    }
+  | {
+      repository?: never;
+      trustedCommand?: never;
+      genericCommand?: never;
+      fullAccess: FullAccessNativeLaunch;
+    }
+);
 
 export type { GenericCommand } from "./helper-protocol.js";
 
@@ -125,7 +160,7 @@ function resolveExecutionArtifacts(options: {
       version?: unknown; protocolVersion?: unknown; helperPath?: unknown; sha256?: unknown;
       launcherPath?: unknown; launcherSha256?: unknown;
     };
-    if (metadata.version !== 2 || metadata.protocolVersion !== 5 ||
+    if (metadata.version !== 2 || metadata.protocolVersion !== EXECUTION_HELPER_PROTOCOL_VERSION ||
         metadata.helperPath !== "build/native/c2c-execution-helper.exe" ||
         typeof metadata.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.sha256) ||
         metadata.launcherPath !== "build/native/c2c-execution-launcher.exe" ||
@@ -166,7 +201,15 @@ export class WindowsNativeExecutionRunner {
       launcherPath: this.options.launcherPath,
       moduleDirectory: this.options.moduleDirectory,
     });
-    const runtime = (this.options.runtimeResolver ?? resolveTrustedRuntime)(request.trustedCommand.packageManager);
+    const fullAccess = "fullAccess" in request ? request.fullAccess : undefined;
+    const legacyRequest = fullAccess ? undefined : request as NativeRunnerBaseRequest & {
+      repository: RepositoryIdentity;
+      trustedCommand: TrustedCommand;
+      genericCommand?: GenericCommand;
+    };
+    const runtime = legacyRequest
+      ? (this.options.runtimeResolver ?? resolveTrustedRuntime)(legacyRequest.trustedCommand.packageManager)
+      : undefined;
     const jobTempDir = request.tempLease.directoryPath;
     const stateRoot = path.resolve(request.tempLease.rootPath, "..", "..", "..");
     const expectedTempRoot = path.join(stateRoot, "execution-jobs", request.tempLease.workspaceId, "execution-temp");
@@ -176,7 +219,10 @@ export class WindowsNativeExecutionRunner {
 
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
     const systemDirectory = path.join(systemRoot, "System32");
-    const env: NodeJS.ProcessEnv = {
+    const env: NodeJS.ProcessEnv = fullAccess ? {
+      ...process.env,
+      C2C_STATE_DIR: stateRoot,
+    } : {
       SystemRoot: systemRoot,
       WINDIR: systemRoot,
       PATH: systemDirectory,
@@ -198,40 +244,65 @@ export class WindowsNativeExecutionRunner {
     let input: Buffer;
     let child: ChildProcessWithoutNullStreams;
     try {
+      if (fullAccess) {
+        const helperRequest: FullAccessHelperRequest = {
+          timeoutSeconds: request.timeoutSeconds,
+          workspaceId: fullAccess.workspaceId,
+          jobId: request.jobId,
+          oauthClientId: fullAccess.oauthClientId,
+          permissionMode: fullAccess.permissionMode,
+          sessionGrantFingerprint: fullAccess.sessionGrantFingerprint,
+          sessionGrantId: fullAccess.sessionGrantId,
+          idempotencyKeyHash: fullAccess.idempotencyKeyHash,
+          requestHash: fullAccess.requestHash,
+          command: fullAccess.command,
+          tempRootPath: request.tempLease.rootPath,
+          tempRootFileIdentity: request.tempLease.rootFileIdentity,
+          tempNonce: request.tempLease.nonce,
+          tempCreatedAtMs: request.tempLease.createdAtMs,
+          jobTempDir,
+          jobTempFileIdentity: request.tempLease.directoryFileIdentity,
+        };
+        input = serializeFullAccessHelperRequest(helperRequest);
+      } else {
+      const legacy = legacyRequest!;
+      const trusted = legacy.trustedCommand;
+      const repository = legacy.repository;
+      const trustedRuntime = runtime!;
       input = serializeHelperRequest({
-        packageManager: request.trustedCommand.packageManager,
-        kind: request.trustedCommand.kind,
+        packageManager: trusted.packageManager,
+        kind: trusted.kind,
         timeoutSeconds: request.timeoutSeconds,
-        cwd: request.repository.canonicalPath,
-        gitDirectory: request.repository.gitDirectory,
-        gitDirectoryFileIdentity: request.repository.fileIdentities.gitDirectory,
-        commonGitDirectory: request.repository.commonGitDirectory,
-        commonGitDirectoryFileIdentity: request.repository.fileIdentities.commonGitDirectory,
-        nodeExecutable: runtime.nodeExecutable,
-        nodeFileIdentity: runtime.nodeFileIdentity,
-        nodeHash: runtime.nodeHash,
-        managerCli: runtime.managerCli,
-        managerFileIdentity: runtime.managerFileIdentity,
-        managerHash: runtime.managerHash,
-        managerLibCli: runtime.managerLibCli,
-        managerLibCliFileIdentity: runtime.managerLibCliFileIdentity,
-        managerLibCliHash: runtime.managerLibCliHash,
-        managerValidateEngines: runtime.managerValidateEngines,
-        managerValidateEnginesFileIdentity: runtime.managerValidateEnginesFileIdentity,
-        managerValidateEnginesHash: runtime.managerValidateEnginesHash,
-        managerMainEntry: runtime.managerMainEntry,
-        managerMainEntryFileIdentity: runtime.managerMainEntryFileIdentity,
-        managerMainEntryHash: runtime.managerMainEntryHash,
-        managerPackageJson: runtime.managerPackageJson,
-        managerPackageJsonFileIdentity: runtime.managerPackageJsonFileIdentity,
-        managerPackageJsonHash: runtime.managerPackageJsonHash,
-        managerExitHandler: runtime.managerExitHandler,
-        managerExitHandlerFileIdentity: runtime.managerExitHandlerFileIdentity,
-        managerExitHandlerHash: runtime.managerExitHandlerHash,
-        managerCore: runtime.managerCore,
-        managerCoreFileIdentity: runtime.managerCoreFileIdentity,
-        managerCoreHash: runtime.managerCoreHash,
-        target: request.trustedCommand.target,
+        cwd: repository.canonicalPath,
+        gitDirectory: repository.gitDirectory,
+        gitDirectoryFileIdentity: repository.fileIdentities.gitDirectory,
+        commonGitDirectory: repository.commonGitDirectory,
+        commonGitDirectoryFileIdentity: repository.fileIdentities.commonGitDirectory,
+        nodeExecutable: trustedRuntime.nodeExecutable,
+        nodeFileIdentity: trustedRuntime.nodeFileIdentity,
+        nodeHash: trustedRuntime.nodeHash,
+        managerCli: trustedRuntime.managerCli,
+        managerFileIdentity: trustedRuntime.managerFileIdentity,
+        managerHash: trustedRuntime.managerHash,
+        managerLibCli: trustedRuntime.managerLibCli,
+        managerLibCliFileIdentity: trustedRuntime.managerLibCliFileIdentity,
+        managerLibCliHash: trustedRuntime.managerLibCliHash,
+        managerValidateEngines: trustedRuntime.managerValidateEngines,
+        managerValidateEnginesFileIdentity: trustedRuntime.managerValidateEnginesFileIdentity,
+        managerValidateEnginesHash: trustedRuntime.managerValidateEnginesHash,
+        managerMainEntry: trustedRuntime.managerMainEntry,
+        managerMainEntryFileIdentity: trustedRuntime.managerMainEntryFileIdentity,
+        managerMainEntryHash: trustedRuntime.managerMainEntryHash,
+        managerPackageJson: trustedRuntime.managerPackageJson,
+        managerPackageJsonFileIdentity: trustedRuntime.managerPackageJsonFileIdentity,
+        managerPackageJsonHash: trustedRuntime.managerPackageJsonHash,
+        managerExitHandler: trustedRuntime.managerExitHandler,
+        managerExitHandlerFileIdentity: trustedRuntime.managerExitHandlerFileIdentity,
+        managerExitHandlerHash: trustedRuntime.managerExitHandlerHash,
+        managerCore: trustedRuntime.managerCore,
+        managerCoreFileIdentity: trustedRuntime.managerCoreFileIdentity,
+        managerCoreHash: trustedRuntime.managerCoreHash,
+        target: trusted.target,
         tempRootPath: request.tempLease.rootPath,
         tempRootFileIdentity: request.tempLease.rootFileIdentity,
         tempWorkspaceId: request.tempLease.workspaceId,
@@ -240,13 +311,14 @@ export class WindowsNativeExecutionRunner {
         tempCreatedAtMs: request.tempLease.createdAtMs,
         jobTempDir,
         jobTempFileIdentity: request.tempLease.directoryFileIdentity,
-        repositoryFileIdentity: request.repository.fileIdentities.repository,
-        gitEntryFileIdentity: request.repository.fileIdentities.gitEntry,
-        gitEntryType: request.repository.gitEntryType,
-        gitEntryHash: request.repository.gitEntryHash,
-        packageJsonHash: request.genericCommand?.approvalManifestHash ?? request.trustedCommand.packageJsonHash,
-        genericCommand: request.genericCommand,
+        repositoryFileIdentity: repository.fileIdentities.repository,
+        gitEntryFileIdentity: repository.fileIdentities.gitEntry,
+        gitEntryType: repository.gitEntryType,
+        gitEntryHash: repository.gitEntryHash,
+        packageJsonHash: legacy.genericCommand?.approvalManifestHash ?? trusted.packageJsonHash,
+        genericCommand: legacy.genericCommand,
       });
+      }
       child = spawnImpl(launcherPath, [], {
         cwd: path.dirname(launcherPath),
         env,
@@ -255,7 +327,7 @@ export class WindowsNativeExecutionRunner {
         shell: false,
       }) as ChildProcessWithoutNullStreams;
       try {
-        this.options.beforeHelperRequestWrite?.(runtime);
+        if (runtime) this.options.beforeHelperRequestWrite?.(runtime);
       } catch (error) {
         child.stdin.destroy();
         throw error;
@@ -263,36 +335,60 @@ export class WindowsNativeExecutionRunner {
     } catch (error) {
       try {
         runExecutionTempCleanup(request.tempLease, request.stateDirectory,
-          (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)));
+          (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)), launcherPath);
       } catch {
         /* Keep the persisted ownership record for a later identity-checked recovery. */
       }
       throw new Error("EXECUTION_HELPER_START_FAILED", { cause: error });
     }
 
-    const decoder = new HelperOutputDecoder();
+    const decoder = new HelperOutputDecoder(EXECUTION_HELPER_PROTOCOL_VERSION);
     let frameResult: HelperResultFrame | null = null;
     let protocolError: Error | null = null;
+    let outputError: Error | null = null;
+    let stdoutError: Error | null = null;
     let diagnostics = "";
     let cancelSent = false;
     let abandoned = false;
     let spawnError: Error | null = null;
     let launcherEvidencePending = "";
 
-    const completion = new Promise<NativeRunnerCompletion>((resolve, reject) => {
-      child.stdout.on("data", (data: Buffer) => {
-        if (protocolError) return;
-        try {
-          for (const frame of decoder.push(Buffer.from(data))) {
-            if (frame.type === "stdout" || frame.type === "stderr") callbacks.onOutput(frame.type, frame.data);
-            else frameResult = frame.result;
+    const stdoutPump = (async () => {
+      try {
+        for await (const data of child.stdout) {
+          if (protocolError) continue;
+          let frames;
+          try {
+            frames = decoder.push(Buffer.from(data));
+          } catch (error) {
+            protocolError = error instanceof Error ? error : new Error("HELPER_PROTOCOL_INVALID");
+            abandoned = true;
+            child.stdin.destroy(); // EOF asks the helper to clean up its owned Job.
+            continue;
           }
-        } catch (error) {
-          protocolError = error instanceof Error ? error : new Error("HELPER_PROTOCOL_INVALID");
-          abandoned = true;
-          child.stdin.destroy(); // EOF asks the helper to clean up its owned Job.
+          for (const frame of frames) {
+            if (frame.type === "stdout" || frame.type === "stderr") {
+              if (abandoned || outputError) continue;
+              try {
+                await callbacks.onOutput(frame.type, frame.data);
+              } catch (error) {
+                outputError = error instanceof Error ? error : new Error("OUTPUT_PERSISTENCE_FAILED", { cause: error });
+                abandoned = true;
+                child.stdin.destroy(); // Stop accepting more work and let the helper clean up.
+              }
+            } else {
+              frameResult = frame.result;
+            }
+          }
         }
-      });
+      } catch (error) {
+        stdoutError = error instanceof Error ? error : new Error("EXECUTION_HELPER_STDOUT_FAILED", { cause: error });
+        abandoned = true;
+        child.stdin.destroy();
+      }
+    })();
+
+    const completion = new Promise<NativeRunnerCompletion>((resolve, reject) => {
       child.stderr.on("data", (data: Buffer) => {
         const chunk = Buffer.from(data).toString("utf8");
         diagnostics = (diagnostics + chunk).slice(-4096);
@@ -310,36 +406,46 @@ export class WindowsNativeExecutionRunner {
         spawnError = new Error("EXECUTION_HELPER_START_FAILED", { cause: error });
       });
       child.once("close", (code) => {
-        if (!runExecutionTempCleanup(request.tempLease, request.stateDirectory,
-          (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)))) {
-          reject(new Error("EXECUTION_TEMP_CLEANUP_FAILED"));
-          return;
-        }
-        if (spawnError) {
-          reject(spawnError);
-          return;
-        }
-        if (protocolError) {
-          reject(new Error("EXECUTION_HELPER_PROTOCOL_FAILED", { cause: protocolError }));
-          return;
-        }
-        try {
-          decoder.finish();
-        } catch (error) {
-          const message = diagnostics ? `: ${redact(diagnostics).slice(-512)}` : "";
-          reject(new Error(`EXECUTION_HELPER_UNCONFIRMED${message}`, { cause: error }));
-          return;
-        }
-        if (!frameResult) {
-          reject(new Error("EXECUTION_HELPER_RESULT_MISSING"));
-          return;
-        }
-        if (diagnostics || frameResult.outcome === 3) {
-          const resultDiagnostic = `helper outcome=${frameResult.outcome}; win32Error=${frameResult.win32Error}; ` +
-            `exitCode=${frameResult.exitCode}`;
-          callbacks.onDiagnostic?.(redact([diagnostics, resultDiagnostic].filter(Boolean).join("\n")).slice(-512));
-        }
-        resolve({ result: frameResult, helperExitCode: code, tempCleanupConfirmed: true });
+        void stdoutPump.then(() => {
+          if (!runExecutionTempCleanup(request.tempLease, request.stateDirectory,
+            (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)), launcherPath)) {
+            reject(new Error("EXECUTION_TEMP_CLEANUP_FAILED"));
+            return;
+          }
+          if (spawnError) {
+            reject(spawnError);
+            return;
+          }
+          if (stdoutError) {
+            reject(new Error("EXECUTION_HELPER_STDOUT_FAILED", { cause: stdoutError }));
+            return;
+          }
+          if (protocolError) {
+            reject(new Error("EXECUTION_HELPER_PROTOCOL_FAILED", { cause: protocolError }));
+            return;
+          }
+          try {
+            decoder.finish();
+          } catch (error) {
+            const message = diagnostics ? `: ${redact(diagnostics).slice(-512)}` : "";
+            reject(new Error(`EXECUTION_HELPER_UNCONFIRMED${message}`, { cause: error }));
+            return;
+          }
+          if (!frameResult) {
+            reject(new Error("EXECUTION_HELPER_RESULT_MISSING"));
+            return;
+          }
+          if (outputError) {
+            reject(new NativeRunnerOutputError(outputError, frameResult, code, true));
+            return;
+          }
+          if (diagnostics || frameResult.outcome === 3) {
+            const resultDiagnostic = `helper outcome=${frameResult.outcome}; win32Error=${frameResult.win32Error}; ` +
+              `exitCode=${frameResult.exitCode}`;
+            callbacks.onDiagnostic?.(redact([diagnostics, resultDiagnostic].filter(Boolean).join("\n")).slice(-512));
+          }
+          resolve({ result: frameResult, helperExitCode: code, tempCleanupConfirmed: true });
+        }).catch(reject);
       });
     });
 

@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { McpContext } from "./server.js";
 import { executionJobView } from "./server.js";
 import { executionToolAuth, executionScopeChallenge } from "./oauth.js";
-import { createLevel3Request, getLevel3Request, type Level3Spec } from "../execution/level3-approval.js";
+import { classifyLevel3Spec, createLevel3Request, getLevel3Request, type Level3Spec } from "../execution/level3-approval.js";
 import type { GitWriteOperation } from "../git-write/index.js";
 import { selectGitRepository, runGit } from "../workspace/git.js";
 
@@ -62,8 +62,8 @@ export function registerV13Tools(server: McpServer, ctx: McpContext): void {
   });
 
   server.registerTool("level3_request", {
-    ...executionToolAuth("level3_request"), title: "Request local Level 3 approval",
-    description: "Create a pending exact-command request. This grants no permission and starts no process. A local user must inspect the request and approve its digest with the C2C CLI. Commands can affect the host beyond cwd; cwd is not an OS sandbox.",
+    ...executionToolAuth("level3_request"), title: "Request restricted Level 3 command execution",
+    description: "Historical restricted controlled path retained for Level 3 workflows. Full Access generic command execution should use execution_run and does not require a Level 3 request. This tool creates an exact-command Level 3 request; safe-development commands may be automatically authorized, while high-risk, destructive, dynamic, or uncertain commands remain pending for local review. Commands can affect the host beyond cwd; cwd is not an OS sandbox.",
     inputSchema: {
       repository_path: z.string().min(1).max(1024), engine: z.enum(["program", "powershell", "cmd"]),
       executable: z.string().min(1).max(1024), args: z.array(z.string().max(8192)).max(128).default([]),
@@ -78,14 +78,24 @@ export function registerV13Tools(server: McpServer, ctx: McpContext): void {
         args: args.args, ...(args.command === undefined ? {} : { command: args.command }), cwd: args.cwd,
         timeoutSeconds: args.timeout_seconds, materials: args.materials } as Level3Spec;
       const request = createLevel3Request(ctx.workspace, extra.authInfo!.clientId, spec);
-      return result({ request_id: request.requestId, digest: request.digest, state: request.status, expires_at: request.expiresAt,
-        approval_required: true, instruction: "Inspect this request locally; approve its exact digest, then call level3_start. Approval tools are not exposed through MCP." });
+      return result({
+        request_id: request.requestId,
+        digest: request.digest,
+        state: request.status,
+        expires_at: request.expiresAt,
+        launch_expires_at: request.launchExpiresAt,
+        approval_required: request.approvalRequired,
+        risk_class: request.riskClass,
+        instruction: request.approvalRequired
+          ? "This command requires local review. Inspect and approve its exact digest, then call level3_start. Approval tools are not exposed through MCP."
+          : "This command was classified as safe-development and auto-authorized. Call level3_start with the exact request_id and digest.",
+      });
     } catch (error) { return fail((error as Error).message); }
   });
 
   server.registerTool("level3_request_status", {
-    ...executionToolAuth("level3_request_status"), title: "Level 3 approval status",
-    description: "Read approval state for a request owned by this OAuth client. No local authority or command materials are returned.",
+    ...executionToolAuth("level3_request_status"), title: "Restricted Level 3 request status",
+    description: "Read status for a historical restricted Level 3 request owned by this OAuth client. Full Access generic execution does not use Level 3. No local authority or command materials are returned.",
     inputSchema: { request_id: id }, annotations: { readOnlyHint: true },
   }, async (args, extra) => {
     const denied = requireCapability(extra.authInfo, "execution.level3", ctx.oauthResourceMetadataUri);
@@ -93,13 +103,21 @@ export function registerV13Tools(server: McpServer, ctx: McpContext): void {
     try {
       const request = getLevel3Request(ctx.workspace.id, args.request_id);
       if (!request || request.clientId !== extra.authInfo!.clientId) return fail("NOT_FOUND");
-      return result({ request_id: request.requestId, digest: request.digest, state: request.status, expires_at: request.expiresAt });
+      return result({
+        request_id: request.requestId,
+        digest: request.digest,
+        state: request.status,
+        expires_at: request.expiresAt,
+        launch_expires_at: request.launchExpiresAt,
+        approval_required: request.status === "pending",
+        risk_class: request.riskClass ?? classifyLevel3Spec(request.spec, ctx.workspace),
+      });
     } catch (error) { return fail((error as Error).message); }
   });
 
   server.registerTool("level3_start", {
-    ...executionToolAuth("level3_start"), title: "Start individually approved Level 3 command",
-    description: "Consume one unexpired local approval bound to this client and exact digest. Run under the existing controlled Windows Job Object. Use execution_status/output/cancel with their separate OAuth scopes.",
+    ...executionToolAuth("level3_start"), title: "Start restricted Level 3 command",
+    description: "Historical restricted controlled path. Consume one unexpired Level 3 authorization bound to this client and exact digest; Full Access generic execution should use execution_run and does not require Level 3. Run under the existing controlled Windows Job Object. Use execution_status/output/cancel with their separate OAuth scopes.",
     inputSchema: { request_id: id, digest, idempotency_key: key }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async (args, extra) => {
     const denied = requireCapability(extra.authInfo, "execution.level3", ctx.oauthResourceMetadataUri);

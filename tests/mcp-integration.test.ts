@@ -132,6 +132,7 @@ afterAll(async () => {
 
 describe("MCP tools over Streamable HTTP", () => {
   const executionPolicies = [
+    { name: "execution_run", scope: "execution.run", args: { engine: "program", executable: process.execPath, args: [], cwd: ".", timeout_seconds: 30, idempotency_key: "oauth-run-scope-test-00001", wait_seconds: 0 } },
     { name: "execution_start", scope: "execution.run", args: { repository_path: ".", kind: "test", target: "test", timeout_seconds: 30, idempotency_key: "oauth-scope-test-00001" } },
     { name: "execution_status", scope: "execution.jobs.read", args: { job_id: "a".repeat(24) } },
     { name: "execution_job_output", scope: "execution.jobs.read", args: { job_id: "a".repeat(24), stream: "stdout" } },
@@ -161,6 +162,11 @@ describe("MCP tools over Streamable HTTP", () => {
       expect(tool?._meta?.securitySchemes).toEqual(schemes);
       expect(sdk.tools.find((tool) => tool.name === name)?._meta?.securitySchemes).toEqual(schemes);
     }
+    const gitCompareSecurity = [{ type: "oauth2", scopes: ["git.read"] }];
+    const gitCompare = rpc.result.tools.find((tool) => tool.name === "git_compare");
+    expect(gitCompare?.securitySchemes).toEqual(gitCompareSecurity);
+    expect(gitCompare?._meta?.securitySchemes).toEqual(gitCompareSecurity);
+    expect(sdk.tools.find((tool) => tool.name === "git_compare")?._meta?.securitySchemes).toEqual(gitCompareSecurity);
   });
 
   it.each(executionPolicies)("returns a scope-specific OAuth challenge for old-token $name", async ({ name, scope, args }) => {
@@ -203,10 +209,12 @@ describe("MCP tools over Streamable HTTP", () => {
       "execution_job_output",
       "execution_list",
       "execution_output",
+      "execution_run",
       "execution_start",
       "execution_status",
       "execution_summary",
       "git_branches",
+      "git_compare",
       "git_diff",
       "git_info",
       "git_status",
@@ -248,10 +256,19 @@ describe("MCP tools over Streamable HTTP", () => {
     expectToolOutputSchema(tools, "execution_summary", ["records"]);
     expectToolOutputSchema(tools, "execution_output", ["action", "items", "text"]);
     expectToolOutputSchema(tools, "execution_start", ["job", "duplicate"]);
+    expectToolOutputSchema(tools, "execution_run", ["job", "job_id", "state", "exit_code", "duplicate", "stdout_tail", "stderr_tail"]);
     expectToolOutputSchema(tools, "execution_status", ["available", "job"]);
     expectToolOutputSchema(tools, "execution_list", ["jobs"]);
     expectToolOutputSchema(tools, "execution_job_output", ["offset", "next_offset", "oldest_available_offset", "eof", "truncated", "text"]);
     expectToolOutputSchema(tools, "execution_cancel", ["job"]);
+    expect(tools.find((tool) => tool.name === "execution_run")?.description)
+      .toContain("Preferred local command execution tool for C2C Full Access");
+    expect(tools.find((tool) => tool.name === "execution_run")?.description)
+      .toContain("before generic remote-terminal tools");
+    expect(tools.find((tool) => tool.name === "execution_start")?.description)
+      .toContain("Restricted trusted-recipe execution path");
+    expect(tools.find((tool) => tool.name === "level3_request")?.description)
+      .toContain("Historical restricted controlled path");
   });
 
   it("documents git_diff pagination with its output field names", async () => {
@@ -680,6 +697,13 @@ describe("MCP tools over Streamable HTTP", () => {
     const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
     expect(denied.isError).toBe(true);
     expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");
+    const head = git(root, "rev-parse", "HEAD").trim();
+    const deniedCompare = await limitedClient.callTool({
+      name: "git_compare",
+      arguments: { base_commit: head, head_commit: head },
+    });
+    expect(deniedCompare.isError).toBe(true);
+    expect(textOf(deniedCompare)).toContain("INSUFFICIENT_SCOPE");
     const outputDenied = await limitedClient.callTool({
       name: "execution_output",
       arguments: { action: "list" },
@@ -888,6 +912,91 @@ describe("MCP tools over Streamable HTTP", () => {
       }));
       expect(finalStatus.job.state).toBe("cancelled");
 
+      const hostCwd = makeTmpDir("mcp-full-access-cwd");
+      const level1Denied = await startClient.callTool({
+        name: "execution_run",
+        arguments: {
+          engine: "program", executable: process.execPath, args: [], cwd: hostCwd,
+          timeout_seconds: 30, idempotency_key: "mcp-full-access-level1-001", wait_seconds: 0,
+        },
+      });
+      expect(level1Denied.isError).toBe(true);
+      expect(textOf(level1Denied)).toContain("FULL_ACCESS_REQUIRED");
+
+      setPermission(bridge.workspace.id, "level2");
+      const hostArguments = {
+        engine: "program",
+        executable: process.execPath,
+        args: [],
+        cwd: hostCwd,
+        timeout_seconds: 30,
+        idempotency_key: "mcp-full-access-host-000001",
+        wait_seconds: 0,
+      };
+      const hostStarted = structuredJsonOf<{
+        job: McpExecutionJob & { execution_context: string };
+        job_id: string;
+        state: string;
+        duplicate: boolean;
+        stdout_tail?: string;
+      }>(await startClient.callTool({ name: "execution_run", arguments: hostArguments }));
+      expect(hostStarted.job.execution_context).toBe("host");
+      expect(hostStarted.duplicate).toBe(false);
+      expect(["queued", "running"]).toContain(hostStarted.state);
+      expect(hostStarted.stdout_tail).toBeUndefined();
+      for (let attempt = 0; attempt < 100 && !executionRunner.runs.has(hostStarted.job_id); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(executionRunner.runs.has(hostStarted.job_id)).toBe(true);
+      executionRunner.emit(hostStarted.job_id, "stdout", "full access stdout tail\n");
+      executionRunner.emit(hostStarted.job_id, "stderr", "full access stderr tail\n");
+      executionRunner.finish(hostStarted.job_id, 0);
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const status = structuredJsonOf<{ job: McpExecutionJob }>(await startClient.callTool({
+          name: "execution_status", arguments: { job_id: hostStarted.job_id },
+        }));
+        if (["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(status.job.state)) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const hostDuplicate = structuredJsonOf<{
+        job: McpExecutionJob;
+        state: string;
+        exit_code: number | null;
+        duplicate: boolean;
+        stdout_tail: string;
+        stderr_tail: string;
+      }>(await startClient.callTool({ name: "execution_run", arguments: hostArguments }));
+      expect(hostDuplicate).toMatchObject({
+        state: "succeeded", exit_code: 0, duplicate: true,
+        stdout_tail: "full access stdout tail\n", stderr_tail: "full access stderr tail\n",
+      });
+
+      const inlineCwd = makeTmpDir("mcp-inline-wait-cwd");
+      const inlineArgs = {
+        engine: "program", executable: process.execPath, args: [], cwd: inlineCwd,
+        timeout_seconds: 30, idempotency_key: "mcp-full-access-inline-0001", wait_seconds: 2,
+      };
+      const beforeInline = new Set(executionRunner.runs.keys());
+      const inlinePending = startClient.callTool({ name: "execution_run", arguments: inlineArgs });
+      let inlineJobId: string | undefined;
+      for (let attempt = 0; attempt < 150 && !inlineJobId; attempt += 1) {
+        inlineJobId = [...executionRunner.runs.keys()].find((jobId) => !beforeInline.has(jobId));
+        if (!inlineJobId) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(inlineJobId).toBeDefined();
+      executionRunner.emit(inlineJobId!, "stdout", "finished inside inline wait\n");
+      executionRunner.finish(inlineJobId!, 0);
+      const inlineResult = structuredJsonOf<{ state: string; stdout_tail: string }>(await inlinePending);
+      expect(inlineResult).toMatchObject({ state: "succeeded", stdout_tail: "finished inside inline wait\n" });
+
+      setPermission(bridge.workspace.id, "readonly");
+      const readonlyDenied = await startClient.callTool({
+        name: "execution_run",
+        arguments: { ...hostArguments, idempotency_key: "mcp-full-access-readonly-001" },
+      });
+      expect(readonlyDenied.isError).toBe(true);
+      expect(textOf(readonlyDenied)).toContain("FULL_ACCESS_REQUIRED");
+
       setPermission(bridge.workspace.id, "readonly");
       const downgraded = await startClient.callTool({
         name: "execution_start",
@@ -906,5 +1015,68 @@ describe("MCP tools over Streamable HTTP", () => {
       await startClient.close();
       await otherClient.close();
     }
+  });
+});
+
+describe("V1.3.2 Git compare tool surface", () => {
+  it("publishes git_compare as a read-only git.read tool with structured output", async () => {
+    const tools = await client.listTools();
+    const compare = tools.tools.find((tool) => tool.name === "git_compare");
+    expect(compare).toBeDefined();
+    expect(compare?.annotations?.readOnlyHint).toBe(true);
+    expectToolOutputSchema(tools.tools, "git_compare", [
+      "isRepo",
+      "repositoryPath",
+      "topLevel",
+      "baseCommit",
+      "headCommit",
+      "files",
+      "totalBytes",
+      "offset",
+      "returnedBytes",
+      "hasMore",
+      "nextOffset",
+      "diff",
+    ]);
+  });
+
+  it("compares exact historical commits through the MCP boundary", async () => {
+    const nested = path.join(root, "nested-compare");
+    fs.mkdirSync(nested, { recursive: true });
+    makeGitRepo(nested);
+    const base = git(nested, "rev-parse", "HEAD").trim();
+    write(nested, "hello.txt", "changed through MCP compare\n");
+    git(nested, "add", "hello.txt");
+    git(nested, "commit", "-m", "historical compare");
+    const head = git(nested, "rev-parse", "HEAD").trim();
+    const linkedWorktree = path.join(nested, "linked-worktree");
+    git(nested, "worktree", "add", "--detach", linkedWorktree, head);
+
+    const compared = structuredJsonOf<{
+      isRepo: boolean;
+      repositoryPath: string;
+      baseCommit: string;
+      headCommit: string;
+      files: Array<{ path: string; status: string }>;
+      diff: string;
+    }>(await client.callTool({
+      name: "git_compare",
+      arguments: {
+        repository_path: "nested-compare/linked-worktree",
+        base_commit: base,
+        head_commit: head,
+        offset: 0,
+        max_bytes: 65536,
+      },
+    }));
+
+    expect(compared.isRepo).toBe(true);
+    expect(compared.repositoryPath).toBe("nested-compare/linked-worktree");
+    expect(compared.baseCommit).toBe(base);
+    expect(compared.headCommit).toBe(head);
+    expect(compared.files).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "hello.txt", status: "M" }),
+    ]));
+    expect(compared.diff).toContain("changed through MCP compare");
   });
 });

@@ -33,8 +33,8 @@ class ControlledRunner implements ExecutionRunner {
     };
   }
 
-  emit(jobId: string, stream: OutputStream, value: string): void {
-    this.runs.get(jobId)?.callbacks.onOutput(stream, Buffer.from(value, "utf8"));
+  async emit(jobId: string, stream: OutputStream, value: string): Promise<void> {
+    await this.runs.get(jobId)?.callbacks.onOutput(stream, Buffer.from(value, "utf8"));
   }
 
   finish(jobId: string, outcome: NativeRunnerCompletion["result"]["outcome"], exitCode = 0): void {
@@ -56,6 +56,20 @@ function startInput(overrides: Partial<Parameters<ExecutionSupervisor["start"]>[
     target: "test",
     timeoutSeconds: 30,
     idempotencyKey: "test-key-0123456789",
+    oauthClientId: "execution-test-client",
+    scopes: ["execution.run"],
+    ...overrides,
+  };
+}
+
+function fullAccessInput(overrides: Partial<Parameters<ExecutionSupervisor["startFullAccess"]>[0]> = {}) {
+  return {
+    engine: "program" as const,
+    executable: process.execPath,
+    args: [],
+    cwd: workspace.root,
+    timeoutSeconds: 30,
+    idempotencyKey: "full-access-test-0123456789",
     oauthClientId: "execution-test-client",
     scopes: ["execution.run"],
     ...overrides,
@@ -104,6 +118,71 @@ function approveTestRecipe(): void {
 }
 
 describe("ExecutionSupervisor", () => {
+  it("requires an existing level2 grant and does not promote readonly or level1", async () => {
+    setPermission(workspace.id, "readonly");
+    expect(await supervisor.startFullAccess(fullAccessInput({ idempotencyKey: "full-access-readonly-0001" })))
+      .toEqual({ ok: false, error: "FULL_ACCESS_REQUIRED" });
+    setPermission(workspace.id, "level1");
+    expect(await supervisor.startFullAccess(fullAccessInput({ idempotencyKey: "full-access-level1-00001" })))
+      .toEqual({ ok: false, error: "FULL_ACCESS_REQUIRED" });
+    expect(runner.runs.size).toBe(0);
+  });
+
+  it("creates repo-independent Full Access jobs and keeps idempotency and output protection", async () => {
+    setPermission(workspace.id, "level2");
+    const hostCwd = makeTmpDir("full-access-outside-workspace");
+    const input = fullAccessInput({ cwd: hostCwd });
+    const started = await supervisor.startFullAccess(input);
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    const jobId = started.job.jobId;
+    const running = await waitForState(jobId, "running");
+    expect(running).toMatchObject({
+      executionContext: "host",
+      repositoryIdentity: null,
+      repositoryPath: null,
+      recipe: null,
+      authorization: { type: "full_access", permissionMode: "level2" },
+      fullAccessCommand: { engine: "program", cwd: hostCwd },
+    });
+    expect(runner.runs.get(jobId)).toBeDefined();
+
+    const duplicate = await supervisor.startFullAccess(input);
+    expect(duplicate).toMatchObject({ ok: true, duplicate: true, job: { jobId } });
+    expect(await supervisor.startFullAccess({ ...input, args: ["different"] }))
+      .toEqual({ ok: false, error: "IDEMPOTENCY_CONFLICT" });
+
+    await runner.runs.get(jobId)!.callbacks.onOutput("stdout", Buffer.from("token=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n"));
+    await runner.runs.get(jobId)!.callbacks.onOutput("stderr", Buffer.from("-----BEGIN "));
+    await runner.runs.get(jobId)!.callbacks.onOutput("stderr", Buffer.from("RSA PRIVATE KEY-----\nsecret\n"));
+    runner.finish(jobId, 0);
+    await waitForState(jobId, "succeeded");
+    const stdout = supervisor.readOutputForClient(jobId, "execution-test-client", "stdout");
+    expect(stdout.ok).toBe(true);
+    if (stdout.ok) {
+      expect(stdout.text).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+      expect(stdout.text).toContain("[REDACTED]");
+    }
+    expect(supervisor.readOutputForClient(jobId, "execution-test-client", "stderr"))
+      .toEqual({ ok: false, error: "OUTPUT_RESTRICTED" });
+  });
+
+  it("cancels a queued or running Full Access job when its level2 session grant is revoked", async () => {
+    setPermission(workspace.id, "level2");
+    const started = await supervisor.startFullAccess(fullAccessInput({
+      idempotencyKey: "full-access-revocation-0001",
+    }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await waitForState(started.job.jobId, "running");
+    setPermission(workspace.id, "level1");
+    supervisor.reconcilePermission();
+    expect(runner.runs.get(started.job.jobId)?.cancelCount).toBe(1);
+    expect(supervisor.store.get(started.job.jobId)?.state).toBe("cancelling");
+    runner.finish(started.job.jobId, 1);
+    await waitForState(started.job.jobId, "cancelled");
+  });
+
   it("requires local trust, scopes idempotency by client, and prevents cross-client ownership", async () => {
     const input = startInput();
     expect(supervisor.start(input)).toEqual({ ok: false, error: "COMMAND_NOT_APPROVED" });
@@ -120,6 +199,72 @@ describe("ExecutionSupervisor", () => {
 
     runner.finish(started.job.jobId, 0, 0);
     await waitForState(started.job.jobId, "succeeded");
+  });
+
+  it("flushes stdout and stderr tails before completing a job", async () => {
+    approveTestRecipe();
+    const started = supervisor.start(startInput({ idempotencyKey: "flush-complete-0123456" }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await runner.emit(started.job.jobId, "stdout", "stdout-final-fragment");
+    await runner.emit(started.job.jobId, "stderr", "stderr-final-fragment");
+
+    runner.finish(started.job.jobId, 0, 0);
+    await waitForState(started.job.jobId, "succeeded");
+
+    expect(supervisor.store.readOutput(started.job.jobId, "stdout")).toMatchObject({ ok: true, eof: true, text: "stdout-final-fragment" });
+    expect(supervisor.store.readOutput(started.job.jobId, "stderr")).toMatchObject({ ok: true, eof: true, text: "stderr-final-fragment" });
+  });
+
+  it("waits for an in-flight output callback and flushes it before completion", async () => {
+    approveTestRecipe();
+    const started = supervisor.start(startInput({ idempotencyKey: "flush-racing-output-0123" }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    const payload = "p".repeat(512 * 1024);
+    const outputPending = runner.emit(started.job.jobId, "stdout", payload);
+    runner.finish(started.job.jobId, 0, 0);
+
+    await waitForState(started.job.jobId, "succeeded");
+    await outputPending;
+    expect(supervisor.store.get(started.job.jobId)?.stdout.totalBytes).toBe(payload.length);
+    expect(supervisor.store.readOutput(started.job.jobId, "stdout", 0)).toMatchObject({
+      ok: true,
+      text: "p".repeat(64 * 1024),
+    });
+    expect(supervisor.store.readOutput(started.job.jobId, "stdout", payload.length - 32, 32)).toMatchObject({
+      ok: true,
+      eof: true,
+      text: "p".repeat(32),
+    });
+  });
+
+  it("flushes accepted output when a running job is cancelled", async () => {
+    approveTestRecipe();
+    const started = supervisor.start(startInput({ idempotencyKey: "flush-cancel-0123456" }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await runner.emit(started.job.jobId, "stdout", "cancel-final-fragment");
+
+    expect(supervisor.cancel(started.job.jobId, "execution-test-client").ok).toBe(true);
+    runner.finish(started.job.jobId, 1);
+    await waitForState(started.job.jobId, "cancelled");
+
+    expect(supervisor.store.readOutput(started.job.jobId, "stdout")).toMatchObject({ ok: true, eof: true, text: "cancel-final-fragment" });
+  });
+
+  it("flushes accepted output before shutdown completes", async () => {
+    approveTestRecipe();
+    const started = supervisor.start(startInput({ idempotencyKey: "flush-shutdown-012345" }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await runner.emit(started.job.jobId, "stderr", "shutdown-final-fragment");
+
+    const shuttingDown = supervisor.shutdown();
+    runner.finish(started.job.jobId, 1);
+    await shuttingDown;
+
+    expect(supervisor.store.readOutput(started.job.jobId, "stderr")).toMatchObject({ ok: true, eof: true, text: "shutdown-final-fragment" });
   });
 
   it("rejects a package script after its approved content changes", () => {

@@ -2,7 +2,8 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
+import { gitCompare, gitDiff, gitInfo, gitStatus, runGit } from "../src/workspace/git.js";
+import { resolveGitExecutable } from "../src/git-write/security.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
@@ -38,6 +39,53 @@ describe("gitInfo", () => {
   it("handles non-repos gracefully", () => {
     expect(gitInfo(plain).isRepo).toBe(false);
   });
+});
+
+it.skipIf(process.platform !== "win32")("ignores a PATH-front fake git.exe for every read-only Git operation", () => {
+  const isolated = makeTmpDir("git-path-spoof-workspace");
+  makeGitRepo(isolated);
+  const base = git(isolated, "rev-parse", "HEAD").trim();
+  write(isolated, "hello.txt", "historical update\n");
+  git(isolated, "add", "hello.txt");
+  git(isolated, "commit", "-m", "historical update");
+  const head = git(isolated, "rev-parse", "HEAD").trim();
+  write(isolated, "hello.txt", "working tree update\n");
+
+  const fakeBin = makeTmpDir("git-path-spoof-bin");
+  const fakeGit = path.join(fakeBin, "git.exe");
+  const whereExecutable = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "where.exe");
+  fs.copyFileSync(whereExecutable, fakeGit);
+  const marker = path.join(fakeBin, "fake-git-started.txt");
+  const markerLoader = write(fakeBin, "marker-loader.cjs",
+    `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started');\n`);
+  const trustedGit = resolveGitExecutable().path;
+  const originalPath = process.env.PATH;
+  const originalTrustedGit = process.env.C2C_TRUSTED_GIT_EXECUTABLE;
+  const originalNodeOptions = process.env.NODE_OPTIONS;
+  process.env.PATH = [fakeBin, originalPath ?? ""].filter(Boolean).join(path.delimiter);
+  process.env.C2C_TRUSTED_GIT_EXECUTABLE = trustedGit;
+  process.env.NODE_OPTIONS = `--require=${markerLoader}`;
+
+  try {
+    const info = gitInfo(isolated);
+    expect(info).toMatchObject({ isRepo: true, branch: "main", dirty: true });
+    expect(gitStatus(isolated).isRepo).toBe(true);
+    expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("working tree update");
+    const comparison = gitCompare(isolated, { baseCommit: base, headCommit: head });
+    expect(comparison.isRepo).toBe(true);
+    expect(comparison.diff).toContain("historical update");
+    const branches = runGit(isolated, ["for-each-ref", "--format=%(refname)%09%(objectname)", "refs/heads", "refs/remotes"]);
+    expect(branches.ok).toBe(true);
+    expect(branches.stdout).toContain("refs/heads/main");
+    expect(fs.existsSync(marker)).toBe(false);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalTrustedGit === undefined) delete process.env.C2C_TRUSTED_GIT_EXECUTABLE;
+    else process.env.C2C_TRUSTED_GIT_EXECUTABLE = originalTrustedGit;
+    if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = originalNodeOptions;
+  }
 });
 
 describe("gitStatus", () => {
@@ -331,5 +379,284 @@ describe("gitDiff pagination", () => {
     expect(srcDiff.diff).not.toContain("root_secret_leak.txt");
 
     git(repo, "reset", "--hard", "HEAD");
+  });
+});
+
+describe("gitCompare historical commits", () => {
+  it("returns changed-file stats and a unified diff for two exact commits", () => {
+    const isolated = makeTmpDir("git-compare-basic");
+    makeGitRepo(isolated);
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+
+    write(isolated, "hello.txt", "historical compare changed\n");
+    write(isolated, "src/new-file.ts", "export const created = true;\n");
+    git(isolated, "add", "hello.txt", "src/new-file.ts");
+    git(isolated, "commit", "-m", "compare fixture");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const compared = gitCompare(isolated, { baseCommit: base.slice(0, 7), headCommit: head.slice(0, 7) });
+
+    expect(compared.isRepo).toBe(true);
+    expect(compared.baseCommit).toBe(base);
+    expect(compared.headCommit).toBe(head);
+    expect(compared.diff).toContain("historical compare changed");
+    expect(compared.diff).toContain("src/new-file.ts");
+    expect(compared.files).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "hello.txt", status: "M", binary: false }),
+      expect.objectContaining({ path: "src/new-file.ts", status: "A", binary: false }),
+    ]));
+    const hello = compared.files.find((item) => item.path === "hello.txt");
+    expect(hello?.additions).not.toBeNull();
+    expect(hello?.deletions).not.toBeNull();
+  });
+
+  it("preserves rename provenance while withholding sensitive historical paths", () => {
+    const isolated = makeTmpDir("git-compare-rename-sensitive");
+    makeGitRepo(isolated);
+    write(isolated, "rename-source.txt", "rename me\n");
+    write(isolated, ".env", "SECRET=baseline-secret\n");
+    git(isolated, "add", "-f", "rename-source.txt", ".env");
+    git(isolated, "commit", "-m", "compare rename baseline");
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+
+    git(isolated, "mv", "rename-source.txt", "rename-target.txt");
+    write(isolated, ".env", "SECRET=changed-secret\n");
+    git(isolated, "add", "-f", ".env", "rename-target.txt");
+    git(isolated, "commit", "-m", "rename and sensitive change");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const compared = gitCompare(isolated, { baseCommit: base, headCommit: head });
+
+    expect(compared.isRepo).toBe(true);
+    expect(compared.files).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: "rename-target.txt",
+        previousPath: "rename-source.txt",
+        status: expect.stringMatching(/^R/),
+      }),
+    ]));
+    expect(compared.diff).toContain("rename-source.txt");
+    expect(compared.diff).toContain("rename-target.txt");
+    expect(compared.diff).not.toContain(".env");
+    expect(compared.diff).not.toContain("changed-secret");
+    expect(compared.files.some((item) => item.path === ".env")).toBe(false);
+  });
+
+  it("reports binary historical changes without inventing line statistics", () => {
+    const isolated = makeTmpDir("git-compare-binary");
+    makeGitRepo(isolated);
+    fs.writeFileSync(path.join(isolated, "asset.bin"), Buffer.from([0, 1, 2, 3]));
+    git(isolated, "add", "asset.bin");
+    git(isolated, "commit", "-m", "binary baseline");
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+
+    fs.writeFileSync(path.join(isolated, "asset.bin"), Buffer.from([0, 1, 9, 3, 4]));
+    git(isolated, "add", "asset.bin");
+    git(isolated, "commit", "-m", "binary change");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const compared = gitCompare(isolated, { baseCommit: base, headCommit: head });
+    expect(compared.isRepo).toBe(true);
+    expect(compared.files).toEqual([
+      expect.objectContaining({
+        path: "asset.bin",
+        status: "M",
+        additions: null,
+        deletions: null,
+        binary: true,
+      }),
+    ]);
+    expect(compared.diff).toContain("Binary files");
+  });
+
+  it("supports repository-relative path scoping", () => {
+    const isolated = makeTmpDir("git-compare-scope");
+    makeGitRepo(isolated);
+    write(isolated, "docs/a.txt", "a0\n");
+    write(isolated, "src/a.ts", "export const a = 0;\n");
+    git(isolated, "add", "docs/a.txt", "src/a.ts");
+    git(isolated, "commit", "-m", "scope baseline");
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+
+    write(isolated, "docs/a.txt", "a1\n");
+    write(isolated, "src/a.ts", "export const a = 1;\n");
+    git(isolated, "add", "docs/a.txt", "src/a.ts");
+    git(isolated, "commit", "-m", "scope change");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const compared = gitCompare(isolated, { baseCommit: base, headCommit: head }, "src");
+
+    expect(compared.isRepo).toBe(true);
+    expect(compared.diff).toContain("src/a.ts");
+    expect(compared.diff).not.toContain("docs/a.txt");
+    expect(compared.files.map((item) => item.path)).toEqual(["src/a.ts"]);
+  });
+
+  it("uses exact A/B tree comparison semantics instead of merge-base semantics", () => {
+    const isolated = makeTmpDir("git-compare-diverged");
+    makeGitRepo(isolated);
+    write(isolated, "forked.txt", "common-base\n");
+    git(isolated, "add", "forked.txt");
+    git(isolated, "commit", "-m", "common compare base");
+    const common = git(isolated, "rev-parse", "HEAD").trim();
+
+    git(isolated, "checkout", "-b", "compare-left");
+    write(isolated, "forked.txt", "left-only\n");
+    git(isolated, "add", "forked.txt");
+    git(isolated, "commit", "-m", "left side");
+    const left = git(isolated, "rev-parse", "HEAD").trim();
+
+    git(isolated, "checkout", "-b", "compare-right", common);
+    write(isolated, "forked.txt", "right-only\n");
+    git(isolated, "add", "forked.txt");
+    git(isolated, "commit", "-m", "right side");
+    const right = git(isolated, "rev-parse", "HEAD").trim();
+
+    const compared = gitCompare(isolated, { baseCommit: left, headCommit: right });
+    expect(compared.isRepo).toBe(true);
+    expect(compared.diff).toContain("-left-only");
+    expect(compared.diff).toContain("+right-only");
+    expect(compared.diff).not.toContain("-common-base");
+  });
+
+  it("does not run configured external diff or textconv helpers", () => {
+    const isolated = makeTmpDir("git-compare-no-helpers");
+    makeGitRepo(isolated);
+    write(isolated, ".gitattributes", "*.txt diff=c2c\n");
+    write(isolated, "compare.txt", "base contents\n");
+    git(isolated, "add", ".gitattributes", "compare.txt");
+    git(isolated, "commit", "-m", "helper test baseline");
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+    write(isolated, "compare.txt", "changed contents\n");
+    git(isolated, "add", "compare.txt");
+    git(isolated, "commit", "-m", "helper test change");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const marker = path.join(isolated, "diff-helper.marker");
+    const helper = write(isolated, "diff-helper.mjs", [
+      "import fs from 'node:fs';",
+      `fs.writeFileSync(${JSON.stringify(marker)}, 'executed');`,
+      "console.log('helper output');",
+      "",
+    ].join("\n"));
+    const helperCommand = `"${process.execPath.replace(/\\/g, "/")}" "${helper.replace(/\\/g, "/")}"`;
+    git(isolated, "config", "diff.external", helperCommand);
+    git(isolated, "config", "diff.c2c.textconv", helperCommand);
+    expect(git(isolated, "config", "diff.external").trim()).toBe(helperCommand);
+    expect(git(isolated, "config", "diff.c2c.textconv").trim()).toBe(helperCommand);
+
+    git(isolated, "diff", "--ext-diff", base, head, "--", ".");
+    expect(fs.readFileSync(marker, "utf8")).toBe("executed");
+    fs.unlinkSync(marker);
+
+    const withExternalConfigured = gitCompare(isolated, { baseCommit: base, headCommit: head });
+    expect(withExternalConfigured.isRepo).toBe(true);
+    expect(withExternalConfigured.diff).toContain("changed contents");
+    expect(fs.existsSync(marker)).toBe(false);
+
+    git(isolated, "config", "--unset", "diff.external");
+    git(isolated, "diff", "--textconv", base, head, "--", ".");
+    expect(fs.readFileSync(marker, "utf8")).toBe("executed");
+    fs.unlinkSync(marker);
+
+    const withTextconvConfigured = gitCompare(isolated, { baseCommit: base, headCommit: head });
+    expect(withTextconvConfigured.isRepo).toBe(true);
+    expect(withTextconvConfigured.diff).toContain("base contents");
+    expect(withTextconvConfigured.diff).toContain("changed contents");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it("keeps both sides of a rename in one diff batch at the path-count boundary", () => {
+    const isolated = makeTmpDir("git-compare-rename-batch");
+    makeGitRepo(isolated);
+    write(isolated, "rename-source.txt", "rename payload\n");
+    git(isolated, "add", "rename-source.txt");
+    git(isolated, "commit", "-m", "rename source");
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+
+    for (let index = 0; index < 49; index += 1) {
+      write(isolated, `a${String(index).padStart(2, "0")}.txt`, `added ${index}\n`);
+    }
+    git(isolated, "add", ".");
+    git(isolated, "mv", "rename-source.txt", "rename-target.txt");
+    git(isolated, "commit", "-m", "many files and rename");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const compared = gitCompare(isolated, { baseCommit: base, headCommit: head });
+    expect(compared.isRepo).toBe(true);
+    expect(compared.files).toHaveLength(50);
+    expect(compared.files.filter((item) => item.status.startsWith("R"))).toHaveLength(1);
+    expect(compared.diff.match(/diff --git a\/rename-source\.txt b\/rename-target\.txt/g)).toHaveLength(1);
+    expect(compared.diff).toContain("rename from rename-source.txt");
+    expect(compared.diff).toContain("rename to rename-target.txt");
+  });
+
+  it("paginates a long UTF-8 diff line without losing bytes or splitting a code point", () => {
+    const isolated = makeTmpDir("git-compare-pagination-utf8");
+    makeGitRepo(isolated);
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+    write(isolated, "long-line.txt", `${"漢🙂".repeat(7000)}\n`);
+    git(isolated, "add", "long-line.txt");
+    git(isolated, "commit", "-m", "long unicode line");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const expected = git(isolated, "diff", "--relative", "--no-color", "--find-renames=1%", base, head, "--", ".");
+    const pages: string[] = [];
+    let offset = 0;
+    for (let pageCount = 0; pageCount < 64; pageCount += 1) {
+      const page = gitCompare(isolated, { baseCommit: base, headCommit: head, offset, maxBytes: 16_384 });
+      pages.push(page.diff);
+      expect(page.returnedBytes).toBe(Buffer.byteLength(page.diff, "utf8"));
+      expect(page.diff).not.toContain("\uFFFD");
+      if (!page.hasMore) break;
+      expect(page.nextOffset).toBe(page.offset + page.returnedBytes);
+      offset = page.nextOffset!;
+      if (pageCount === 63) throw new Error("UTF8_DIFF_PAGINATION_DID_NOT_FINISH");
+    }
+    expect(pages.join("")).toBe(expected);
+  });
+
+  it.skipIf(process.platform !== "win32")("withholds case variants of sensitive historical paths on Windows", () => {
+    const isolated = makeTmpDir("git-compare-sensitive-case");
+    makeGitRepo(isolated);
+    write(isolated, ".ENV", "TOKEN=case-variant-secret\n");
+    git(isolated, "add", "-f", ".ENV");
+    git(isolated, "commit", "-m", "sensitive case baseline");
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+    write(isolated, ".ENV", "TOKEN=changed-case-variant-secret\n");
+    git(isolated, "add", "-f", ".ENV");
+    git(isolated, "commit", "-m", "sensitive case change");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const compared = gitCompare(isolated, { baseCommit: base, headCommit: head });
+    expect(compared.isRepo).toBe(true);
+    expect(compared.files.some((item) => item.path.toLowerCase() === ".env")).toBe(false);
+    expect(compared.diff).not.toContain("case-variant-secret");
+  });
+
+  it("paginates historical diff output by byte offset", () => {
+    const isolated = makeTmpDir("git-compare-pagination");
+    makeGitRepo(isolated);
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+
+    const body = Array.from({ length: 3000 }, (_, i) => `row-${i}-${"x".repeat(50)}`).join("\n") + "\n";
+    write(isolated, "large.txt", body);
+    git(isolated, "add", "large.txt");
+    git(isolated, "commit", "-m", "large compare fixture");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    const first = gitCompare(isolated, { baseCommit: base, headCommit: head, maxBytes: 8192 });
+    expect(first.hasMore).toBe(true);
+    expect(first.diff.endsWith("\n")).toBe(true);
+    expect(first.nextOffset).toBe(first.returnedBytes);
+
+    const second = gitCompare(isolated, {
+      baseCommit: base,
+      headCommit: head,
+      offset: first.nextOffset!,
+      maxBytes: 8192,
+    });
+    expect(second.offset).toBe(first.nextOffset);
+    expect(second.diff.length).toBeGreaterThan(0);
   });
 });

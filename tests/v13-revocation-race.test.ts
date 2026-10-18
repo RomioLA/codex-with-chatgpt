@@ -8,12 +8,16 @@ import { createLevel3Request, setLevel3Enabled, approveLevel3Request, revokeLeve
 import { setPermission } from "../src/permission/store.js";
 import { isolateStateDir, makeTmpDir, makeGitRepo } from "./helpers.js";
 
+const nativeModuleDirectory = process.env.C2C_FULL_ACCESS_NATIVE_TEST_MODULE_DIRECTORY ?? path.resolve("dist", "execution");
+
 describe.skipIf(process.platform !== "win32")("F-02 native pre-launch revocation", () => {
   for (const stage of ["pending", "approved", "consumed"] as const) {
     it(`revocation in ${stage} prevents launch authorization`, () => {
       isolateStateDir(); const root = makeTmpDir(`f02-${stage}`); makeGitRepo(root);
       const workspace = new Workspace(root); setLevel3Enabled(workspace.id, true, true);
-      const request = createLevel3Request(workspace, "f02-stage", { engine: "program", repositoryPath: ".", executable: process.execPath,
+      const reviewOnlyExecutable = path.join(root, "review-only-program.exe");
+      fs.writeFileSync(reviewOnlyExecutable, "isolated review-only executable fixture\n");
+      const request = createLevel3Request(workspace, "f02-stage", { engine: "program", repositoryPath: ".", executable: reviewOnlyExecutable,
         args: ["--version"], cwd: ".", timeoutSeconds: 20, materials: [] });
       if (stage !== "pending") approveLevel3Request(workspace, request.requestId, request.digest, true, { risk: "development" });
       if (stage === "consumed") consumeLevel3Request(workspace, request.requestId, "f02-stage", request.digest);
@@ -32,7 +36,7 @@ describe.skipIf(process.platform !== "win32")("F-02 native pre-launch revocation
         args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started');setInterval(()=>{},1000)`], cwd: ".", timeoutSeconds: 20, materials: [] });
       approveLevel3Request(workspace, request.requestId, request.digest, true, { risk: "development", allowDynamic: true });
       let gateSeen = false, revoked = false, gateError = "";
-      const runner = new WindowsNativeExecutionRunner({ helperBeforeResumeTest: { releaseFile: release, phase, onSuspended: () => {
+      const runner = new WindowsNativeExecutionRunner({ moduleDirectory: nativeModuleDirectory, helperBeforeResumeTest: { releaseFile: release, phase, onSuspended: () => {
         gateSeen = true;
         try { if (action === "disable") { setLevel3Enabled(workspace.id, false, true); revoked = true; } else revoked = revokeLevel3Request(workspace.id, request.requestId, true); } catch (error) { gateError = (error as Error).message; }
         finally { fs.writeFileSync(release, "release"); }
@@ -71,7 +75,7 @@ describe.skipIf(process.platform !== "win32")("F-02 native pre-launch revocation
       args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'unexpected')`], cwd: ".", timeoutSeconds: 20, materials: [] });
     approveLevel3Request(workspace, request.requestId, request.digest, true, { risk: "development", allowDynamic: true });
     let revoked = false;
-    const runner = new WindowsNativeExecutionRunner({ beforeHelperRequestWrite: () => {
+    const runner = new WindowsNativeExecutionRunner({ moduleDirectory: nativeModuleDirectory, beforeHelperRequestWrite: () => {
       revoked = revokeLevel3Request(workspace.id, request.requestId, true);
     } });
     const supervisor = new ExecutionSupervisor(workspace, { runner, permissionPollMs: 60_000 });

@@ -3,10 +3,21 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
+#include <sdkddkver.h>
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION NTDDI_WIN10_RS1
+#endif
+#if NTDDI_VERSION < NTDDI_WIN10_RS1
+#undef NTDDI_VERSION
+#define NTDDI_VERSION NTDDI_WIN10_RS1
+#endif
 #include <windows.h>
+#include <aclapi.h>
 #include <bcrypt.h>
+#include <sddl.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -38,8 +49,9 @@ constexpr BYTE kFrameStdout = 1;
 constexpr BYTE kFrameStderr = 2;
 constexpr BYTE kFrameResult = 3;
 
-constexpr BYTE kRequestMagic[8] = {'C', '2', 'C', 'J', 'O', 'B', '5', 0};
-constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '5', 0};
+constexpr BYTE kRequestMagicV5[8] = {'C', '2', 'C', 'J', 'O', 'B', '5', 0};
+constexpr BYTE kRequestMagicV7[8] = {'C', '2', 'C', 'J', 'O', 'B', '7', 0};
+constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '7', 0};
 constexpr BYTE kTempCleanupMagic[8] = {'C', '2', 'C', 'T', 'M', 'P', '1', 0};
 
 struct UniqueHandle {
@@ -77,6 +89,135 @@ struct UniqueHandle {
     }
 };
 
+struct AtomicEditMutex {
+    HANDLE value = nullptr;
+    bool owned = false;
+
+    AtomicEditMutex() = default;
+    AtomicEditMutex(const AtomicEditMutex&) = delete;
+    AtomicEditMutex& operator=(const AtomicEditMutex&) = delete;
+
+    ~AtomicEditMutex() {
+        if (owned) ReleaseMutex(value);
+        if (value != nullptr) CloseHandle(value);
+    }
+
+    bool acquire(const std::wstring& name, DWORD& error) {
+        value = CreateMutexW(nullptr, FALSE, name.c_str());
+        if (value == nullptr) {
+            error = GetLastError();
+            return false;
+        }
+        const DWORD wait = WaitForSingleObject(value, 9000);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+            owned = true;
+            return true;
+        }
+        error = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+        return false;
+    }
+};
+
+// Cross-process counterpart to permission/store.ts's exclusive .json.lock.
+// The file remains present until the helper has crossed ResumeThread.
+struct PermissionLaunchPermit {
+    HANDLE value = INVALID_HANDLE_VALUE;
+    std::wstring path;
+    DWORD volumeSerial = 0;
+    DWORD fileIndexHigh = 0;
+    DWORD fileIndexLow = 0;
+
+    PermissionLaunchPermit() = default;
+    PermissionLaunchPermit(const PermissionLaunchPermit&) = delete;
+    PermissionLaunchPermit& operator=(const PermissionLaunchPermit&) = delete;
+    ~PermissionLaunchPermit() { reset(); }
+
+    bool acquire(const std::wstring& lockPath, DWORD& error) {
+        static std::atomic<std::uint64_t> stagingSequence{0};
+        const std::wstring stagingPath = lockPath + L".launch-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(GetTickCount64()) + L"-" +
+            std::to_wstring(stagingSequence.fetch_add(1, std::memory_order_relaxed));
+        value = CreateFileW(stagingPath.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+                            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (value == INVALID_HANDLE_VALUE) {
+            error = GetLastError();
+            return false;
+        }
+        FILE_ATTRIBUTE_TAG_INFO attributes{};
+        BY_HANDLE_FILE_INFORMATION identity{};
+        if (!GetFileInformationByHandleEx(value, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
+            !GetFileInformationByHandle(value, &identity) ||
+            (attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+            error = GetLastError();
+            if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+            CloseHandle(value);
+            value = INVALID_HANDLE_VALUE;
+            DeleteFileW(stagingPath.c_str());
+            return false;
+        }
+        volumeSerial = identity.dwVolumeSerialNumber;
+        fileIndexHigh = identity.nFileIndexHigh;
+        fileIndexLow = identity.nFileIndexLow;
+        const std::string owner = "launch:" + std::to_string(GetCurrentProcessId()) + "\n";
+        DWORD written = 0;
+        if (!WriteFile(value, owner.data(), static_cast<DWORD>(owner.size()), &written, nullptr) ||
+            written != owner.size() || !FlushFileBuffers(value)) {
+            error = GetLastError();
+            if (error == ERROR_SUCCESS) error = ERROR_WRITE_FAULT;
+            CloseHandle(value);
+            value = INVALID_HANDLE_VALUE;
+            DeleteFileW(stagingPath.c_str());
+            return false;
+        }
+        // Publish only after the launch marker is complete. Readers can then
+        // distinguish this immutable Resume permit from a permission mutation
+        // without observing an empty or partially written common lock file.
+        if (!MoveFileExW(stagingPath.c_str(), lockPath.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            error = GetLastError();
+            CloseHandle(value);
+            value = INVALID_HANDLE_VALUE;
+            DeleteFileW(stagingPath.c_str());
+            return false;
+        }
+        path = lockPath;
+        return true;
+    }
+
+    void reset() {
+        if (value == INVALID_HANDLE_VALUE) return;
+        const std::wstring lockPath = path;
+        const DWORD expectedVolume = volumeSerial;
+        const DWORD expectedIndexHigh = fileIndexHigh;
+        const DWORD expectedIndexLow = fileIndexLow;
+        FILE_DISPOSITION_INFO disposition{};
+        disposition.DeleteFile = TRUE;
+        const bool deleteByHandle = SetFileInformationByHandle(
+            value, FileDispositionInfo, &disposition, sizeof(disposition)) != FALSE;
+        CloseHandle(value);
+        value = INVALID_HANDLE_VALUE;
+        path.clear();
+        if (deleteByHandle) return;
+
+        HANDLE current = CreateFileW(lockPath.c_str(), FILE_READ_ATTRIBUTES,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (current == INVALID_HANDLE_VALUE) return;
+        FILE_ATTRIBUTE_TAG_INFO attributes{};
+        BY_HANDLE_FILE_INFORMATION identity{};
+        const bool matches = GetFileInformationByHandleEx(current, FileAttributeTagInfo,
+                &attributes, sizeof(attributes)) &&
+            GetFileInformationByHandle(current, &identity) &&
+            (attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) == 0 &&
+            identity.dwVolumeSerialNumber == expectedVolume &&
+            identity.nFileIndexHigh == expectedIndexHigh &&
+            identity.nFileIndexLow == expectedIndexLow;
+        CloseHandle(current);
+        if (matches) DeleteFileW(lockPath.c_str());
+    }
+};
+
 struct UniqueModule {
     HMODULE value = nullptr;
 
@@ -88,6 +229,7 @@ struct UniqueModule {
 };
 
 struct Request {
+    std::uint16_t protocolVersion = 7;
     BYTE recipe = 1;
     BYTE manager = 0;
     BYTE kind = 0;
@@ -143,6 +285,14 @@ struct Request {
     std::wstring genericCommandText;
     std::wstring genericCwd;
     std::wstring genericCwdFileIdentity;
+    std::wstring fullAccessWorkspaceId;
+    std::wstring fullAccessJobId;
+    std::wstring oauthClientId;
+    std::wstring permissionMode;
+    std::wstring sessionGrantFingerprint;
+    std::wstring sessionGrantId;
+    std::wstring idempotencyKeyHash;
+    std::wstring requestHash;
     std::wstring approvalManifest;
     std::wstring approvalManifestFileIdentity;
     std::wstring approvalManifestHash;
@@ -346,7 +496,9 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
     if (!ReadExact(input, magic, static_cast<DWORD>(sizeof(magic)), error)) {
         return false;
     }
-    if (!std::equal(std::begin(magic), std::end(magic), std::begin(kRequestMagic))) {
+    const bool requestV5 = std::equal(std::begin(magic), std::end(magic), std::begin(kRequestMagicV5));
+    const bool requestV7 = std::equal(std::begin(magic), std::end(magic), std::begin(kRequestMagicV7));
+    if (!requestV5 && !requestV7) {
         error = ERROR_INVALID_DATA;
         return false;
     }
@@ -365,14 +517,65 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         return false;
     }
 
-    if (version != 5 || (recipe != 1 && recipe != 2) || reservedByte != 0 || reservedWord != 0 ||
-        (request.manager != 1 && request.manager != 2) ||
-        request.kind < 1 || request.kind > 5 ||
+    const bool validRepositoryRequest = requestV5 && version == 5 &&
+        (recipe == 1 || recipe == 2) && (request.manager == 1 || request.manager == 2) &&
+        request.kind >= 1 && request.kind <= 5;
+    const bool validHostRequest = requestV7 && version == 7 && recipe == 3 &&
+        request.manager == 0 && request.kind == 0;
+    if ((!validRepositoryRequest && !validHostRequest) || reservedByte != 0 || reservedWord != 0 ||
         request.timeoutSeconds < 1 || request.timeoutSeconds > 3600) {
         error = ERROR_INVALID_DATA;
         return false;
     }
+    request.protocolVersion = version;
     request.recipe = recipe;
+
+    if (request.recipe == 3) {
+        DWORD argumentCount = 0;
+        if (!ReadString(input, kMaxFieldBytes, request.fullAccessWorkspaceId, error) ||
+            !ReadString(input, kMaxFieldBytes, request.fullAccessJobId, error) ||
+            !ReadString(input, kMaxFieldBytes, request.oauthClientId, error) ||
+            !ReadString(input, kMaxFieldBytes, request.permissionMode, error) ||
+            !ReadString(input, kMaxFieldBytes, request.sessionGrantFingerprint, error) ||
+            !ReadString(input, kMaxFieldBytes, request.sessionGrantId, error) ||
+            !ReadString(input, kMaxFieldBytes, request.idempotencyKeyHash, error) ||
+            !ReadString(input, kMaxFieldBytes, request.requestHash, error) ||
+            !ReadByte(input, request.genericMode, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericExecutable, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericExecutableFileIdentity, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericExecutableHash, error) ||
+            !ReadU32(input, argumentCount, error) || argumentCount > kMaxGenericArguments) {
+            if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+            return false;
+        }
+        request.genericArguments.reserve(argumentCount);
+        for (DWORD index = 0; index < argumentCount; ++index) {
+            std::wstring argument;
+            if (!ReadString(input, kMaxFieldBytes, argument, error, true)) return false;
+            request.genericArguments.push_back(std::move(argument));
+        }
+        if (!ReadString(input, kMaxFieldBytes, request.genericCommandText, error, true) ||
+            !ReadString(input, kMaxFieldBytes, request.genericCwd, error) ||
+            !ReadString(input, kMaxFieldBytes, request.genericCwdFileIdentity, error) ||
+            !ReadString(input, kMaxFieldBytes, request.tempRootPath, error) ||
+            !ReadString(input, kMaxFieldBytes, request.tempRootFileIdentity, error) ||
+            !ReadString(input, kMaxFieldBytes, request.tempNonce, error) ||
+            !ReadString(input, kMaxFieldBytes, request.tempCreatedAtMs, error) ||
+            !ReadString(input, kMaxFieldBytes, request.jobTempDir, error) ||
+            !ReadString(input, kMaxFieldBytes, request.jobTempFileIdentity, error)) {
+            return false;
+        }
+        request.tempWorkspaceId = request.fullAccessWorkspaceId;
+        request.tempJobId = request.fullAccessJobId;
+        if (request.genericMode < 1 || request.genericMode > 3 ||
+            (request.genericMode == 1 && !request.genericCommandText.empty()) ||
+            (request.genericMode != 1 &&
+             (!request.genericArguments.empty() || request.genericCommandText.empty()))) {
+            error = ERROR_INVALID_DATA;
+            return false;
+        }
+        return true;
+    }
 
     if (!ReadString(input, kMaxFieldBytes, request.cwd, error) ||
         !ReadString(input, kMaxFieldBytes, request.gitDirectory, error) ||
@@ -678,6 +881,15 @@ bool HasExeExtension(const std::wstring& path) {
         CompareStringOrdinal(base.c_str() + dot, -1, L".exe", -1, TRUE) == CSTR_EQUAL;
 }
 
+bool HasFullAccessExecutableExtension(const std::wstring& path) {
+    const std::wstring base = PathBasename(path);
+    const size_t dot = base.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    const wchar_t* extension = base.c_str() + dot;
+    return CompareStringOrdinal(extension, -1, L".exe", -1, TRUE) == CSTR_EQUAL ||
+           CompareStringOrdinal(extension, -1, L".com", -1, TRUE) == CSTR_EQUAL;
+}
+
 bool IsPathWithinDirectory(const std::wstring& root, const std::wstring& candidate) {
     if (candidate.size() < root.size() ||
         CompareStringOrdinal(root.c_str(), static_cast<int>(root.size()),
@@ -723,6 +935,12 @@ bool IsHex(const std::wstring& value, size_t expectedLength) {
     return value.size() == expectedLength && std::all_of(value.begin(), value.end(), [](wchar_t ch) {
         return (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f') ||
                (ch >= L'A' && ch <= L'F');
+    });
+}
+
+bool IsWorkspaceId(const std::wstring& value) {
+    return value.size() == 12 && std::all_of(value.begin(), value.end(), [](wchar_t ch) {
+        return (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'f');
     });
 }
 
@@ -811,7 +1029,70 @@ bool ParseUnsignedDecimal(const std::wstring& value, std::uint64_t& parsed) {
     return true;
 }
 
+bool ValidateFullAccessRequestPaths(Request& request, DWORD& error) {
+    if (!IsWorkspaceId(request.fullAccessWorkspaceId) || !IsRequestId(request.fullAccessJobId) ||
+        request.oauthClientId.empty() || request.oauthClientId.size() > 200 ||
+        request.permissionMode != L"level2" ||
+        !IsHex(request.sessionGrantFingerprint, 64) || !IsHex(request.idempotencyKeyHash, 64) ||
+        !IsHex(request.sessionGrantId, 64) || !IsHex(request.requestHash, 64) ||
+        !IsIdentity(request.genericCwdFileIdentity) ||
+        !IsIdentity(request.genericExecutableFileIdentity) || !IsHex(request.genericExecutableHash, 64) ||
+        !IsIdentity(request.tempRootFileIdentity) || !IsIdentity(request.jobTempFileIdentity) ||
+        !IsHex(request.tempNonce, 64) || request.tempCreatedAtMs.empty() ||
+        request.tempCreatedAtMs.size() > 16) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::uint64_t createdAtMs = 0;
+    if (!ParseUnsignedDecimal(request.tempCreatedAtMs, createdAtMs)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+
+    std::wstring canonical;
+    if (!ValidateCanonicalPath(request.genericCwd, true, canonical, error)) return false;
+    request.genericCwd = std::move(canonical);
+    if (!ValidateCanonicalPath(request.genericExecutable, false, canonical, error)) return false;
+    request.genericExecutable = std::move(canonical);
+    if (!HasFullAccessExecutableExtension(request.genericExecutable) ||
+        (request.genericMode != 1 && !HasExeExtension(request.genericExecutable))) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
+    if (request.genericMode == 2 && !IsBasename(request.genericExecutable, L"cmd.exe")) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    } else if (request.genericMode == 3 &&
+               !IsBasename(request.genericExecutable, L"powershell.exe") &&
+               !IsBasename(request.genericExecutable, L"pwsh.exe")) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    } else if (request.genericMode != 1 && request.genericMode != 2 && request.genericMode != 3) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+
+    std::wstring expectedTempRoot;
+    if (!ValidateCanonicalPath(request.tempRootPath, true, canonical, error)) return false;
+    request.tempRootPath = std::move(canonical);
+    if (!ExpectedExecutionTempRoot(request.fullAccessWorkspaceId, expectedTempRoot, error) ||
+        !SameOrdinal(request.tempRootPath, expectedTempRoot)) {
+        if (error == ERROR_SUCCESS) error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    const std::wstring expectedJobTemp = request.tempRootPath + L"\\tmp-" + request.fullAccessJobId;
+    if (!SameOrdinal(request.jobTempDir, expectedJobTemp) ||
+        !ValidateCanonicalPath(request.jobTempDir, true, canonical, error)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_NAME;
+        return false;
+    }
+    request.jobTempDir = std::move(canonical);
+    return true;
+}
+
 bool ValidateRequestPaths(Request& request, DWORD& error) {
+    if (request.recipe == 3) return ValidateFullAccessRequestPaths(request, error);
+
     if (!ValidateTarget(request)) {
         error = ERROR_INVALID_DATA;
         return false;
@@ -1273,9 +1554,386 @@ bool MatchesMarkerFile(const std::wstring& path, const std::string& expected, DW
     return OpenMatchingMarkerFile(path, expected, GENERIC_READ, file, error);
 }
 
+void SkipJsonWhitespace(const std::string& json, size_t& cursor) {
+    while (cursor < json.size() && (json[cursor] == ' ' || json[cursor] == '\t' ||
+           json[cursor] == '\r' || json[cursor] == '\n')) ++cursor;
+}
+
+void AppendUtf8CodePoint(std::uint32_t codePoint, std::string& value) {
+    if (codePoint <= 0x7f) {
+        value.push_back(static_cast<char>(codePoint));
+    } else if (codePoint <= 0x7ff) {
+        value.push_back(static_cast<char>(0xc0 | (codePoint >> 6)));
+        value.push_back(static_cast<char>(0x80 | (codePoint & 0x3f)));
+    } else if (codePoint <= 0xffff) {
+        value.push_back(static_cast<char>(0xe0 | (codePoint >> 12)));
+        value.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3f)));
+        value.push_back(static_cast<char>(0x80 | (codePoint & 0x3f)));
+    } else {
+        value.push_back(static_cast<char>(0xf0 | (codePoint >> 18)));
+        value.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3f)));
+        value.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3f)));
+        value.push_back(static_cast<char>(0x80 | (codePoint & 0x3f)));
+    }
+}
+
+bool ReadJsonHexCodeUnit(const std::string& json, size_t& cursor, std::uint32_t& value) {
+    if (cursor + 4 > json.size()) return false;
+    value = 0;
+    for (size_t index = 0; index < 4; ++index) {
+        const char ch = json[cursor++];
+        std::uint32_t digit = 0;
+        if (ch >= '0' && ch <= '9') digit = static_cast<std::uint32_t>(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') digit = static_cast<std::uint32_t>(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') digit = static_cast<std::uint32_t>(ch - 'A' + 10);
+        else return false;
+        value = (value << 4) | digit;
+    }
+    return true;
+}
+
+bool ParseJsonString(const std::string& json, size_t& cursor, std::string& value) {
+    if (cursor >= json.size() || json[cursor++] != '"') return false;
+    value.clear();
+    while (cursor < json.size()) {
+        const unsigned char ch = static_cast<unsigned char>(json[cursor++]);
+        if (ch == '"') return true;
+        if (ch < 0x20) return false;
+        if (ch != '\\') {
+            value.push_back(static_cast<char>(ch));
+            continue;
+        }
+        if (cursor >= json.size()) return false;
+        switch (json[cursor++]) {
+            case '"': value.push_back('"'); break;
+            case '\\': value.push_back('\\'); break;
+            case '/': value.push_back('/'); break;
+            case 'b': value.push_back('\b'); break;
+            case 'f': value.push_back('\f'); break;
+            case 'n': value.push_back('\n'); break;
+            case 'r': value.push_back('\r'); break;
+            case 't': value.push_back('\t'); break;
+            case 'u': {
+                std::uint32_t codePoint = 0;
+                if (!ReadJsonHexCodeUnit(json, cursor, codePoint)) return false;
+                if (codePoint >= 0xd800 && codePoint <= 0xdbff) {
+                    if (cursor + 2 > json.size() || json[cursor] != '\\' || json[cursor + 1] != 'u') return false;
+                    cursor += 2;
+                    std::uint32_t low = 0;
+                    if (!ReadJsonHexCodeUnit(json, cursor, low) || low < 0xdc00 || low > 0xdfff) return false;
+                    codePoint = 0x10000 + ((codePoint - 0xd800) << 10) + (low - 0xdc00);
+                } else if (codePoint >= 0xdc00 && codePoint <= 0xdfff) {
+                    return false;
+                }
+                AppendUtf8CodePoint(codePoint, value);
+                break;
+            }
+            default: return false;
+        }
+    }
+    return false;
+}
+
+bool SkipJsonNumber(const std::string& json, size_t& cursor) {
+    if (cursor < json.size() && json[cursor] == '-') ++cursor;
+    if (cursor >= json.size()) return false;
+    if (json[cursor] == '0') {
+        ++cursor;
+        if (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9') return false;
+    } else if (json[cursor] >= '1' && json[cursor] <= '9') {
+        while (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9') ++cursor;
+    } else {
+        return false;
+    }
+    if (cursor < json.size() && json[cursor] == '.') {
+        ++cursor;
+        const size_t fractionStart = cursor;
+        while (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9') ++cursor;
+        if (cursor == fractionStart) return false;
+    }
+    if (cursor < json.size() && (json[cursor] == 'e' || json[cursor] == 'E')) {
+        ++cursor;
+        if (cursor < json.size() && (json[cursor] == '+' || json[cursor] == '-')) ++cursor;
+        const size_t exponentStart = cursor;
+        while (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9') ++cursor;
+        if (cursor == exponentStart) return false;
+    }
+    return true;
+}
+
+bool SkipJsonValue(const std::string& json, size_t& cursor, unsigned depth) {
+    if (depth > 32) return false;
+    SkipJsonWhitespace(json, cursor);
+    if (cursor >= json.size()) return false;
+    if (json[cursor] == '"') {
+        std::string ignored;
+        return ParseJsonString(json, cursor, ignored);
+    }
+    if (json[cursor] == '{') {
+        ++cursor;
+        SkipJsonWhitespace(json, cursor);
+        if (cursor < json.size() && json[cursor] == '}') { ++cursor; return true; }
+        for (;;) {
+            std::string key;
+            if (!ParseJsonString(json, cursor, key)) return false;
+            SkipJsonWhitespace(json, cursor);
+            if (cursor >= json.size() || json[cursor++] != ':') return false;
+            if (!SkipJsonValue(json, cursor, depth + 1)) return false;
+            SkipJsonWhitespace(json, cursor);
+            if (cursor >= json.size()) return false;
+            if (json[cursor] == '}') { ++cursor; return true; }
+            if (json[cursor++] != ',') return false;
+            SkipJsonWhitespace(json, cursor);
+        }
+    }
+    if (json[cursor] == '[') {
+        ++cursor;
+        SkipJsonWhitespace(json, cursor);
+        if (cursor < json.size() && json[cursor] == ']') { ++cursor; return true; }
+        for (;;) {
+            if (!SkipJsonValue(json, cursor, depth + 1)) return false;
+            SkipJsonWhitespace(json, cursor);
+            if (cursor >= json.size()) return false;
+            if (json[cursor] == ']') { ++cursor; return true; }
+            if (json[cursor++] != ',') return false;
+        }
+    }
+    if (json.compare(cursor, 4, "true") == 0) { cursor += 4; return true; }
+    if (json.compare(cursor, 5, "false") == 0) { cursor += 5; return true; }
+    if (json.compare(cursor, 4, "null") == 0) { cursor += 4; return true; }
+    return SkipJsonNumber(json, cursor);
+}
+
+bool ReadJsonObjectMemberPrefix(const std::string& json, size_t& cursor, std::string& key) {
+    if (!ParseJsonString(json, cursor, key)) return false;
+    SkipJsonWhitespace(json, cursor);
+    return cursor < json.size() && json[cursor++] == ':';
+}
+
+bool IsCanonicalIsoTimestamp(const std::string& value) {
+    if (value.size() != 24 || value[4] != '-' || value[7] != '-' || value[10] != 'T' ||
+        value[13] != ':' || value[16] != ':' || value[19] != '.' || value[23] != 'Z') return false;
+    const auto digits = [&value](size_t offset, size_t count, unsigned& result) {
+        result = 0;
+        for (size_t index = 0; index < count; ++index) {
+            const char ch = value[offset + index];
+            if (ch < '0' || ch > '9') return false;
+            result = result * 10 + static_cast<unsigned>(ch - '0');
+        }
+        return true;
+    };
+    unsigned year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0, millis = 0;
+    if (!digits(0, 4, year) || !digits(5, 2, month) || !digits(8, 2, day) ||
+        !digits(11, 2, hour) || !digits(14, 2, minute) || !digits(17, 2, second) ||
+        !digits(20, 3, millis) || month < 1 || month > 12 || hour > 23 ||
+        minute > 59 || second > 59 || millis > 999) return false;
+    const bool leapYear = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    const unsigned daysInMonth[] = { 31, leapYear ? 29u : 28u, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return day >= 1 && day <= daysInMonth[month - 1];
+}
+
+struct ParsedPermissionGrant {
+    std::string identityFingerprint;
+    std::string grantId;
+    std::string createdAt;
+    bool hasIdentityFingerprint = false;
+    bool hasGrantId = false;
+    bool hasCreatedAt = false;
+};
+
+bool ParsePermissionGrant(const std::string& json, size_t& cursor, ParsedPermissionGrant& grant) {
+    SkipJsonWhitespace(json, cursor);
+    if (cursor >= json.size() || json[cursor++] != '{') return false;
+    SkipJsonWhitespace(json, cursor);
+    if (cursor < json.size() && json[cursor] == '}') { ++cursor; return false; }
+    for (;;) {
+        std::string key;
+        if (!ReadJsonObjectMemberPrefix(json, cursor, key)) return false;
+        SkipJsonWhitespace(json, cursor);
+        if (key == "identityFingerprint") {
+            if (grant.hasIdentityFingerprint || !ParseJsonString(json, cursor, grant.identityFingerprint)) return false;
+            grant.hasIdentityFingerprint = true;
+        } else if (key == "grantId") {
+            if (grant.hasGrantId || !ParseJsonString(json, cursor, grant.grantId)) return false;
+            grant.hasGrantId = true;
+        } else if (key == "createdAt") {
+            if (grant.hasCreatedAt || !ParseJsonString(json, cursor, grant.createdAt)) return false;
+            grant.hasCreatedAt = true;
+        } else if (!SkipJsonValue(json, cursor, 2)) {
+            return false;
+        }
+        SkipJsonWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == '}') { ++cursor; break; }
+        if (json[cursor++] != ',') return false;
+        SkipJsonWhitespace(json, cursor);
+    }
+    return grant.hasIdentityFingerprint && grant.hasGrantId && grant.hasCreatedAt &&
+        IsCanonicalIsoTimestamp(grant.createdAt);
+}
+
+struct ParsedPermissionState {
+    std::string version;
+    std::string workspaceId;
+    std::string baselineMode;
+    std::string updatedAt;
+    ParsedPermissionGrant sessionGrant;
+    bool hasVersion = false;
+    bool hasWorkspaceId = false;
+    bool hasBaselineMode = false;
+    bool hasUpdatedAt = false;
+    bool hasSessionGrant = false;
+};
+
+bool ParsePermissionState(const std::string& json, ParsedPermissionState& state) {
+    size_t cursor = 0;
+    SkipJsonWhitespace(json, cursor);
+    if (cursor >= json.size() || json[cursor++] != '{') return false;
+    SkipJsonWhitespace(json, cursor);
+    if (cursor < json.size() && json[cursor] == '}') return false;
+    for (;;) {
+        std::string key;
+        if (!ReadJsonObjectMemberPrefix(json, cursor, key)) return false;
+        SkipJsonWhitespace(json, cursor);
+        if (key == "version") {
+            if (state.hasVersion || cursor >= json.size() || json[cursor] != '2') return false;
+            ++cursor;
+            if (cursor < json.size() && (json[cursor] == '.' || json[cursor] == 'e' || json[cursor] == 'E' ||
+                (json[cursor] >= '0' && json[cursor] <= '9'))) return false;
+            state.version = "2";
+            state.hasVersion = true;
+        } else if (key == "workspaceId") {
+            if (state.hasWorkspaceId || !ParseJsonString(json, cursor, state.workspaceId)) return false;
+            state.hasWorkspaceId = true;
+        } else if (key == "baselineMode") {
+            if (state.hasBaselineMode || !ParseJsonString(json, cursor, state.baselineMode)) return false;
+            state.hasBaselineMode = true;
+        } else if (key == "updatedAt") {
+            if (state.hasUpdatedAt || !ParseJsonString(json, cursor, state.updatedAt)) return false;
+            state.hasUpdatedAt = true;
+        } else if (key == "sessionGrant") {
+            if (state.hasSessionGrant || !ParsePermissionGrant(json, cursor, state.sessionGrant)) return false;
+            state.hasSessionGrant = true;
+        } else if (!SkipJsonValue(json, cursor, 1)) {
+            return false;
+        }
+        SkipJsonWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == '}') { ++cursor; break; }
+        if (json[cursor++] != ',') return false;
+        SkipJsonWhitespace(json, cursor);
+    }
+    SkipJsonWhitespace(json, cursor);
+    return cursor == json.size() && state.hasVersion && state.hasWorkspaceId &&
+        state.hasBaselineMode && state.hasUpdatedAt && !state.updatedAt.empty() &&
+        state.hasSessionGrant;
+}
+
+bool ExpectedPermissionStatePaths(const Request& request, std::wstring& statePath,
+                                  std::wstring& lockPath, DWORD& error) {
+    std::wstring stateRoot;
+    if (!ReadEnvironmentValue(L"C2C_STATE_DIR", stateRoot, error)) {
+        if (error != ERROR_SUCCESS) return false;
+        std::wstring localAppData;
+        if (!ReadEnvironmentValue(L"LOCALAPPDATA", localAppData, error)) {
+            if (error != ERROR_SUCCESS) return false;
+            std::wstring profile;
+            if (!ReadEnvironmentValue(L"USERPROFILE", profile, error) || error != ERROR_SUCCESS) {
+                if (error == ERROR_SUCCESS) error = ERROR_PATH_NOT_FOUND;
+                return false;
+            }
+            localAppData = profile + L"\\AppData\\Local";
+        }
+        stateRoot = localAppData + L"\\OpenAI\\c2c-local";
+    }
+    std::wstring canonicalRoot;
+    if (!ValidateCanonicalPath(stateRoot, true, canonicalRoot, error)) return false;
+    std::wstring canonicalPermissionDirectory;
+    if (!ValidateCanonicalPath(canonicalRoot + L"\\permissions", true,
+                               canonicalPermissionDirectory, error)) return false;
+    statePath = canonicalPermissionDirectory + L"\\" + request.fullAccessWorkspaceId + L".json";
+    lockPath = statePath + L".lock";
+    return true;
+}
+
+bool ReadPermissionState(const Request& request, const std::wstring& statePath, DWORD& error) {
+    UniqueHandle file;
+    file.reset(CreateFileW(statePath.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!file.valid()) {
+        error = GetLastError();
+        return false;
+    }
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    LARGE_INTEGER size{};
+    if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo,
+                                      &attributes, sizeof(attributes)) ||
+        !GetFileSizeEx(file.get(), &size)) {
+        error = GetLastError();
+        return false;
+    }
+    if ((attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+        size.QuadPart < 2 || size.QuadPart > 64 * 1024) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::string json(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD received = 0;
+    if (!ReadFile(file.get(), json.data(), static_cast<DWORD>(json.size()), &received, nullptr) ||
+        received != json.size()) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_HANDLE_EOF;
+        return false;
+    }
+
+    ParsedPermissionState state;
+    std::string expectedWorkspaceId;
+    std::string expectedIdentityFingerprint;
+    std::string expectedGrantId;
+    if (!ToAscii(request.fullAccessWorkspaceId, expectedWorkspaceId) ||
+        !ToAscii(request.sessionGrantFingerprint, expectedIdentityFingerprint) ||
+        !ToAscii(request.sessionGrantId, expectedGrantId) ||
+        !ParsePermissionState(json, state) || state.version != "2" ||
+        state.workspaceId != expectedWorkspaceId || state.baselineMode != "level1" ||
+        state.sessionGrant.identityFingerprint != expectedIdentityFingerprint ||
+        state.sessionGrant.grantId != expectedGrantId) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    return true;
+}
+
+bool AcquireFullAccessLaunchPermit(const Request& request, PermissionLaunchPermit& permit,
+                                   DWORD& error) {
+    std::wstring statePath;
+    std::wstring lockPath;
+    if (!ExpectedPermissionStatePaths(request, statePath, lockPath, error)) return false;
+
+    // Permission writers use the same exclusive lock. Wait briefly for an
+    // in-progress write, then read the committed state while holding the lock.
+    const auto lockDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    for (;;) {
+        if (permit.acquire(lockPath, error)) break;
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) return false;
+        if (std::chrono::steady_clock::now() >= lockDeadline) {
+            error = ERROR_BUSY;
+            return false;
+        }
+        Sleep(5);
+    }
+    if (!ReadPermissionState(request, statePath, error)) {
+        permit.reset();
+        return false;
+    }
+    return true;
+}
+
 // Authorization provenance remains in the trusted Bridge. This narrowly binds
 // its revocable launch permit to the locked manifest through ResumeThread.
-bool AcquireLaunchPermit(const Request& request, UniqueHandle& permit, DWORD& error) {
+bool AcquireLaunchPermit(const Request& request, UniqueHandle& permit,
+                         PermissionLaunchPermit& fullAccessPermit, DWORD& error) {
+    if (request.recipe == 3) return AcquireFullAccessLaunchPermit(request, fullAccessPermit, error);
     if (request.recipe != 2 || !HasRequestIdSuffix(request.approvalManifest.substr(
             request.approvalManifest.find_last_of(L'\\') + 1), L".manifest.json")) return true;
     std::string expected;
@@ -1557,6 +2215,23 @@ void WriteHelperFailureDiagnostic(const char* stage, DWORD error) {
 
 bool LockExecutionMaterials(const Request& request, std::vector<UniqueHandle>& locks,
                             DWORD& error) {
+    if (request.recipe == 3) {
+        const size_t separator = request.genericExecutable.find_last_of(L'\\');
+        if (separator == std::wstring::npos) {
+            error = ERROR_INVALID_NAME;
+            return false;
+        }
+        const std::wstring executableDirectory = separator == 2
+            ? request.genericExecutable.substr(0, 3)
+            : request.genericExecutable.substr(0, separator);
+        return LockDirectoryPath(request.genericCwd, &request.genericCwdFileIdentity, locks, error) &&
+               LockDirectoryPath(request.tempRootPath, &request.tempRootFileIdentity, locks, error) &&
+               LockDirectoryPath(request.jobTempDir, &request.jobTempFileIdentity, locks, error) &&
+               ValidateTempOwnershipMarkers(request, error) &&
+               LockDirectoryPath(executableDirectory, nullptr, locks, error) &&
+               OpenFileLock(request.genericExecutable, &request.genericExecutableFileIdentity,
+                            &request.genericExecutableHash, locks, error);
+    }
     if (!LockDirectoryPath(request.cwd, &request.repositoryFileIdentity, locks, error) ||
         !LockDirectoryPath(request.gitDirectory, &request.gitDirectoryFileIdentity, locks, error) ||
         !LockDirectoryPath(request.commonGitDirectory, &request.commonGitDirectoryFileIdentity, locks, error) ||
@@ -1741,6 +2416,37 @@ bool BuildEnvironment(const Request& request, ChildEnvironment& environment, DWO
     }
     environment.privateTemp = privateDir;
 
+    if (request.recipe == 3) {
+        LPWCH inherited = GetEnvironmentStringsW();
+        if (inherited == nullptr) {
+            error = GetLastError();
+            return false;
+        }
+        std::vector<std::pair<std::wstring, std::wstring>> entries;
+        for (const wchar_t* current = inherited; *current != L'\0'; current += std::wcslen(current) + 1) {
+            const std::wstring assignment(current);
+            const size_t separator = assignment.find(L'=', assignment.empty() || assignment[0] != L'=' ? 0 : 1);
+            if (separator == std::wstring::npos || separator == 0) continue;
+            const std::wstring name = assignment.substr(0, separator);
+            if (SameOrdinal(name, L"TEMP") || SameOrdinal(name, L"TMP")) continue;
+            entries.emplace_back(name, assignment.substr(separator + 1));
+        }
+        FreeEnvironmentStringsW(inherited);
+        entries.emplace_back(L"TEMP", environment.privateTemp);
+        entries.emplace_back(L"TMP", environment.privateTemp);
+        std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+            return CompareStringOrdinal(left.first.c_str(), -1,
+                                        right.first.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+        });
+        for (const auto& entry : entries) {
+            const std::wstring assignment = entry.first + L"=" + entry.second;
+            environment.block.insert(environment.block.end(), assignment.begin(), assignment.end());
+            environment.block.push_back(L'\0');
+        }
+        environment.block.push_back(L'\0');
+        return true;
+    }
+
     if (!JoinPath(privateDir, L"user.npmrc", environment.userConfig, error) ||
         !JoinPath(privateDir, L"global.npmrc", environment.globalConfig, error) ||
         !JoinPath(privateDir, L"npm-cache", environment.npmCache, error) ||
@@ -1851,7 +2557,7 @@ std::wstring QuoteWindowsArgument(const std::wstring& argument) {
 bool BuildCommandLine(const Request& request, const ChildEnvironment& environment,
                       std::vector<wchar_t>& commandLine, DWORD& error) {
     std::vector<std::wstring> arguments;
-    if (request.recipe == 2) {
+    if (request.recipe == 2 || request.recipe == 3) {
         if (request.genericMode == 2) {
             if (!SameOrdinal(request.genericExecutable, environment.comSpec)) {
                 error = ERROR_INVALID_NAME;
@@ -2238,10 +2944,10 @@ bool CreateSuspendedChild(const Request& request, const ChildEnvironment& enviro
     PROCESS_INFORMATION processInfo{};
     DWORD creationFlags = CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT |
                           CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
-    const wchar_t* applicationName = request.recipe == 2
+    const wchar_t* applicationName = request.recipe == 2 || request.recipe == 3
         ? request.genericExecutable.c_str()
         : request.nodeExecutable.c_str();
-    const wchar_t* workingDirectory = request.recipe == 2
+    const wchar_t* workingDirectory = request.recipe == 2 || request.recipe == 3
         ? request.genericCwd.c_str()
         : request.cwd.c_str();
     if (!CreateProcessW(applicationName, commandLine.data(),
@@ -2326,6 +3032,568 @@ void SetFirstError(DWORD candidate, DWORD& error) {
     }
 }
 
+std::uint64_t ElapsedMicroseconds(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count());
+}
+
+bool AtomicFileAttributes(HANDLE file, FILE_ATTRIBUTE_TAG_INFO& info, DWORD& error) {
+    if (!GetFileInformationByHandleEx(file, FileAttributeTagInfo, &info, sizeof(info))) {
+        error = GetLastError();
+        return false;
+    }
+    if ((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        error = ERROR_REPARSE_TAG_INVALID;
+        return false;
+    }
+    if ((info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        error = ERROR_DIRECTORY;
+        return false;
+    }
+    return true;
+}
+
+bool AtomicSecurityDescriptor(HANDLE file, std::wstring& sddl, DWORD& error) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const SECURITY_INFORMATION sections = OWNER_SECURITY_INFORMATION |
+        GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    const DWORD status = GetSecurityInfo(file, SE_FILE_OBJECT, sections,
+        nullptr, nullptr, nullptr, nullptr, &descriptor);
+    if (status != ERROR_SUCCESS) {
+        error = status;
+        return false;
+    }
+    LPWSTR text = nullptr;
+    ULONG length = 0;
+    const BOOL converted = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        descriptor, SDDL_REVISION_1, sections, &text, &length);
+    if (!converted) {
+        error = GetLastError();
+        LocalFree(descriptor);
+        return false;
+    }
+    sddl.assign(text, length > 0 ? length - 1 : 0);
+    LocalFree(text);
+    LocalFree(descriptor);
+    return true;
+}
+
+struct AtomicSecurityParts {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PSID owner = nullptr;
+    PSID group = nullptr;
+    PACL dacl = nullptr;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+};
+
+void FreeAtomicSecurityParts(AtomicSecurityParts& parts) {
+    if (parts.descriptor != nullptr) LocalFree(parts.descriptor);
+    parts = {};
+}
+
+bool ReadAtomicSecurityParts(HANDLE file, AtomicSecurityParts& parts, DWORD& error) {
+    const SECURITY_INFORMATION sections = OWNER_SECURITY_INFORMATION |
+        GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    error = GetSecurityInfo(file, SE_FILE_OBJECT, sections, &parts.owner, &parts.group,
+        &parts.dacl, nullptr, &parts.descriptor);
+    if (error != ERROR_SUCCESS) return false;
+    DWORD revision = 0;
+    if (!GetSecurityDescriptorControl(parts.descriptor, &parts.control, &revision)) {
+        error = GetLastError();
+        FreeAtomicSecurityParts(parts);
+        return false;
+    }
+    return true;
+}
+
+bool SameAtomicSid(PSID left, PSID right) {
+    if (left == nullptr || right == nullptr) return left == right;
+    return EqualSid(left, right) != FALSE;
+}
+
+bool AtomicCopySecurityDescriptor(HANDLE target, HANDLE replacement,
+                                 const std::wstring& expectedSddl, DWORD& error) {
+    AtomicSecurityParts targetParts;
+    AtomicSecurityParts replacementParts;
+    if (!ReadAtomicSecurityParts(target, targetParts, error)) return false;
+    if (!ReadAtomicSecurityParts(replacement, replacementParts, error)) {
+        FreeAtomicSecurityParts(targetParts);
+        return false;
+    }
+
+    const bool ownerDiffers = !SameAtomicSid(targetParts.owner, replacementParts.owner);
+    const bool groupDiffers = !SameAtomicSid(targetParts.group, replacementParts.group);
+    std::wstring replacementSddl;
+    if (!AtomicSecurityDescriptor(replacement, replacementSddl, error)) {
+        FreeAtomicSecurityParts(replacementParts);
+        FreeAtomicSecurityParts(targetParts);
+        return false;
+    }
+    const bool descriptorDiffers = !SameOrdinal(replacementSddl, expectedSddl);
+
+    SECURITY_INFORMATION securityInfo = 0;
+    if (ownerDiffers) securityInfo |= OWNER_SECURITY_INFORMATION;
+    if (groupDiffers) securityInfo |= GROUP_SECURITY_INFORMATION;
+    if (descriptorDiffers) {
+        securityInfo |= DACL_SECURITY_INFORMATION |
+            ((targetParts.control & SE_DACL_PROTECTED) != 0
+                ? PROTECTED_DACL_SECURITY_INFORMATION
+                : UNPROTECTED_DACL_SECURITY_INFORMATION);
+    }
+    if (securityInfo == 0) {
+        FreeAtomicSecurityParts(replacementParts);
+        FreeAtomicSecurityParts(targetParts);
+        return true;
+    }
+
+    UniqueHandle ownerWritableReplacement;
+    HANDLE securityHandle = replacement;
+    if (ownerDiffers || groupDiffers) {
+        ownerWritableReplacement.reset(ReOpenFile(replacement,
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0));
+        if (!ownerWritableReplacement.valid()) {
+            error = GetLastError();
+            FreeAtomicSecurityParts(replacementParts);
+            FreeAtomicSecurityParts(targetParts);
+            return false;
+        }
+        std::wstring originalIdentity;
+        std::wstring reopenedIdentity;
+        if (!FileIdentity(replacement, originalIdentity, error) ||
+            !FileIdentity(ownerWritableReplacement.get(), reopenedIdentity, error) ||
+            !SameOrdinal(originalIdentity, reopenedIdentity)) {
+            if (error == ERROR_SUCCESS) error = ERROR_FILE_INVALID;
+            FreeAtomicSecurityParts(replacementParts);
+            FreeAtomicSecurityParts(targetParts);
+            return false;
+        }
+        securityHandle = ownerWritableReplacement.get();
+    }
+
+    error = SetSecurityInfo(securityHandle, SE_FILE_OBJECT, securityInfo,
+        ownerDiffers ? targetParts.owner : nullptr,
+        groupDiffers ? targetParts.group : nullptr,
+        descriptorDiffers ? targetParts.dacl : nullptr, nullptr);
+    FreeAtomicSecurityParts(replacementParts);
+    FreeAtomicSecurityParts(targetParts);
+    if (error != ERROR_SUCCESS) return false;
+
+    std::wstring actualSddl;
+    if (!AtomicSecurityDescriptor(replacement, actualSddl, error)) return false;
+    if (!SameOrdinal(actualSddl, expectedSddl)) {
+        error = ERROR_INVALID_SECURITY_DESCR;
+        return false;
+    }
+    return true;
+}
+
+bool AtomicCopyAlternateDataStreams(const std::wstring& destination,
+                                    const std::wstring& replacement, DWORD& error) {
+    WIN32_FIND_STREAM_DATA stream{};
+    HANDLE search = FindFirstStreamW(destination.c_str(), FindStreamInfoStandard, &stream, 0);
+    if (search == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        if (error == ERROR_HANDLE_EOF) error = ERROR_SUCCESS;
+        return error == ERROR_SUCCESS;
+    }
+
+    bool copied = true;
+    do {
+        if (CompareStringOrdinal(stream.cStreamName, -1, L"::$DATA", -1, TRUE) == CSTR_EQUAL) {
+            continue;
+        }
+        if (stream.cStreamName[0] != L':' ||
+            std::wcschr(stream.cStreamName, L'\\') != nullptr ||
+            std::wcschr(stream.cStreamName, L'/') != nullptr) {
+            error = ERROR_INVALID_NAME;
+            copied = false;
+            break;
+        }
+
+        const std::wstring streamName(stream.cStreamName);
+        const std::wstring sourceStream = destination + streamName;
+        const std::wstring replacementStream = replacement + streamName;
+        UniqueHandle input(CreateFileW(sourceStream.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!input.valid()) {
+            error = GetLastError();
+            copied = false;
+            break;
+        }
+        UniqueHandle output(CreateFileW(replacementStream.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (!output.valid()) {
+            error = GetLastError();
+            copied = false;
+            break;
+        }
+
+        std::array<char, 64 * 1024> buffer{};
+        for (;;) {
+            DWORD bytesRead = 0;
+            if (!ReadFile(input.get(), buffer.data(), static_cast<DWORD>(buffer.size()),
+                          &bytesRead, nullptr)) {
+                error = GetLastError();
+                copied = false;
+                break;
+            }
+            if (bytesRead == 0) break;
+            DWORD offset = 0;
+            while (offset < bytesRead) {
+                DWORD bytesWritten = 0;
+                if (!WriteFile(output.get(), buffer.data() + offset, bytesRead - offset,
+                               &bytesWritten, nullptr) || bytesWritten == 0) {
+                    error = GetLastError();
+                    if (error == ERROR_SUCCESS) error = ERROR_WRITE_FAULT;
+                    copied = false;
+                    break;
+                }
+                offset += bytesWritten;
+            }
+            if (!copied) break;
+        }
+        if (copied && !FlushFileBuffers(output.get())) {
+            error = GetLastError();
+            copied = false;
+        }
+        if (!copied) break;
+    } while (FindNextStreamW(search, &stream));
+
+    if (copied) {
+        const DWORD enumerationError = GetLastError();
+        if (enumerationError != ERROR_HANDLE_EOF) {
+            error = enumerationError;
+            copied = false;
+        }
+    }
+    if (!FindClose(search) && copied) {
+        error = GetLastError();
+        copied = false;
+    }
+    if (copied) error = ERROR_SUCCESS;
+    return copied;
+}
+
+bool AtomicPrepareReplacement(const std::wstring& destination,
+                              const std::wstring& replacementPath,
+                              HANDLE target, HANDLE replacement,
+                              const FILE_ATTRIBUTE_TAG_INFO& targetAttributes,
+                              const std::wstring& targetSddl, DWORD& error) {
+    const DWORD unsupportedStorageAttributes = FILE_ATTRIBUTE_COMPRESSED |
+        FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_OFFLINE;
+    if ((targetAttributes.FileAttributes & unsupportedStorageAttributes) != 0) {
+        error = ERROR_NOT_SUPPORTED;
+        return false;
+    }
+
+    if (!AtomicCopyAlternateDataStreams(destination, replacementPath, error) ||
+        !AtomicCopySecurityDescriptor(target, replacement, targetSddl, error)) {
+        return false;
+    }
+
+    FILE_BASIC_INFO targetBasic{};
+    FILE_BASIC_INFO replacementBasic{};
+    if (!GetFileInformationByHandleEx(target, FileBasicInfo, &targetBasic, sizeof(targetBasic)) ||
+        !GetFileInformationByHandleEx(replacement, FileBasicInfo, &replacementBasic, sizeof(replacementBasic))) {
+        error = GetLastError();
+        return false;
+    }
+
+    const DWORD preserveMask = FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN |
+        FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_TEMPORARY;
+    const DWORD desiredAttributes = (replacementBasic.FileAttributes & ~preserveMask) |
+        (targetBasic.FileAttributes & preserveMask);
+    FILE_BASIC_INFO update{};
+    update.CreationTime = targetBasic.CreationTime;
+    update.FileAttributes = desiredAttributes;
+    if (!SetFileInformationByHandle(replacement, FileBasicInfo, &update, sizeof(update))) {
+        error = GetLastError();
+        return false;
+    }
+
+    FILE_BASIC_INFO verifiedBasic{};
+    if (!GetFileInformationByHandleEx(replacement, FileBasicInfo, &verifiedBasic, sizeof(verifiedBasic))) {
+        error = GetLastError();
+        return false;
+    }
+    const DWORD verifyMask = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE |
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED |
+        FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_SPARSE_FILE |
+        FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_TEMPORARY;
+    if (verifiedBasic.CreationTime.QuadPart != targetBasic.CreationTime.QuadPart ||
+        (verifiedBasic.FileAttributes & verifyMask) != (targetBasic.FileAttributes & verifyMask)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    if (!FlushFileBuffers(replacement)) {
+        error = GetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool AtomicRenameReplace(HANDLE replacement, const std::wstring& destination, DWORD& error) {
+    const std::size_t fileNameBytes = destination.size() * sizeof(wchar_t);
+    const std::size_t structureBytes = sizeof(FILE_RENAME_INFO);
+    if (fileNameBytes == 0 ||
+        fileNameBytes > static_cast<std::size_t>(MAXDWORD) - structureBytes) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
+    // Windows requires at least sizeof(FILE_RENAME_INFO) + FileNameLength.
+    // The zero-filled tail also leaves a terminating WCHAR after the counted name.
+    std::vector<BYTE> storage(structureBytes + fileNameBytes, 0);
+    auto* renameInfo = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+    // Flags 0x1 | 0x2: replace existing, then use POSIX-style name replacement.
+    renameInfo->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS |
+        FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    renameInfo->RootDirectory = nullptr;
+    renameInfo->FileNameLength = static_cast<DWORD>(fileNameBytes);
+    std::memcpy(renameInfo->FileName, destination.data(), fileNameBytes);
+    if (!SetFileInformationByHandle(replacement, FileRenameInfoEx,
+                                    renameInfo, static_cast<DWORD>(storage.size()))) {
+        error = GetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool AtomicResult(const std::string& payload, DWORD& error) {
+    const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == nullptr || output == INVALID_HANDLE_VALUE) {
+        error = ERROR_INVALID_HANDLE;
+        return false;
+    }
+    const std::string line = "C2C_RESULT|" + payload + "\n";
+    return WriteAll(output, line.data(), static_cast<DWORD>(line.size()), error);
+}
+
+bool AtomicOpen(const std::wstring& path, UniqueHandle& handle, DWORD& error,
+                DWORD desiredAccess = GENERIC_READ | READ_CONTROL,
+                DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_DELETE) {
+    for (DWORD attempt = 0; attempt <= 10; ++attempt) {
+        handle.reset(CreateFileW(path.c_str(), desiredAccess, shareMode, nullptr,
+            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (handle.valid()) break;
+        error = GetLastError();
+        if ((error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) || attempt == 10) {
+            return false;
+        }
+        Sleep(10);
+    }
+    if (GetFileType(handle.get()) != FILE_TYPE_DISK) {
+        error = ERROR_INVALID_FUNCTION;
+        return false;
+    }
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    if (!AtomicFileAttributes(handle.get(), attributes, error)) return false;
+    return true;
+}
+
+int RunAtomicReplace(const std::wstring& destination, const std::wstring& source,
+                     const std::wstring& expectedHash, const std::wstring& expectedNewHash,
+                     const std::wstring& expectedVolumeText, const std::wstring& expectedIndexText) {
+    const auto validationStart = std::chrono::steady_clock::now();
+    DWORD error = ERROR_SUCCESS;
+    std::uint64_t expectedVolume = 0;
+    std::uint64_t expectedIndex = 0;
+    if (!IsHex(expectedHash, 64) || !IsHex(expectedNewHash, 64) ||
+        !ParseUnsignedDecimal(expectedVolumeText, expectedVolume) ||
+        !ParseUnsignedDecimal(expectedIndexText, expectedIndex)) {
+        AtomicResult("ERROR|87|preflight|0|0|0", error);
+        return 0;
+    }
+
+    std::wstring canonicalDestination;
+    std::wstring canonicalSource;
+    if (!ValidateCanonicalPath(destination, false, canonicalDestination, error) ||
+        !ValidateCanonicalPath(source, false, canonicalSource, error) ||
+        !SameOrdinal(ParentDirectory(canonicalDestination), ParentDirectory(canonicalSource))) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_NAME;
+        AtomicResult("ERROR|" + std::to_string(error) + "|preflight|0|0|0", error);
+        return 0;
+    }
+
+    // Serialize C2C publishers for one original file identity. This gives
+    // ordinary competing C2C writers one winner; external same-user path swaps
+    // remain outside the Practical Atomic Edit guarantee.
+    const std::wstring mutexName = L"Local\\C2C_PracticalAtomicEdit_" +
+        expectedVolumeText + L"_" + expectedIndexText;
+    AtomicEditMutex publicationLock;
+    if (!publicationLock.acquire(mutexName, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+
+    UniqueHandle target;
+    // Requiring target write and DELETE access honors its DACL even when the
+    // parent directory separately grants DELETE_CHILD.
+    if (!AtomicOpen(canonicalDestination, target, error,
+                    GENERIC_READ | READ_CONTROL | FILE_WRITE_DATA | DELETE)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|preflight|0|0|0", error);
+        return 0;
+    }
+    FILE_ATTRIBUTE_TAG_INFO targetAttributes{};
+    if (!AtomicFileAttributes(target.get(), targetAttributes, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|preflight|0|0|0", error);
+        return 0;
+    }
+    if ((targetAttributes.FileAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
+        AtomicResult("READONLY|" + std::to_string(ElapsedMicroseconds(validationStart)), error);
+        return 0;
+    }
+
+    std::wstring targetIdentity;
+    std::wstring targetHash;
+    if (!FileIdentity(target.get(), targetIdentity, error) ||
+        !Sha256(target.get(), targetHash, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+    std::wostringstream expectedIdentity;
+    expectedIdentity << std::hex << std::nouppercase << expectedVolume << L":" << expectedIndex;
+    if (!SameOrdinal(targetIdentity, expectedIdentity.str()) ||
+        !SameOrdinal(targetHash, expectedHash)) {
+        std::string currentHash;
+        if (!ToAscii(targetHash, currentHash)) currentHash = std::string(64, '0');
+        AtomicResult("STALE|" + currentHash + "|" +
+            std::to_string(ElapsedMicroseconds(validationStart)), error);
+        return 0;
+    }
+
+    std::wstring aclBefore;
+    if (!AtomicSecurityDescriptor(target.get(), aclBefore, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+
+    // Confirm the destination name still resolves to the handle whose bytes were
+    // hashed. The held handle denies ordinary in-place writes and allows a single
+    // POSIX-style rename replacement. Same-user adversarial path swaps remain
+    // outside the Practical Atomic Edit guarantee.
+    UniqueHandle pathCheck;
+    if (!AtomicOpen(canonicalDestination, pathCheck, error,
+                    GENERIC_READ | READ_CONTROL,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+    std::wstring pathIdentity;
+    if (!FileIdentity(pathCheck.get(), pathIdentity, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+    if (!SameOrdinal(pathIdentity, targetIdentity)) {
+        std::string currentHash;
+        std::wstring pathHash;
+        if (Sha256(pathCheck.get(), pathHash, error) && !ToAscii(pathHash, currentHash)) {
+            currentHash = std::string(64, '0');
+        }
+        if (currentHash.empty()) currentHash = std::string(64, '0');
+        AtomicResult("STALE|" + currentHash + "|" +
+            std::to_string(ElapsedMicroseconds(validationStart)), error);
+        return 0;
+    }
+    pathCheck.reset();
+
+    UniqueHandle replacement;
+    if (!AtomicOpen(canonicalSource, replacement, error,
+                    GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE | WRITE_DAC,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+    std::wstring replacementHash;
+    if (!Sha256(replacement.get(), replacementHash, error) ||
+        !SameOrdinal(replacementHash, expectedNewHash)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+    if (!AtomicPrepareReplacement(canonicalDestination, canonicalSource, target.get(),
+                                  replacement.get(), targetAttributes, aclBefore, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+    std::wstring preparedHash;
+    if (!Sha256(replacement.get(), preparedHash, error) ||
+        !SameOrdinal(preparedHash, expectedNewHash)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
+            std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
+        return 0;
+    }
+
+    const std::uint64_t validationUs = ElapsedMicroseconds(validationStart);
+    const auto replaceStart = std::chrono::steady_clock::now();
+    if (!AtomicRenameReplace(replacement.get(), canonicalDestination, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|publish|0|" +
+            std::to_string(validationUs) + "|0", error);
+        return 0;
+    }
+    const std::uint64_t replaceUs = ElapsedMicroseconds(replaceStart);
+    target.reset();
+    replacement.reset();
+
+    const auto verificationStart = std::chrono::steady_clock::now();
+    UniqueHandle finalFile;
+    if (!AtomicOpen(canonicalDestination, finalFile, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|post-verification|1|" +
+            std::to_string(validationUs) + "|" +
+            std::to_string(ElapsedMicroseconds(verificationStart)) + "|", error);
+        return 0;
+    }
+    FILE_ATTRIBUTE_TAG_INFO finalAttributes{};
+    std::wstring finalHash;
+    std::wstring aclAfter;
+    if (!AtomicFileAttributes(finalFile.get(), finalAttributes, error) ||
+        !Sha256(finalFile.get(), finalHash, error) ||
+        !AtomicSecurityDescriptor(finalFile.get(), aclAfter, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|post-verification|1|" +
+            std::to_string(validationUs) + "|" +
+            std::to_string(ElapsedMicroseconds(verificationStart)) + "|", error);
+        return 0;
+    }
+    const DWORD verifyMask = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE |
+        FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED |
+        FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_SPARSE_FILE |
+        FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_TEMPORARY;
+    if (!SameOrdinal(finalHash, expectedNewHash)) {
+        std::string actual;
+        if (!ToAscii(finalHash, actual)) actual = std::string(64, '0');
+        AtomicResult("ERROR|13|post-verification|1|" + std::to_string(validationUs) + "|" +
+            std::to_string(ElapsedMicroseconds(verificationStart)) + "|" + actual, error);
+        return 0;
+    }
+    if ((finalAttributes.FileAttributes & verifyMask) !=
+            (targetAttributes.FileAttributes & verifyMask) ||
+        !SameOrdinal(aclBefore, aclAfter)) {
+        std::string actual;
+        if (!ToAscii(finalHash, actual)) actual = std::string(64, '0');
+        AtomicResult("ERROR|13|post-verification|1|" + std::to_string(validationUs) + "|" +
+            std::to_string(ElapsedMicroseconds(verificationStart)) + "|" + actual, error);
+        return 0;
+    }
+
+    std::string finalHashAscii;
+    if (!ToAscii(finalHash, finalHashAscii)) finalHashAscii = std::string(64, '0');
+    AtomicResult("OK|" + finalHashAscii + "|" + std::to_string(validationUs) + "|" +
+        std::to_string(replaceUs) + "|" + std::to_string(ElapsedMicroseconds(verificationStart)), error);
+    return 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -2335,6 +3603,10 @@ int wmain(int argc, wchar_t** argv) {
         CompareStringOrdinal(argv[1], -1, L"--cleanup-temp", -1, FALSE) == CSTR_EQUAL) {
         if (input == nullptr || input == INVALID_HANDLE_VALUE) return 1;
         return RunTempCleanup(input);
+    }
+    if (argc == 8 && argv != nullptr &&
+        CompareStringOrdinal(argv[1], -1, L"--atomic-replace", -1, FALSE) == CSTR_EQUAL) {
+        return RunAtomicReplace(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
     }
     if (output == nullptr || output == INVALID_HANDLE_VALUE) {
         return 2;
@@ -2516,35 +3788,53 @@ int wmain(int argc, wchar_t** argv) {
                             outcome = Outcome::HelperError;
                         }
                     } else {
-                        const bool materialLocksVerified =
+                        const bool materialLocksVerified = request.recipe == 3 ||
                             VerifyRuntimeMaterialLocks(request, resultError);
                         if (!materialLocksVerified) failureStage = "verify-runtime-material-locks";
                         UniqueHandle launchPermit;
+                        PermissionLaunchPermit fullAccessLaunchPermit;
                         std::vector<UniqueHandle> snapshotChecks;
                         bool snapshotsVerified = true;
                         for (const auto& material : request.launchSnapshots) {
                             if (!OpenFileLock(material.path, &material.fileIdentity, &material.hash, snapshotChecks, resultError)) { snapshotsVerified = false; break; }
                         }
-                        const bool launchAuthorized = materialLocksVerified && snapshotsVerified && AcquireLaunchPermit(request, launchPermit, resultError) &&
+                        const bool launchAuthorized = materialLocksVerified && snapshotsVerified &&
+                            AcquireLaunchPermit(request, launchPermit, fullAccessLaunchPermit, resultError) &&
                             TestWaitBeforeResume(L"permit", GetProcessId(process.get()), resultError);
                         if (materialLocksVerified && !launchAuthorized) failureStage = "launch-permit";
                         // Git itself must update these files; release just before
                         // Resume. Commit uses pinned tree/parent + ref CAS as well.
                         snapshotChecks.clear();
-                        const DWORD previousSuspendCount = launchAuthorized
+                        const ControlEvent beforeResumeEvent = control.state();
+                        const auto beforeResumeTime = std::chrono::steady_clock::now();
+                        const bool resumeAuthorized = launchAuthorized &&
+                            beforeResumeEvent == ControlEvent::None && beforeResumeTime < deadline;
+                        const DWORD previousSuspendCount = resumeAuthorized
                             ? ResumeThread(primaryThread.get())
                             : static_cast<DWORD>(-1);
                         launchPermit.reset();
+                        fullAccessLaunchPermit.reset();
                         if (previousSuspendCount != 1) {
-                            if (launchAuthorized) {
+                            if (resumeAuthorized) {
                                 resultError = previousSuspendCount == static_cast<DWORD>(-1)
                                                   ? GetLastError()
                                                   : ERROR_INVALID_STATE;
                                 failureStage = "resume-child";
                             }
                             jobZeroConfirmed = terminateTree(ERROR_PROCESS_ABORTED);
-                            outcome = jobZeroConfirmed && materialLocksVerified && !launchAuthorized
-                                ? snapshotsVerified ? Outcome::AuthorizationDenied : Outcome::PrelaunchStateChanged : Outcome::HelperError;
+                            if (!jobZeroConfirmed) {
+                                outcome = Outcome::HelperError;
+                            } else if (beforeResumeEvent == ControlEvent::Cancel) {
+                                outcome = Outcome::Cancelled;
+                            } else if (beforeResumeEvent == ControlEvent::None && beforeResumeTime >= deadline) {
+                                outcome = Outcome::TimedOut;
+                            } else if (materialLocksVerified && !launchAuthorized) {
+                                outcome = snapshotsVerified ? Outcome::AuthorizationDenied : Outcome::PrelaunchStateChanged;
+                            } else {
+                                outcome = Outcome::HelperError;
+                                if (beforeResumeEvent == ControlEvent::OwnerLost) resultError = ERROR_BROKEN_PIPE;
+                                else if (resultError == ERROR_SUCCESS) resultError = ERROR_INVALID_DATA;
+                            }
                         } else {
                             primaryThread.reset();
                             bool terminateIssued = false;

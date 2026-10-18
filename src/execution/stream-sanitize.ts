@@ -87,6 +87,7 @@ function isHomeTerminator(char: string, style: "unix" | "windows"): boolean {
 }
 
 function findHomeCandidate(input: string): HomeCandidate | undefined {
+  if (!input.includes("/") && !input.includes("\\")) return undefined;
   const prefixes: Array<Omit<HomeCandidate, "start" | "prefixEnd"> & { prefix: RegExp }> = [
     { prefix: /\/Users\//g, pathStyle: "unix", replacementPrefix: "/Users/[user]" },
     { prefix: /\/home\//g, pathStyle: "unix", replacementPrefix: "/home/[user]" },
@@ -112,6 +113,11 @@ function findHomeCandidate(input: string): HomeCandidate | undefined {
 }
 
 function findTokenCandidate(input: string, previousChar: string | undefined, atEnd: boolean): TokenCandidate | undefined {
+  if (
+    !input.includes("c2c_") && !input.includes("ghp_") && !input.includes("github_pat_") &&
+    !input.includes("sk-") && !input.includes("xox") && !input.includes("AKIA") &&
+    !input.includes("AIza") && !input.includes("-")
+  ) return undefined;
   const candidates: TokenCandidate[] = [];
   for (const item of TOKEN_PATTERNS) {
     item.pattern.lastIndex = 0;
@@ -181,24 +187,24 @@ export class StreamingSanitizer {
   /** Accept a chunk and return the portion that is safe to release now. */
   push(chunk: string): string {
     if (this.closed || this._restrictedReason) return "";
-    let output = "";
-    for (const char of chunk) {
-      this.privateTail += char;
-      const privateMatch = PRIVATE_KEY_HEADER.exec(this.privateTail);
-      if (privateMatch) {
-        output += this.acceptSafeText(this.privateTail.slice(0, privateMatch.index), true);
-        this.privateTail = "";
-        output += this.finishPending();
-        this._restrictedReason = "private_key";
-        this._truncated = true;
-        return output;
-      }
-      if (this.privateTail.length > PRIVATE_HEADER_WINDOW) {
-        output += this.acceptSafeText(this.privateTail[0]);
-        this.privateTail = this.privateTail.slice(1);
-      }
+    this.privateTail += chunk;
+    const privateMatch = PRIVATE_KEY_HEADER.exec(this.privateTail);
+    if (privateMatch) {
+      const safePrefix = this.privateTail.slice(0, privateMatch.index);
+      const stableLength = Math.max(0, safePrefix.length - PRIVATE_HEADER_WINDOW);
+      this.privateTail = "";
+      let output = this.acceptSafeText(safePrefix.slice(0, stableLength));
+      output += this.acceptSafeText(safePrefix.slice(stableLength), true);
+      output += this.finishPending();
+      this._restrictedReason = "private_key";
+      this._truncated = true;
+      return output;
     }
-    return output;
+    const safeLength = Math.max(0, this.privateTail.length - PRIVATE_HEADER_WINDOW);
+    if (safeLength === 0) return "";
+    const safeText = this.privateTail.slice(0, safeLength);
+    this.privateTail = this.privateTail.slice(safeLength);
+    return this.acceptSafeText(safeText);
   }
 
   /** Flush a safe suffix. Repeated calls return an empty string. */

@@ -439,6 +439,21 @@ export function validateGitConfig(config: GitConfigEntry[]): void {
   }
 }
 
+/** Level 3 auto-approval does not execute Git signing or key-discovery helpers. */
+export function validateLevel3GitConfig(config: GitConfigEntry[]): void {
+  validateGitConfig(config);
+  for (const { key } of config) {
+    const lower = key.toLowerCase();
+    if (/^(?:commit|tag|push)\.gpgsign$/.test(lower) ||
+        /^gpg\.format$/.test(lower) ||
+        /^gpg\.program$/.test(lower) ||
+        /^gpg\..+\.program$/.test(lower) ||
+        /^gpg\.ssh\.defaultkeycommand$/.test(lower)) {
+      throw new GitWriteError("UNSAFE_GIT_CONFIG");
+    }
+  }
+}
+
 export function remoteValues(config: GitConfigEntry[], remoteName: string, key: "url" | "pushurl"): string[] {
   const expected = `remote.${remoteName}.${key}`.toLowerCase();
   return config.filter((entry) => entry.key.toLowerCase() === expected).map((entry) => entry.value);

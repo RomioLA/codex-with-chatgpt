@@ -7,6 +7,7 @@ import { readJsonIfExists } from "../config/paths.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
+  | "GIT_EXECUTABLE_UNTRUSTED"
   | "PATH_OUTSIDE_WORKSPACE"
   | "PATH_OUTSIDE_REPOSITORY"
   | "ACCESS_DENIED_SENSITIVE_FILE"

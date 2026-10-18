@@ -10,6 +10,7 @@ export function runExecutionTempCleanup(
   lease: ExecutionTempLease,
   trustedStoreDirectory: string,
   onDiagnostic?: (message: string) => void,
+  launcherPath?: string,
 ): boolean {
   if (process.platform !== "win32") {
     onDiagnostic?.("Execution temp cleanup requires the Windows native primitive.");
@@ -33,12 +34,12 @@ export function runExecutionTempCleanup(
   }
   let result: ReturnType<typeof spawnSync>;
   try {
-    const launcherPath = resolveExecutionLauncherPath();
+    const cleanupLauncherPath = launcherPath ?? resolveExecutionLauncherPath();
     const input = serializeTempCleanupRequest(lease);
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
     const systemDirectory = path.join(systemRoot, "System32");
-    result = spawnSync(launcherPath, [], {
-      cwd: path.dirname(launcherPath),
+    result = spawnSync(cleanupLauncherPath, [], {
+      cwd: path.dirname(cleanupLauncherPath),
       input,
       env: {
         SystemRoot: systemRoot,

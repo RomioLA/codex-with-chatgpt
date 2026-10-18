@@ -36,7 +36,11 @@ function failure(error: unknown) {
 const filePath = z.string().min(1).describe("Workspace-relative path (workspace:/ alias accepted)");
 const hostPath = z.string().min(1).describe("Explicit host absolute path outside the workspace");
 const expectedHash = z.string().regex(/^[a-f0-9]{64}$/i).describe("contentHash from the last read; required for stale protection");
-const content = z.string().max(1024 * 1024).describe("UTF-8 text to write");
+const content = z.string().superRefine((value, context) => {
+  if (Buffer.byteLength(value, "utf8") > 1024 * 1024) {
+    context.addIssue({ code: "custom", message: "UTF-8 text content is capped at 1 MiB." });
+  }
+}).describe("UTF-8 text to write (up to 1 MiB)");
 const writeOutput = { path: z.string(), oldHash: z.string().nullable(), newHash: z.string().nullable() };
 const mutationAnnotations = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
 
@@ -135,13 +139,13 @@ export function registerFileTools(server: McpServer, workspace: Workspace, logge
       apply(args.path, external, "write", extra.authInfo, (target, ctx) => createFile(target.abs, args.content, ctx))));
     server.registerTool(`replace_${suffix}`, {
       title: `Replace ${external ? "external" : "workspace"} file`,
-      description: "Replace an existing file only when expected_hash matches its exact current bytes.",
+      description: "Atomically replace an existing text file only when expected_hash matches its exact current bytes. Reparse points and read-only targets are rejected.",
       inputSchema: { path: pathSchema, content, expected_hash: expectedHash }, outputSchema: writeOutput, annotations,
     }, async (args, extra) => run(`replace_${suffix}`, () =>
       apply(args.path, external, "write", extra.authInfo, (target, ctx) => replaceFile(target.abs, args.content, args.expected_hash, ctx))));
     server.registerTool(`edit_${suffix}`, {
       title: `Edit ${external ? "external" : "workspace"} file`,
-      description: "Replace exactly one old_text match after expected_hash verification. Ambiguous matches are rejected.",
+      description: "Atomically replace exactly one old_text match after expected_hash verification. Ambiguous matches, reparse points, and read-only targets are rejected.",
       inputSchema: { path: pathSchema, old_text: z.string().min(1), new_text: content, expected_hash: expectedHash },
       outputSchema: writeOutput, annotations,
     }, async (args, extra) => run(`edit_${suffix}`, () =>

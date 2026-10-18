@@ -626,8 +626,17 @@ function addProgramEntries(input: ScriptEntryBindingInput, found: Array<{ refere
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
-    if ((isNode && (arg === "-e" || arg === "--eval" || arg === "-p" || arg === "--print")) ||
-        (isPython && (arg === "-c" || arg === "-m"))) {
+    const lower = arg.toLowerCase();
+    const option = lower.split("=", 1)[0]!;
+    const nodeDynamic = isNode && (
+      ["--eval", "--print", "--require", "--import", "--loader", "--experimental-loader", "--test", "--run"].includes(option) ||
+      lower === "-e" || lower.startsWith("-e") || lower === "-p" || lower.startsWith("-p") ||
+      lower === "-r" || lower.startsWith("-r")
+    );
+    const pythonDynamic = isPython && (
+      option === "-c" || option === "-m" || lower.startsWith("-c") || lower.startsWith("-m")
+    );
+    if (nodeDynamic || pythonDynamic) {
       uncertainties.add("interpreter-eval");
     }
     const attached = optionValue(arg);

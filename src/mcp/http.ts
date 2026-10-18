@@ -3,6 +3,12 @@ import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Logger } from "../logger/index.js";
+import {
+  beginEventLoopTraceSpan,
+  currentEventLoopTraceContext,
+  isEventLoopTraceEnabled,
+  recordEventLoopTrace,
+} from "../diagnostics/event-loop-trace.js";
 
 type FailurePhase = "server_create" | "transport_create" | "server_connect" | "handle_request";
 
@@ -16,8 +22,8 @@ const SAFE_ERROR_CODES = new Set([
 ]);
 const SAFE_PROTOCOL_CODES = new Set([-32700, -32600, -32601, -32602, -32603, -32000]);
 const REGISTERED_TOOL_NAMES = new Set([
-  "workspace_info", "list_directory", "read_file", "read_image", "search_workspace", "git_info", "git_status", "git_diff",
-  "test_status", "execution_summary", "execution_output", "execution_start", "execution_status", "execution_list",
+  "workspace_info", "list_directory", "read_file", "read_image", "search_workspace", "git_info", "git_status", "git_diff", "git_compare",
+  "test_status", "execution_summary", "execution_output", "execution_run", "execution_start", "execution_status", "execution_list",
   "execution_job_output", "execution_cancel", "permission_status", "create_file", "replace_file", "edit_file",
   "create_external_file", "replace_external_file", "edit_external_file", "create_directory", "delete_file", "move_file",
   "read_external_file", "git_branches", "level3_request", "level3_request_status", "level3_start", "git_write",
@@ -54,12 +60,37 @@ function safeErrorDetails(error: unknown): { errorName: string; errorCode?: stri
   return { errorName, ...(errorCode ? { errorCode } : {}), stackFrames };
 }
 
-function safeToolName(body: unknown): string | undefined {
+export function safeToolName(body: unknown): string | undefined {
   if (!body || typeof body !== "object") return undefined;
   const params = (body as { params?: unknown }).params;
   if (!params || typeof params !== "object") return undefined;
   const name = (params as { name?: unknown }).name;
   return typeof name === "string" && REGISTERED_TOOL_NAMES.has(name) ? name : undefined;
+}
+
+function instrumentToolRequestHandler(server: McpServer): void {
+  type RequestHandler = (request: unknown, extra: unknown) => unknown | Promise<unknown>;
+  try {
+    const protocol = server.server as unknown as { _requestHandlers?: Map<string, RequestHandler> };
+    const handlers = protocol._requestHandlers;
+    const handler = handlers?.get("tools/call");
+    if (!handlers || !handler) return;
+    handlers.set("tools/call", async (request, extra) => {
+      const params = request && typeof request === "object"
+        ? (request as { params?: unknown }).params
+        : undefined;
+      const toolName = safeToolName({ params });
+      if (!toolName || !isEventLoopTraceEnabled()) return handler(request, extra);
+      const span = beginEventLoopTraceSpan("tool", { toolName });
+      try {
+        return await handler(request, extra);
+      } finally {
+        span();
+      }
+    });
+  } catch {
+    // Missing SDK internals only omit optional diagnostics; the MCP server remains usable.
+  }
 }
 
 /**
@@ -69,6 +100,9 @@ function safeToolName(body: unknown): string | undefined {
  */
 export function createMcpHttpHandler(makeServer: () => McpServer, logger: Logger) {
   return async (req: Request, res: Response): Promise<void> => {
+    const tracing = isEventLoopTraceEnabled();
+    const toolName = tracing ? safeToolName(req.body) : undefined;
+    if (tracing) recordEventLoopTrace("handler_start", toolName ? { toolName } : {});
     if (req.method === "GET" || req.method === "DELETE") {
       // Stateless mode: no server-initiated streams, no sessions to delete.
       res.status(405).json({
@@ -78,13 +112,15 @@ export function createMcpHttpHandler(makeServer: () => McpServer, logger: Logger
       });
       return;
     }
-    const requestId = randomUUID();
+    const traceContext = tracing ? currentEventLoopTraceContext() : undefined;
+    const requestId = traceContext?.requestId ?? randomUUID();
     res.setHeader("x-correlation-id", requestId);
     let phase: FailurePhase = "server_create";
     let server: McpServer | undefined;
     let transport: StreamableHTTPServerTransport | undefined;
     try {
       server = makeServer();
+      if (tracing) instrumentToolRequestHandler(server);
       phase = "transport_create";
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
@@ -102,7 +138,7 @@ export function createMcpHttpHandler(makeServer: () => McpServer, logger: Logger
       logger.error("MCP request handling failed", {
         requestId,
         method: req.method,
-        ...(safeToolName(req.body) ? { toolName: safeToolName(req.body) } : {}),
+        ...((toolName ?? safeToolName(req.body)) ? { toolName: toolName ?? safeToolName(req.body) } : {}),
         phase,
         ...safeErrorDetails(error),
       });

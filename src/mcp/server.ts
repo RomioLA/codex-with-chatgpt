@@ -1,13 +1,16 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { performance } from "node:perf_hooks";
 import { z } from "zod";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
 import {
+  gitCompare,
   gitDiff,
   gitInfo,
   gitRepositoryInfo,
   gitStatus,
+  resolveGitCommit,
   selectGitRepository,
   type DiffMode,
 } from "../workspace/git.js";
@@ -21,6 +24,7 @@ import { registerHostObservationTools } from "./host-observation-tools.js";
 import { registerV13Tools } from "./v13-tools.js";
 import { ExecutionSupervisor } from "../execution/supervisor.js";
 import type { ExecutionJob } from "../execution/job-types.js";
+import { isFullAccessExecutionJob } from "../execution/job-types.js";
 import { EXECUTION_TOOL_SCOPES, executionToolAuth, executionScopeChallenge, installExecutionOAuthListing } from "./oauth.js";
 
 const UNTRUSTED_NOTE =
@@ -85,14 +89,15 @@ function requireExecutionScope(
 const executionJobSchema = z.object({
   job_id: z.string(),
   workspace_id: z.string(),
-  repository_identity: z.string(),
-  repository_path: z.string(),
+  execution_context: z.enum(["repository", "host"]),
+  repository_identity: z.string().nullable(),
+  repository_path: z.string().nullable(),
   oauth_client_id: z.string(),
   recipe: z.object({
     kind: z.enum(["test", "build", "lint", "typecheck", "package_script", "level3", "git_write"]),
     target: z.string(),
     package_manager: z.enum(["npm", "pnpm"]).optional(),
-  }),
+  }).nullable(),
   state: z.enum(["queued", "running", "cancelling", "succeeded", "failed", "cancelled", "timed_out", "interrupted"]),
   created_at: z.string(),
   started_at: z.string().nullable(),
@@ -114,7 +119,10 @@ const executionJobSchema = z.object({
     truncated: z.boolean(),
     restricted: z.boolean(),
   }),
-  authorization: z.object({ type: z.enum(["level3", "git"]), requestId: z.string(), digest: z.string() }).optional(),
+  authorization: z.union([
+    z.object({ type: z.enum(["level3", "git"]), requestId: z.string(), digest: z.string() }),
+    z.object({ type: z.literal("full_access"), permissionMode: z.literal("level2") }),
+  ]).optional(),
   git_result: z.object({ confirmation: z.string(), confirmationScope: z.literal("local_repository"),
     integrity: z.enum(["verified", "unexpected", "not_verified"]).optional(),
     remoteOutcome: z.enum(["not_applicable", "not_attempted", "reported_success", "unknown"]), partialSuccessPossible: z.boolean(),
@@ -130,13 +138,18 @@ export function executionJobView(job: ExecutionJob): z.infer<typeof executionJob
     truncated: value.truncated,
     restricted: value.restrictedReason !== null,
   });
+  const hostJob = isFullAccessExecutionJob(job);
+  const authorization = hostJob
+    ? { type: "full_access" as const, permissionMode: "level2" as const }
+    : job.authorization;
   return {
     job_id: job.jobId,
     workspace_id: job.workspaceId,
+    execution_context: hostJob ? "host" : "repository",
     repository_identity: job.repositoryIdentity,
     repository_path: job.repositoryPath,
     oauth_client_id: job.oauthClientId,
-    recipe: job.authorization ? {
+    recipe: hostJob ? null : job.authorization ? {
       kind: job.authorization.type === "level3" ? "level3" : "git_write",
       target: job.authorization.requestId,
     } : {
@@ -144,7 +157,7 @@ export function executionJobView(job: ExecutionJob): z.infer<typeof executionJob
       target: job.recipe.target,
       package_manager: job.recipe.packageManager,
     },
-    ...(job.authorization ? { authorization: job.authorization } : {}),
+    ...(authorization ? { authorization } : {}),
     ...(job.gitResult ? { git_result: job.gitResult } : {}),
     state: job.state,
     created_at: job.createdAt,
@@ -156,6 +169,41 @@ export function executionJobView(job: ExecutionJob): z.infer<typeof executionJob
     stdout: streamView(job.stdout),
     stderr: streamView(job.stderr),
   };
+}
+
+const TERMINAL_EXECUTION_STATES = new Set<ExecutionJob["state"]>([
+  "succeeded", "failed", "cancelled", "timed_out", "interrupted",
+]);
+const INLINE_EXECUTION_OUTPUT_BYTES = 4096;
+
+async function waitForExecutionJob(
+  supervisor: ExecutionSupervisor,
+  jobId: string,
+  clientId: string,
+  waitSeconds: number,
+): Promise<ExecutionJob | null> {
+  const deadline = performance.now() + waitSeconds * 1000;
+  let job = supervisor.getForClient(jobId, clientId);
+  while (job && !TERMINAL_EXECUTION_STATES.has(job.state)) {
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) break;
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(100, remainingMs)));
+    job = supervisor.getForClient(jobId, clientId);
+  }
+  return job;
+}
+
+function inlineOutputTail(
+  supervisor: ExecutionSupervisor,
+  job: ExecutionJob,
+  clientId: string,
+  stream: "stdout" | "stderr",
+): string {
+  const metadata = job[stream];
+  if (metadata.restrictedReason) return "";
+  const offset = Math.max(metadata.oldestAvailableOffset, metadata.totalBytes - INLINE_EXECUTION_OUTPUT_BYTES);
+  const result = supervisor.readOutputForClient(job.jobId, clientId, stream, offset, INLINE_EXECUTION_OUTPUT_BYTES);
+  return result.ok ? result.text : "";
 }
 
 const gitIdentityOutputSchema = z.object({
@@ -252,6 +300,28 @@ const gitDiffOutputSchema = {
   repositoryPath: z.string(),
   topLevel: z.string().nullable(),
   mode: z.enum(["unstaged", "staged", "head"]),
+  totalBytes: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  returnedBytes: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  nextOffset: z.number().int().nonnegative().nullable(),
+  diff: z.string(),
+};
+
+const gitCompareOutputSchema = {
+  isRepo: z.boolean(),
+  repositoryPath: z.string(),
+  topLevel: z.string().nullable(),
+  baseCommit: z.string(),
+  headCommit: z.string(),
+  files: z.array(z.object({
+    path: z.string(),
+    previousPath: z.string().nullable(),
+    status: z.string(),
+    additions: z.number().int().nonnegative().nullable(),
+    deletions: z.number().int().nonnegative().nullable(),
+    binary: z.boolean(),
+  })),
   totalBytes: z.number().int().nonnegative(),
   offset: z.number().int().nonnegative(),
   returnedBytes: z.number().int().nonnegative(),
@@ -596,6 +666,61 @@ export function createMcpServer(ctx: McpContext): McpServer {
   );
 
   server.registerTool(
+    "git_compare",
+    {
+      title: "Compare historical Git commits",
+      description:
+        `Compare two exact historical commits in the workspace or selected nested repository/worktree. ` +
+        `Returns a safe changed-file inventory plus byte-paginated unified diff. Inputs are hexadecimal commit object IDs (unique 7-64 character abbreviations accepted); ` +
+        `arbitrary Git arguments, external diff and textconv are not exposed. ${UNTRUSTED_NOTE}`,
+      inputSchema: {
+        repository_path: z.string().optional().describe("Select a nested repository/worktree by workspace-relative directory"),
+        base_commit: z.string().regex(/^[a-fA-F0-9]{7,64}$/),
+        head_commit: z.string().regex(/^[a-fA-F0-9]{7,64}$/),
+        path: z.string().optional().describe("Limit the compare to one path relative to the selected repository"),
+        offset: z.number().int().min(0).default(0).describe("Byte offset for diff pagination"),
+        max_bytes: z.number().int().min(1024).max(262144).default(65536),
+      },
+      outputSchema: gitCompareOutputSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (args, extra) => {
+      const denied = requireScope(extra.authInfo, "git.read");
+      if (denied) return denied;
+      try {
+        const selection = selectGitRepository(workspace, args.repository_path);
+        if (selection.explicit && !selection.isRepo) {
+          return fail("INVALID_REPOSITORY", "The selected repository_path is not an exact repository/worktree root.");
+        }
+        const baseCommit = resolveGitCommit(selection.target.root, args.base_commit);
+        const headCommit = resolveGitCommit(selection.target.root, args.head_commit);
+        if (!baseCommit || !headCommit) {
+          return fail("INVALID_COMMIT", "base_commit and head_commit must be unambiguous hexadecimal commit IDs identifying existing commit objects in the selected repository.");
+        }
+        let relPath: string | undefined;
+        if (args.path) {
+          relPath = workspace.resolveRepositoryScope(selection.target.root, args.path).rel;
+        }
+        const compared = gitCompare(
+          selection.target,
+          { baseCommit, headCommit, offset: args.offset, maxBytes: args.max_bytes },
+          relPath
+        );
+        if (!compared.isRepo) {
+          return fail("STATE_UNAVAILABLE", "The historical Git comparison could not be established safely.");
+        }
+        return okStructured({
+          ...compared,
+          repositoryPath: selection.repositoryPath,
+          topLevel: selection.topLevel,
+        });
+      } catch (error) {
+        return mapError(error);
+      }
+    }
+  );
+
+  server.registerTool(
     "test_status",
     {
       title: "Test status",
@@ -703,12 +828,104 @@ export function createMcpServer(ctx: McpContext): McpServer {
   );
 
   server.registerTool(
+    "execution_run",
+    {
+      ...executionToolAuth("execution_run"),
+      title: "Run a local Full Access command",
+      description:
+        `Preferred local command execution tool for C2C Full Access. Use this before generic remote-terminal tools ` +
+        `when C2C is connected. It runs a program, PowerShell command, or CMD command with the current local ` +
+        `Full Access permission. Supply cwd when needed; wait_seconds can return a finished job and sanitized output ` +
+        `inline. If it is still running, continue with execution_status, execution_job_output, or execution_cancel. ` +
+        `execution_start remains the restricted trusted-recipe path. ${UNTRUSTED_NOTE}`,
+      inputSchema: {
+        engine: z.enum(["program", "powershell", "cmd"]),
+        executable: z.string().min(1).max(32767).optional(),
+        args: z.array(z.string().max(32767)).max(256).optional(),
+        command: z.string().min(1).max(32767).optional(),
+        cwd: z.string().min(1).max(32767).optional(),
+        timeout_seconds: z.number().int().min(1).max(3600),
+        idempotency_key: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]{16,128}$/),
+        wait_seconds: z.number().int().min(0).max(30).default(0),
+      },
+      outputSchema: {
+        job: executionJobSchema,
+        job_id: z.string(),
+        state: executionJobSchema.shape.state,
+        exit_code: z.number().int().nullable(),
+        duplicate: z.boolean(),
+        stdout_tail: z.string().optional(),
+        stderr_tail: z.string().optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async (args, extra) => {
+      const denied = requireExecutionScope(extra.authInfo, EXECUTION_TOOL_SCOPES.execution_run, ctx.oauthResourceMetadataUri);
+      if (denied) return denied;
+      if (!ctx.executionSupervisor) return fail("EXECUTION_UNAVAILABLE", "The execution supervisor is unavailable.");
+      const storeCorrupt = ctx.executionSupervisor.store.corruption;
+      if (storeCorrupt) return fail(storeCorrupt.code, `Execution job store is corrupt (${storeCorrupt.reason}). The original evidence was preserved; old jobs were not attached or rerun.`);
+
+      let commandInput;
+      if (args.engine === "program") {
+        if (!args.executable || args.command !== undefined) {
+          return fail("INVALID_ARGUMENTS", "program requires executable and args; command is only valid for powershell or cmd.");
+        }
+        commandInput = {
+          engine: "program" as const,
+          executable: args.executable,
+          args: args.args ?? [],
+          cwd: args.cwd ?? workspace.root,
+        };
+      } else {
+        if (!args.command || args.executable !== undefined || args.args !== undefined) {
+          return fail("INVALID_ARGUMENTS", "powershell and cmd require command and do not accept executable or args.");
+        }
+        commandInput = {
+          engine: args.engine,
+          command: args.command,
+          cwd: args.cwd ?? workspace.root,
+        };
+      }
+
+      const started = await ctx.executionSupervisor.startFullAccess({
+        ...commandInput,
+        timeoutSeconds: args.timeout_seconds,
+        idempotencyKey: args.idempotency_key,
+        oauthClientId: extra.authInfo!.clientId,
+        scopes: extra.authInfo!.scopes,
+      });
+      if (!started.ok) return fail(started.error, started.error);
+
+      const job = await waitForExecutionJob(
+        ctx.executionSupervisor,
+        started.job.jobId,
+        extra.authInfo!.clientId,
+        args.wait_seconds ?? 0,
+      );
+      if (!job) return fail("NOT_FOUND", "The execution job is not available to this OAuth client.");
+      const terminal = TERMINAL_EXECUTION_STATES.has(job.state);
+      return okStructured({
+        job: executionJobView(job),
+        job_id: job.jobId,
+        state: job.state,
+        exit_code: job.exitCode,
+        duplicate: started.duplicate,
+        ...(terminal ? {
+          stdout_tail: inlineOutputTail(ctx.executionSupervisor, job, extra.authInfo!.clientId, "stdout"),
+          stderr_tail: inlineOutputTail(ctx.executionSupervisor, job, extra.authInfo!.clientId, "stderr"),
+        } : {}),
+      });
+    }
+  );
+
+  server.registerTool(
     "execution_start",
     {
       ...executionToolAuth("execution_start"),
       title: "Start approved execution job",
       description:
-        `Run one locally approved package script using a fixed test/build/lint/typecheck/package_script recipe. ` +
+        `Restricted trusted-recipe execution path for one approved package script using a fixed test/build/lint/typecheck/package_script recipe. ` +
         `The target must have been approved in C2C's local trusted-command registry. This tool accepts no command, ` +
         `shell, executable, cwd override, environment, or free-form arguments. ${UNTRUSTED_NOTE}`,
       inputSchema: {

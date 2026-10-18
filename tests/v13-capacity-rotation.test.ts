@@ -158,7 +158,7 @@ function branchListOperation() {
 }
 
 describe("V1.3 F-05 durable capacity rotation", () => {
-  it("archives at least 300 terminal jobs across store reconstruction with idempotency and output intact", () => {
+  it("archives at least 300 terminal jobs across store reconstruction with idempotency and output intact", async () => {
     const directory = makeTmpDir("v13-capacity-job-store");
     let store = new ExecutionJobStore(JOB_WORKSPACE_ID, { directory });
     let firstJob: ExecutionJob | undefined;
@@ -166,7 +166,10 @@ describe("V1.3 F-05 durable capacity rotation", () => {
     for (let index = 0; index < 300; index += 1) {
       const queued = jobForIndex(index);
       store.create(queued);
-      store.appendSanitized(queued.jobId, "stdout", `fake-program-output-${index}\n`);
+      if (index === 0) {
+        await store.appendSanitized(queued.jobId, "stdout", `fake-program-output-${index}\n`);
+        await store.flushOutput(queued.jobId);
+      }
       const started = transitionExecutionJob(store.get(queued.jobId)!, "running", {}, queued.createdAt);
       const terminal = transitionExecutionJob(started, "succeeded", { exitCode: 0 }, new Date(Date.parse(queued.createdAt) + 1).toISOString());
       store.replace(terminal);

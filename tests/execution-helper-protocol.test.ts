@@ -23,7 +23,7 @@ function writeIntegrityMetadata(root: string, helperBytes: Buffer, launcherBytes
   fs.mkdirSync(path.dirname(metadata), { recursive: true });
   fs.writeFileSync(metadata, JSON.stringify({
     version: 2,
-    protocolVersion: 5,
+    protocolVersion: 7,
     helperPath: "build/native/c2c-execution-helper.exe",
     sha256: createHash("sha256").update(helperBytes).digest("hex"),
     launcherPath: "build/native/c2c-execution-launcher.exe",
@@ -64,6 +64,8 @@ describe("execution helper build and protocol contract", () => {
       .toThrow("HELPER_PROTOCOL_BAD_HEADER");
     expect(() => decoder.push(Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x34, 0x00])))
       .toThrow("HELPER_PROTOCOL_BAD_HEADER");
+    expect(() => decoder.push(Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x36, 0x00])))
+      .toThrow("HELPER_PROTOCOL_BAD_HEADER");
   });
 
   it("rejects helper hash and metadata mismatches", () => {
@@ -73,7 +75,7 @@ describe("execution helper build and protocol contract", () => {
     fs.mkdirSync(path.join(root, "dist", "execution"), { recursive: true });
     fs.writeFileSync(helper, fakePe());
     fs.writeFileSync(path.join(root, "dist", "execution", "c2c-execution-helper-integrity.json"), JSON.stringify({
-      version: 2, protocolVersion: 5, helperPath: "build/native/c2c-execution-helper.exe", sha256: "0".repeat(64),
+      version: 2, protocolVersion: 7, helperPath: "build/native/c2c-execution-helper.exe", sha256: "0".repeat(64),
       launcherPath: "build/native/c2c-execution-launcher.exe",
       launcherSha256: createHash("sha256").update(fakePe()).digest("hex"),
     }));
@@ -102,7 +104,7 @@ describe("execution helper build and protocol contract", () => {
 
     fs.writeFileSync(path.join(root, "dist", "execution", "c2c-execution-helper-integrity.json"), JSON.stringify({
       version: 2,
-      protocolVersion: 5,
+      protocolVersion: 7,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: createHash("sha256").update(fakePe()).digest("hex"),
       launcherPath: "build/native/c2c-execution-launcher.exe",
@@ -130,7 +132,7 @@ describe("execution helper build and protocol contract", () => {
     fs.writeFileSync(launcher, launcherBytes);
     fs.writeFileSync(metadata, JSON.stringify({
       version: 2,
-      protocolVersion: 5,
+      protocolVersion: 7,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: createHash("sha256").update(corrupt).digest("hex"),
       launcherPath: "build/native/c2c-execution-launcher.exe",

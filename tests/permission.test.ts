@@ -12,6 +12,7 @@ import {
   checkMovePermission,
   checkPermission,
   ensurePermissionMigrated,
+  readCurrentSessionGrant,
   readPermission,
   readPermissionStatus,
   setPermission,
@@ -90,11 +91,13 @@ describe("permission state", () => {
     expect(persisted).toMatchObject({ version: 2, workspaceId: WORKSPACE_A, baselineMode: "level1" });
     expect(persisted).not.toHaveProperty("mode");
     expect(persisted.sessionGrant).toMatchObject({ identityFingerprint: sessionIdentity.fingerprint });
+    expect(persisted.sessionGrant).toMatchObject({ grantId: expect.stringMatching(/^[a-f0-9]{64}$/) });
   });
 
   it("persists readonly or level1 and revokes the current Level 2 grant", () => {
     usedWorkspaceIds.add(WORKSPACE_A);
     setPermission(WORKSPACE_A, "level2");
+    const firstGrantId = readCurrentSessionGrant(WORKSPACE_A)?.grantId;
     expect(readPermissionStatus(WORKSPACE_A).sessionElevation.active).toBe(true);
 
     setPermission(WORKSPACE_A, "readonly");
@@ -102,6 +105,7 @@ describe("permission state", () => {
       baselineMode: "readonly", effectiveMode: "readonly", sessionElevation: { active: false },
     });
     setPermission(WORKSPACE_A, "level2");
+    expect(readCurrentSessionGrant(WORKSPACE_A)?.grantId).not.toBe(firstGrantId);
     setPermission(WORKSPACE_A, "level1");
     expect(readPermissionStatus(WORKSPACE_A)).toMatchObject({
       baselineMode: "level1", effectiveMode: "level1", sessionElevation: { active: false },
@@ -135,6 +139,60 @@ describe("permission state", () => {
     // A new Bridge/runtime process resolves the same Windows boot/logon tuple.
     expect(readPermission(WORKSPACE_A)).toBe("level2");
     expect(readPermissionStatus(WORKSPACE_A).sessionElevation.active).toBe(true);
+  });
+
+  it("keeps read-only authorization stable while Native holds a live launch permit", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    setPermission(WORKSPACE_A, "level2");
+    const grant = readCurrentSessionGrant(WORKSPACE_A);
+    const lockFile = `${stateFile(WORKSPACE_A)}.lock`;
+    fs.writeFileSync(lockFile, `launch:${process.pid}\n`, { flag: "wx" });
+    try {
+      expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level2");
+      expect(readCurrentSessionGrant(WORKSPACE_A)).toEqual(grant);
+      let revokeError: unknown;
+      try { setPermission(WORKSPACE_A, "level1"); }
+      catch (error) { revokeError = error; }
+      expect(revokeError).toMatchObject({ code: "PERMISSION_STATE_BUSY" });
+    } finally {
+      fs.unlinkSync(lockFile);
+    }
+  });
+
+  it("does not treat a non-canonical grant timestamp or missing state timestamp as current", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    setPermission(WORKSPACE_A, "level2");
+    const valid = JSON.parse(fs.readFileSync(stateFile(WORKSPACE_A), "utf8")) as Record<string, unknown> & {
+      sessionGrant: Record<string, unknown>;
+    };
+    fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify({
+      ...valid,
+      sessionGrant: { ...valid.sessionGrant, createdAt: "2026-01-01" },
+    }));
+    expect(readPermissionStatus(WORKSPACE_A).sessionElevation.active).toBe(false);
+    expect(readCurrentSessionGrant(WORKSPACE_A)).toBeNull();
+
+    const missingUpdatedAt: Record<string, unknown> = { ...valid };
+    delete missingUpdatedAt.updatedAt;
+    fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify(missingUpdatedAt));
+    expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("readonly");
+    expect(readCurrentSessionGrant(WORKSPACE_A)).toBeNull();
+  });
+
+  it("backfills a unique grant ID for a persisted same-session grant", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    fs.mkdirSync(path.dirname(stateFile(WORKSPACE_A)), { recursive: true });
+    fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify({
+      version: 2,
+      workspaceId: WORKSPACE_A,
+      baselineMode: "level1",
+      sessionGrant: { identityFingerprint: sessionIdentity.fingerprint, createdAt: "2026-01-01T00:00:00.000Z" },
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    }));
+
+    expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level1");
+    expect(ensurePermissionMigrated(WORKSPACE_A).effectiveMode).toBe("level2");
+    expect(readCurrentSessionGrant(WORKSPACE_A)?.grantId).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("drops the grant when boot or logon identity changes", () => {

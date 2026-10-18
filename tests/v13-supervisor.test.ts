@@ -93,7 +93,7 @@ describe("V1.3 supervisor isolation", () => {
       expect(started.ok).toBe(true);
       expect(f.runner.requests).toHaveLength(1);
       expect(f.runner.requests[0].genericCommand?.args).toEqual(f.spec.args);
-      f.runner.callbacks.onOutput("stdout", Buffer.from("-----BEGIN PRIVATE KEY-----", "utf16le"));
+      await f.runner.callbacks.onOutput("stdout", Buffer.from("-----BEGIN PRIVATE KEY-----", "utf16le"));
       if (started.ok) expect(f.supervisor.readOutputForClient(started.job.jobId, "owner", "stdout")).toMatchObject({ ok: false, error: "OUTPUT_RESTRICTED" });
       expect(f.supervisor.startLevel3(exact)).toMatchObject({ ok: true, duplicate: true });
       expect(f.supervisor.startLevel3({ ...exact, idempotencyKey: "different-key-0123456789" })).toMatchObject({ ok: false, error: "LEVEL3_REQUEST_ALREADY_USED" });

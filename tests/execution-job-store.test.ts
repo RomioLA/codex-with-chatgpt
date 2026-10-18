@@ -1,7 +1,9 @@
+import fs from "node:fs";
+import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { ExecutionJobStore, MAX_OUTPUT_BYTES_PER_STREAM } from "../src/execution/job-store.js";
-import type { ExecutionJob } from "../src/execution/job-types.js";
+import type { ExecutionJob, FullAccessExecutionJob } from "../src/execution/job-types.js";
 import { transitionExecutionJob } from "../src/execution/state-machine.js";
 import { makeTmpDir } from "./helpers.js";
 
@@ -27,31 +29,98 @@ function makeJob(workspaceId: string, state: ExecutionJob["state"] = "queued"): 
   };
 }
 
+function makeHostJob(workspaceId: string): FullAccessExecutionJob {
+  return {
+    jobId: randomBytes(24).toString("base64url"),
+    workspaceId,
+    executionContext: "host",
+    repositoryIdentity: null,
+    repositoryPath: null,
+    oauthClientId: "store-full-access-client",
+    recipe: null,
+    authorization: {
+      type: "full_access",
+      permissionMode: "level2",
+      sessionGrantFingerprint: "d".repeat(64),
+      requestHash: "e".repeat(64),
+    },
+    fullAccessCommand: {
+      engine: "program",
+      executable: "C:\\Tools\\node.exe",
+      executableFileIdentity: "1:2",
+      executableHash: "a".repeat(64),
+      args: ["-e", "1"],
+      cwd: "C:\\Outside\\work",
+      cwdFileIdentity: "3:4",
+    },
+    state: "queued",
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    timeoutSeconds: 60,
+    idempotencyKeyHash: "c".repeat(64),
+    tempOwnership: null,
+    exitCode: null,
+    failureCode: null,
+    stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+    stderr: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+  };
+}
+
 describe("ExecutionJobStore", () => {
-  it("reads incremental byte offsets and reports EOF only after completion", () => {
+  it("persists host jobs without changing store version and reads legacy repository records", () => {
+    const hostDirectory = makeTmpDir("execution-host-store");
+    const hostJob = makeHostJob("store-host-workspace");
+    const hostStore = new ExecutionJobStore("store-host-workspace", { directory: hostDirectory });
+    hostStore.create(hostJob);
+    const persisted = JSON.parse(fs.readFileSync(path.join(hostDirectory, "jobs.json"), "utf8")) as { version: number };
+    expect(persisted.version).toBe(1);
+    const reopenedHostStore = new ExecutionJobStore("store-host-workspace", { directory: hostDirectory });
+    expect(reopenedHostStore.corruption).toBeNull();
+    expect(reopenedHostStore.get(hostJob.jobId)).toMatchObject({
+      executionContext: "host", repositoryIdentity: null, repositoryPath: null,
+      authorization: { type: "full_access", permissionMode: "level2" },
+      fullAccessCommand: { engine: "program", cwd: "C:\\Outside\\work" },
+    });
+
+    const legacyDirectory = makeTmpDir("execution-legacy-context-store");
+    const legacyJob = makeJob("store-legacy-context");
+    fs.writeFileSync(path.join(legacyDirectory, "jobs.json"), JSON.stringify({
+      version: 1,
+      workspaceId: "store-legacy-context",
+      jobs: [legacyJob],
+    }), { mode: 0o600 });
+    const reopenedLegacyStore = new ExecutionJobStore("store-legacy-context", { directory: legacyDirectory });
+    expect(reopenedLegacyStore.corruption).toBeNull();
+    expect(reopenedLegacyStore.get(legacyJob.jobId)).toMatchObject({ executionContext: "repository" });
+  });
+
+  it("reads incremental byte offsets and reports EOF only after completion", async () => {
     const directory = makeTmpDir("execution-output-offsets");
     const store = new ExecutionJobStore("store-offsets", { directory });
     const job = makeJob("store-offsets");
     store.create(job);
-    store.appendSanitized(job.jobId, "stdout", "first\nsecond\n");
+    await store.appendSanitized(job.jobId, "stdout", "first\nsecond\n");
 
     const first = store.readOutput(job.jobId, "stdout", 2, 3);
     expect(first).toMatchObject({ ok: true, offset: 2, nextOffset: 5, eof: false, text: "rst" });
 
     const running = transitionExecutionJob(store.get(job.jobId)!, "running");
+    await store.flushOutput(job.jobId);
     const succeeded = transitionExecutionJob(running, "succeeded", { exitCode: 0 });
     store.replace(succeeded);
     const tail = store.readOutput(job.jobId, "stdout", 5, 32);
     expect(tail).toMatchObject({ ok: true, offset: 5, eof: true, text: "\nsecond\n" });
   });
 
-  it("bounds each stream and exposes truncation through the oldest byte offset", () => {
+  it("bounds each stream and exposes truncation through the oldest byte offset", async () => {
     const directory = makeTmpDir("execution-output-truncation");
     const store = new ExecutionJobStore("store-truncation", { directory });
     const job = makeJob("store-truncation");
     store.create(job);
     const input = "x".repeat(MAX_OUTPUT_BYTES_PER_STREAM + 17);
-    store.appendSanitized(job.jobId, "stderr", input);
+    await store.appendSanitized(job.jobId, "stderr", input);
+    await store.flushOutput(job.jobId);
 
     const current = store.get(job.jobId)!;
     expect(current.stderr.totalBytes).toBe(input.length);
@@ -64,13 +133,14 @@ describe("ExecutionJobStore", () => {
     expect(read.ok && read.text).toBe("x".repeat(32));
   });
 
-  it("marks unfinished jobs interrupted after reload and preserves sanitized output", () => {
+  it("marks unfinished jobs interrupted after reload and preserves sanitized output", async () => {
     const directory = makeTmpDir("execution-restart");
     const store = new ExecutionJobStore("store-restart", { directory });
     const job = makeJob("store-restart");
     store.create(job);
     store.replace(transitionExecutionJob(job, "running"));
-    store.appendSanitized(job.jobId, "stdout", "safe partial output\n");
+    await store.appendSanitized(job.jobId, "stdout", "safe partial output\n");
+    await store.flushOutput(job.jobId);
 
     const restarted = new ExecutionJobStore("store-restart", { directory });
     expect(restarted.get(job.jobId)).toMatchObject({ state: "interrupted", failureCode: "BRIDGE_RESTARTED" });
@@ -79,5 +149,111 @@ describe("ExecutionJobStore", () => {
       eof: true,
       text: "safe partial output\n",
     });
+  });
+
+  it("persists only committed output metadata when a state transition races a pending tail", async () => {
+    const directory = makeTmpDir("execution-pending-output-restart");
+    const store = new ExecutionJobStore("pending-output-restart", { directory });
+    const job = makeJob("pending-output-restart");
+    store.create(job);
+    store.replace(transitionExecutionJob(store.get(job.jobId)!, "running"));
+    await store.appendSanitized(job.jobId, "stdout", "volatile tail");
+    store.replace(transitionExecutionJob(store.get(job.jobId)!, "cancelling"));
+
+    const persisted = JSON.parse(fs.readFileSync(path.join(directory, "jobs.json"), "utf8")) as { jobs: ExecutionJob[] };
+    expect(persisted.jobs[0]?.stdout).toMatchObject({ totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0 });
+
+    const restarted = new ExecutionJobStore("pending-output-restart", { directory });
+    expect(restarted.get(job.jobId)?.state).toBe("interrupted");
+    expect(restarted.readOutput(job.jobId, "stdout")).toMatchObject({ ok: true, text: "" });
+  });
+
+  it("prunes persisted segments to a bounded retained window and recovers it", async () => {
+    const directory = makeTmpDir("execution-output-pruned-restart");
+    const store = new ExecutionJobStore("output-pruned-restart", { directory });
+    const job = makeJob("output-pruned-restart");
+    store.create(job);
+    const input = "x".repeat(MAX_OUTPUT_BYTES_PER_STREAM * 2 + 17);
+    await store.appendSanitized(job.jobId, "stdout", input);
+    await store.flushOutput(job.jobId);
+
+    const segmentPrefix = `${job.jobId}.stdout.seg.`;
+    const segmentBytes = fs.readdirSync(directory)
+      .filter((name) => name.startsWith(segmentPrefix) && /^\d{16}$/.test(name.slice(segmentPrefix.length)))
+      .reduce((sum, name) => sum + fs.statSync(path.join(directory, name)).size, 0);
+    expect(segmentBytes).toBeLessThanOrEqual(MAX_OUTPUT_BYTES_PER_STREAM + 256 * 1024);
+
+    const restarted = new ExecutionJobStore("output-pruned-restart", { directory });
+    const meta = restarted.get(job.jobId)!.stdout;
+    expect(meta).toMatchObject({ totalBytes: input.length, retainedBytes: MAX_OUTPUT_BYTES_PER_STREAM, truncated: true });
+    expect(restarted.readOutput(job.jobId, "stdout", meta.oldestAvailableOffset, 32))
+      .toMatchObject({ ok: true, text: "x".repeat(32), truncated: true });
+  });
+
+  it("serializes chunks per stream while keeping streams and jobs independent", async () => {
+    const directory = makeTmpDir("execution-output-order");
+    const store = new ExecutionJobStore("output-order", { directory });
+    const first = makeJob("output-order");
+    const second = makeJob("output-order");
+    store.create(first);
+    store.create(second);
+
+    await Promise.all([
+      store.appendSanitized(first.jobId, "stdout", "out-1|"),
+      store.appendSanitized(first.jobId, "stdout", "out-2|"),
+      store.appendSanitized(first.jobId, "stdout", "out-3"),
+      store.appendSanitized(first.jobId, "stderr", "err-1|"),
+      store.appendSanitized(first.jobId, "stderr", "err-2"),
+      store.appendSanitized(second.jobId, "stdout", "other-job"),
+    ]);
+    await Promise.all([store.flushOutput(first.jobId), store.flushOutput(second.jobId)]);
+
+    expect(store.readOutput(first.jobId, "stdout")).toMatchObject({ ok: true, text: "out-1|out-2|out-3" });
+    expect(store.readOutput(first.jobId, "stderr")).toMatchObject({ ok: true, text: "err-1|err-2" });
+    expect(store.readOutput(second.jobId, "stdout")).toMatchObject({ ok: true, text: "other-job" });
+  });
+
+  it("propagates persistence failure, marks the stream restricted, and handles its promise rejection", async () => {
+    const directory = makeTmpDir("execution-output-persist-failure");
+    const store = new ExecutionJobStore("output-persist-failure", { directory });
+    const job = makeJob("output-persist-failure");
+    store.create(job);
+    const pendingFile = path.join(directory, `${job.jobId}.stdout.seg.${"0".repeat(16)}.pending`);
+    fs.writeFileSync(pendingFile, "occupied");
+    const unhandled: unknown[] = [];
+    const captureUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", captureUnhandled);
+    try {
+      await expect(store.appendSanitized(job.jobId, "stdout", "x".repeat(256 * 1024)))
+        .rejects.toThrow("OUTPUT_PERSISTENCE_FAILED");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(store.get(job.jobId)?.stdout.restrictedReason).toBe("output_store_error");
+      expect(store.readOutput(job.jobId, "stdout")).toEqual({ ok: false, error: "OUTPUT_RESTRICTED" });
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", captureUnhandled);
+    }
+  });
+
+  it("reads legacy single-file output and metadata after reconstruction", () => {
+    const directory = makeTmpDir("execution-output-legacy");
+    const store = new ExecutionJobStore("output-legacy", { directory });
+    const job = makeJob("output-legacy");
+    store.create(job);
+    const output = Buffer.from("legacy output\n", "utf8");
+    fs.writeFileSync(path.join(directory, `${job.jobId}.stdout.log`), output, { mode: 0o600 });
+    const current = store.get(job.jobId)!;
+    const legacyJobs = {
+      version: 1,
+      workspaceId: "output-legacy",
+      jobs: [{
+        ...current,
+        stdout: { totalBytes: output.byteLength, retainedBytes: output.byteLength, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+      }],
+    };
+    fs.writeFileSync(path.join(directory, "jobs.json"), JSON.stringify(legacyJobs), { mode: 0o600 });
+
+    const reopened = new ExecutionJobStore("output-legacy", { directory });
+    expect(reopened.readOutput(job.jobId, "stdout")).toMatchObject({ ok: true, text: "legacy output\n" });
   });
 });

@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { getStateDir } from "../config/paths.js";
+import { atomicReplace, AtomicReplaceError, type AtomicReplaceResult } from "../execution/atomic-replace.js";
 
 /**
  * Low-level mutation primitives. Callers must authorize the operation in the
@@ -12,6 +14,7 @@ import { getStateDir } from "../config/paths.js";
 export type WriteSafetyErrorCode =
   | "INVALID_ARGUMENT"
   | "STALE_FILE"
+  | "FILE_TOO_LARGE"
   | "FILE_ALREADY_EXISTS"
   | "FILE_NOT_FOUND"
   | "NOT_A_FILE"
@@ -78,12 +81,40 @@ interface AuditRecord {
   oldHash: string | null;
   newHash: string | null;
   success: boolean;
+  operationApplied?: boolean;
   errorCode?: WriteSafetyErrorCode;
+  stage?: string;
+  systemCode?: string;
+  retryCount?: number;
+  temporaryCleanupCode?: string;
+  temporaryFile?: string;
+  temporaryFileLeftover?: boolean;
+  timingsMs?: WriteStageTimings;
   workspaceId?: string;
   permissionMode?: string;
 }
 
+interface WriteStageTimings {
+  preflightMs: number;
+  oldHashMs: number;
+  newHashMs: number;
+  tempWriteMs: number;
+  flushMs: number;
+  finalValidationMs: number;
+  atomicReplaceMs: number;
+  postVerificationMs: number;
+  totalMs: number;
+}
+
+interface RegularFileSnapshot {
+  bytes: Buffer;
+  mode: number;
+  dev: string;
+  ino: string;
+}
+
 const SHA256_HEX = /^[a-f0-9]{64}$/i;
+const MAX_EDITABLE_FILE_BYTES = 10 * 1024 * 1024;
 
 function asAbsolutePath(input: string): string {
   if (typeof input !== "string" || input.includes("\0") || !path.isAbsolute(input)) {
@@ -102,10 +133,14 @@ function hashBytes(content: Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
-function readRegularFile(filePath: string): { bytes: Buffer; mode: number } {
-  let stat: fs.Stats;
+function sameVersion(a: fs.BigIntStats, b: fs.BigIntStats): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
+function readRegularFile(filePath: string, maxBytes?: number): RegularFileSnapshot {
+  let named: fs.BigIntStats;
   try {
-    stat = fs.lstatSync(filePath);
+    named = fs.lstatSync(filePath, { bigint: true });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") {
@@ -113,14 +148,62 @@ function readRegularFile(filePath: string): { bytes: Buffer; mode: number } {
     }
     throw new WriteSafetyError("WRITE_FAILED", `Could not inspect file: ${filePath}`, { systemCode: code });
   }
-  if (!stat.isFile()) {
+  if (!named.isFile() || named.isSymbolicLink()) {
     throw new WriteSafetyError("NOT_A_FILE", `Not a regular file: ${filePath}`);
   }
+  let fd: number;
   try {
-    return { bytes: fs.readFileSync(filePath), mode: stat.mode & 0o777 };
+    fd = fs.openSync(filePath, "r");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
+    throw new WriteSafetyError("WRITE_FAILED", `Could not open file: ${filePath}`, { systemCode: code });
+  }
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || !sameVersion(named, opened)) {
+      throw new WriteSafetyError("STALE_FILE", `File changed while it was being opened: ${filePath}`, { stage: "preflight-identity" });
+    }
+    if (maxBytes !== undefined && opened.size > BigInt(maxBytes)) {
+      throw new WriteSafetyError("FILE_TOO_LARGE", `File exceeds the ${maxBytes}-byte edit limit: ${filePath}`, { maxBytes });
+    }
+    let bytes: Buffer;
+    if (maxBytes === undefined) {
+      bytes = fs.readFileSync(fd);
+    } else {
+      let buffer = Buffer.allocUnsafe(Math.min(maxBytes + 1, Math.max(1, Number(opened.size) + 1)));
+      let total = 0;
+      while (total <= maxBytes) {
+        if (total === buffer.length) {
+          const next = Buffer.allocUnsafe(Math.min(maxBytes + 1, Math.max(64 * 1024, buffer.length * 2)));
+          buffer.copy(next, 0, 0, total);
+          buffer = next;
+        }
+        const count = fs.readSync(fd, buffer, total, buffer.length - total, null);
+        if (count === 0) break;
+        total += count;
+      }
+      if (total > maxBytes) {
+        throw new WriteSafetyError("FILE_TOO_LARGE", `File exceeds the ${maxBytes}-byte edit limit: ${filePath}`, { maxBytes });
+      }
+      bytes = buffer.subarray(0, total);
+    }
+    const afterHandle = fs.fstatSync(fd, { bigint: true });
+    const afterPath = fs.lstatSync(filePath, { bigint: true });
+    if (!sameVersion(opened, afterHandle) || opened.dev !== afterPath.dev || opened.ino !== afterPath.ino || !afterPath.isFile()) {
+      throw new WriteSafetyError("STALE_FILE", `File changed while it was being read: ${filePath}`, { stage: "preflight-read" });
+    }
+    return {
+      bytes,
+      mode: Number(opened.mode & 0o777n),
+      dev: opened.dev.toString(),
+      ino: opened.ino.toString(),
+    };
+  } catch (error) {
+    if (error instanceof WriteSafetyError) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
     throw new WriteSafetyError("WRITE_FAILED", `Could not read file: ${filePath}`, { systemCode: code });
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -182,8 +265,32 @@ function logFailure(record: AuditRecord, error: unknown): void {
   const details = error instanceof WriteSafetyError ? error.details : {};
   const currentHash = typeof details.currentHash === "string" ? details.currentHash : null;
   const oldHash = typeof details.oldHash === "string" ? details.oldHash : currentHash ?? record.oldHash;
+  const newHash = typeof details.newHash === "string" ? details.newHash : record.newHash;
+  const stage = typeof details.stage === "string" ? details.stage : undefined;
+  const systemCode = typeof details.systemCode === "string" ? details.systemCode : undefined;
+  const retryCount = typeof details.retryCount === "number" ? details.retryCount : undefined;
+  const temporaryCleanupCode = typeof details.temporaryCleanupCode === "string" ? details.temporaryCleanupCode : undefined;
+  const temporaryFile = typeof details.temporaryFile === "string" ? details.temporaryFile : undefined;
+  const temporaryFileLeftover = typeof details.temporaryFileLeftover === "boolean" ? details.temporaryFileLeftover : undefined;
+  const operationApplied = typeof details.operationApplied === "boolean" ? details.operationApplied : undefined;
+  const timingsMs = details.timingsMs && typeof details.timingsMs === "object"
+    ? details.timingsMs as WriteStageTimings : undefined;
   try {
-    appendAudit({ ...record, oldHash, success: false, errorCode: errorCode(error) });
+    appendAudit({
+      ...record,
+      oldHash,
+      newHash,
+      success: false,
+      ...(operationApplied !== undefined ? { operationApplied } : {}),
+      errorCode: errorCode(error),
+      ...(stage ? { stage } : {}),
+      ...(systemCode ? { systemCode } : {}),
+      ...(retryCount !== undefined ? { retryCount } : {}),
+      ...(temporaryCleanupCode ? { temporaryCleanupCode } : {}),
+      ...(temporaryFile ? { temporaryFile } : {}),
+      ...(temporaryFileLeftover !== undefined ? { temporaryFileLeftover } : {}),
+      ...(timingsMs ? { timingsMs } : {}),
+    });
   } catch {
     // Preserve the operation's original error if the audit directory is unavailable.
   }
@@ -194,7 +301,8 @@ function audited<T extends WriteResult | MoveResult | DeleteResult | DirectoryRe
   filePath: string,
   context: WriteContext,
   action: () => T,
-  move?: { source: string; destination: string }
+  move?: { source: string; destination: string },
+  getTimings?: () => WriteStageTimings,
 ): T {
   const base: AuditRecord = {
     timestamp: new Date().toISOString(),
@@ -212,8 +320,12 @@ function audited<T extends WriteResult | MoveResult | DeleteResult | DirectoryRe
   try {
     result = action();
   } catch (error) {
-    logFailure(base, error);
-    throw error;
+    const timingsMs = getTimings?.();
+    const auditedError = error instanceof WriteSafetyError && timingsMs
+      ? new WriteSafetyError(error.code, error.message, { ...error.details, timingsMs })
+      : error;
+    logFailure(base, auditedError);
+    throw auditedError;
   }
 
   try {
@@ -222,6 +334,7 @@ function audited<T extends WriteResult | MoveResult | DeleteResult | DirectoryRe
       oldHash: result.oldHash,
       newHash: result.newHash,
       success: true,
+      ...(getTimings ? { timingsMs: getTimings() } : {}),
     });
   } catch (error) {
     throw new WriteSafetyError("AUDIT_FAILED", "The file operation succeeded, but its audit record could not be written.", {
@@ -232,14 +345,30 @@ function audited<T extends WriteResult | MoveResult | DeleteResult | DirectoryRe
   return result;
 }
 
-function temporaryFileFor(target: string, content: Buffer, mode: number, oldHash?: string): string {
-  const tempPath = path.join(path.dirname(target), `.${path.basename(target)}.c2c-${randomUUID()}.tmp`);
+function temporaryFileFor(
+  target: string,
+  content: Buffer,
+  mode: number,
+  oldHash?: string,
+  timings?: Pick<WriteStageTimings, "tempWriteMs" | "flushMs">,
+): string {
+  const tempPath = path.join(path.dirname(target), `.${path.basename(target)}.c2c-${process.pid}-${randomUUID()}.tmp`);
   let fd: number | undefined;
+  let stage = "create-temp";
   try {
+    let stageStarted = performance.now();
     fd = fs.openSync(tempPath, "wx", mode);
+    stage = "write-temp";
     fs.writeFileSync(fd, content);
+    if (timings) timings.tempWriteMs += performance.now() - stageStarted;
+    stage = "flush-temp";
+    stageStarted = performance.now();
     fs.fsyncSync(fd);
+    if (timings) timings.flushMs += performance.now() - stageStarted;
+    stage = "close-temp";
+    stageStarted = performance.now();
     fs.closeSync(fd);
+    if (timings) timings.tempWriteMs += performance.now() - stageStarted;
     fd = undefined;
     return tempPath;
   } catch (error) {
@@ -250,23 +379,96 @@ function temporaryFileFor(target: string, content: Buffer, mode: number, oldHash
         // Keep the original write error.
       }
     }
+    let temporaryCleanupCode: string | undefined;
     try {
       fs.unlinkSync(tempPath);
-    } catch {
-      // The temporary file may not have been created.
+    } catch (cleanupError) {
+      const cleanupErrno = (cleanupError as NodeJS.ErrnoException).code;
+      if (cleanupErrno !== "ENOENT") temporaryCleanupCode = cleanupErrno ?? "UNKNOWN";
     }
     throw new WriteSafetyError("WRITE_FAILED", `Could not prepare an atomic write for: ${target}`, {
       ...(oldHash ? { oldHash } : {}),
+      stage,
       systemCode: (error as NodeJS.ErrnoException).code,
+      operationApplied: false,
+      ...(timings ? { timingsMs: { ...timings } } : {}),
+      ...(temporaryCleanupCode ? {
+        temporaryCleanupCode,
+        temporaryFile: path.basename(tempPath),
+        temporaryFileLeftover: true,
+      } : {}),
     });
   }
 }
 
-function removeTempFile(tempPath: string): void {
+function removeTempFile(tempPath: string): { code?: string } {
   try {
     fs.unlinkSync(tempPath);
-  } catch {
-    // Cleanup is best effort after the target has already been safely published.
+    return {};
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return {};
+    return { code: code ?? "UNKNOWN" };
+  }
+}
+
+function publishReplacement(
+  tempPath: string,
+  filePath: string,
+  oldHash: string,
+  newHash: string,
+  identity: { dev: string; ino: string },
+  operation: "replace" | "edit",
+): AtomicReplaceResult {
+  try {
+    return atomicReplace(tempPath, filePath, {
+      preserveAcl: true,
+      expectedHash: oldHash,
+      expectedNewHash: newHash,
+      expectedIdentity: identity,
+    });
+  } catch (error) {
+    const cleanup = removeTempFile(tempPath);
+    const cleanupDetails = cleanup.code
+      ? {
+        temporaryCleanupCode: cleanup.code,
+        temporaryFile: path.basename(tempPath),
+        temporaryFileLeftover: true,
+      }
+      : {};
+    if (error instanceof WriteSafetyError) {
+      if (cleanup.code) {
+        throw new WriteSafetyError(error.code, error.message, { ...error.details, ...cleanupDetails });
+      }
+      throw error;
+    }
+
+    const atomicError = error instanceof AtomicReplaceError ? error : undefined;
+    if (atomicError?.failureCode === "STALE_FILE") {
+      throw new WriteSafetyError("STALE_FILE", `File changed while waiting to replace it: ${filePath}`, {
+        oldHash,
+        expectedHash: oldHash,
+        ...(atomicError.currentHash ? { currentHash: atomicError.currentHash } : {}),
+        stage: atomicError.stage,
+        retryCount: atomicError.retryCount,
+        operationApplied: atomicError.operationApplied,
+        ...(atomicError.timings ? { timingsMs: atomicError.timings } : {}),
+        ...cleanupDetails,
+      });
+    }
+    const systemCode = atomicError?.systemCode ?? (error as NodeJS.ErrnoException).code;
+    const retryCount = atomicError?.retryCount ?? 0;
+    throw new WriteSafetyError("WRITE_FAILED", `Could not ${operation} file: ${filePath}`, {
+      oldHash,
+      stage: atomicError?.stage ?? "publish",
+      ...(systemCode ? { systemCode } : {}),
+      retryCount,
+      operationApplied: atomicError?.operationApplied ?? false,
+      ...(atomicError?.readOnly ? { readOnly: true } : {}),
+      ...(atomicError?.finalHash ? { newHash: atomicError.finalHash } : {}),
+      ...(atomicError?.timings ? { timingsMs: atomicError.timings } : {}),
+      ...cleanupDetails,
+    });
   }
 }
 
@@ -274,6 +476,20 @@ function validateExpectedHash(expectedHash: string): void {
   if (typeof expectedHash !== "string" || !SHA256_HEX.test(expectedHash)) {
     throw new WriteSafetyError("INVALID_ARGUMENT", "expectedHash must be a 64-character SHA-256 hex digest.");
   }
+}
+
+function emptyWriteTimings(): WriteStageTimings {
+  return {
+    preflightMs: 0,
+    oldHashMs: 0,
+    newHashMs: 0,
+    tempWriteMs: 0,
+    flushMs: 0,
+    finalValidationMs: 0,
+    atomicReplaceMs: 0,
+    postVerificationMs: 0,
+    totalMs: 0,
+  };
 }
 
 /** Read a regular file and return the SHA-256 hash of its exact bytes. */
@@ -345,32 +561,43 @@ export function replaceFile(
   const absolutePath = asAbsolutePath(filePath);
   validateExpectedHash(expectedHash);
   const bytes = asBuffer(content);
+  const timings = emptyWriteTimings();
+  const started = performance.now();
+  const getTimings = () => ({ ...timings, totalMs: performance.now() - started });
   return audited("replace", absolutePath, context, () => {
-    const current = readRegularFile(absolutePath);
+    let stageStarted = performance.now();
+    const current = readRegularFile(absolutePath, MAX_EDITABLE_FILE_BYTES);
+    timings.preflightMs += performance.now() - stageStarted;
+    stageStarted = performance.now();
     const oldHash = hashBytes(current.bytes);
+    timings.oldHashMs += performance.now() - stageStarted;
     if (oldHash !== expectedHash.toLowerCase()) {
       throw new WriteSafetyError("STALE_FILE", `File changed since it was read: ${absolutePath}`, {
         expectedHash: expectedHash.toLowerCase(),
         currentHash: oldHash,
       });
     }
-
-    const tempPath = temporaryFileFor(absolutePath, bytes, current.mode, oldHash);
-    try {
-      // The temp file is in the target directory. On local filesystems, rename
-      // publishes the replacement atomically; Windows may reject replacement
-      // while another process holds the target open, in which case we fail closed.
-      fs.renameSync(tempPath, absolutePath);
-    } catch (error) {
-      throw new WriteSafetyError("WRITE_FAILED", `Could not replace file: ${absolutePath}`, {
+    if (process.platform === "win32" && (current.mode & 0o222) === 0) {
+      throw new WriteSafetyError("WRITE_FAILED", `File is read-only and cannot be replaced: ${absolutePath}`, {
         oldHash,
-        systemCode: (error as NodeJS.ErrnoException).code,
+        stage: "preflight-readonly",
+        systemCode: "EACCES",
+        readOnly: true,
+        operationApplied: false,
       });
-    } finally {
-      removeTempFile(tempPath);
     }
-    return { path: absolutePath, oldHash, newHash: hashBytes(bytes) };
-  });
+
+    stageStarted = performance.now();
+    const newHash = hashBytes(bytes);
+    timings.newHashMs += performance.now() - stageStarted;
+    const tempPath = temporaryFileFor(absolutePath, bytes, current.mode, oldHash, timings);
+    const publication = publishReplacement(tempPath, absolutePath, oldHash, newHash,
+      { dev: current.dev, ino: current.ino }, "replace");
+    timings.finalValidationMs += publication.timings.finalValidationMs;
+    timings.atomicReplaceMs += publication.timings.atomicReplaceMs;
+    timings.postVerificationMs += publication.timings.postVerificationMs;
+    return { path: absolutePath, oldHash, newHash };
+  }, undefined, getTimings);
 }
 
 /** Replace a text match after checking the caller's hash. Matches must be unique by default. */
@@ -387,9 +614,16 @@ export function editText(
     throw new WriteSafetyError("INVALID_ARGUMENT", "oldText must not be empty.");
   }
 
+  const timings = emptyWriteTimings();
+  const started = performance.now();
+  const getTimings = () => ({ ...timings, totalMs: performance.now() - started });
   return audited("edit", absolutePath, options, () => {
-    const current = readRegularFile(absolutePath);
+    let stageStarted = performance.now();
+    const current = readRegularFile(absolutePath, MAX_EDITABLE_FILE_BYTES);
+    timings.preflightMs += performance.now() - stageStarted;
+    stageStarted = performance.now();
     const oldHash = hashBytes(current.bytes);
+    timings.oldHashMs += performance.now() - stageStarted;
     if (oldHash !== expectedHash.toLowerCase()) {
       throw new WriteSafetyError("STALE_FILE", `File changed since it was read: ${absolutePath}`, {
         expectedHash: expectedHash.toLowerCase(),
@@ -414,19 +648,26 @@ export function editText(
       ? text.split(oldText).join(newText)
       : `${text.slice(0, matches[0])}${newText}${text.slice(matches[0] + oldText.length)}`;
     const bytes = Buffer.from(updated, "utf8");
-    const tempPath = temporaryFileFor(absolutePath, bytes, current.mode, oldHash);
-    try {
-      fs.renameSync(tempPath, absolutePath);
-    } catch (error) {
-      throw new WriteSafetyError("WRITE_FAILED", `Could not edit file: ${absolutePath}`, {
+    if (process.platform === "win32" && (current.mode & 0o222) === 0) {
+      throw new WriteSafetyError("WRITE_FAILED", `File is read-only and cannot be edited: ${absolutePath}`, {
         oldHash,
-        systemCode: (error as NodeJS.ErrnoException).code,
+        stage: "preflight-readonly",
+        systemCode: "EACCES",
+        readOnly: true,
+        operationApplied: false,
       });
-    } finally {
-      removeTempFile(tempPath);
     }
-    return { path: absolutePath, oldHash, newHash: hashBytes(bytes) };
-  });
+    stageStarted = performance.now();
+    const newHash = hashBytes(bytes);
+    timings.newHashMs += performance.now() - stageStarted;
+    const tempPath = temporaryFileFor(absolutePath, bytes, current.mode, oldHash, timings);
+    const publication = publishReplacement(tempPath, absolutePath, oldHash, newHash,
+      { dev: current.dev, ino: current.ino }, "edit");
+    timings.finalValidationMs += publication.timings.finalValidationMs;
+    timings.atomicReplaceMs += publication.timings.atomicReplaceMs;
+    timings.postVerificationMs += publication.timings.postVerificationMs;
+    return { path: absolutePath, oldHash, newHash };
+  }, undefined, getTimings);
 }
 
 /**

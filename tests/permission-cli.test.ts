@@ -146,7 +146,7 @@ describe("local permission CLI", () => {
     const textResult = runCli(["status", "-w", root], stateDir);
     expect(textResult.stdout).toContain("Permission: readonly");
 
-    const doctor = runCli(["doctor", "--json", "-w", root], stateDir);
+    const doctor = runCli(["doctor", "--json", "--no-fix", "-w", root], stateDir);
     expect(JSON.parse(doctor.stdout).autostart).toMatchObject({
       enabled: false,
       backend: "none",

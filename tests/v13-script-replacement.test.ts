@@ -140,6 +140,7 @@ function specFor(entrypoint: EntrypointCase) {
 function approveRequest(workspace: Workspace, request: ReturnType<typeof createLevel3Request>) {
   const record = getLevel3Request(workspace.id, request.requestId);
   expect(record).not.toBeNull();
+  if (record?.status === "approved") return record;
   const options: { risk: "development"; allowDynamic?: true } = { risk: "development" };
   if (record?.spec.entryBinding?.kind === "dynamic_code") options.allowDynamic = true;
   return approveLevel3Request(workspace, request.requestId, request.digest, true, options);

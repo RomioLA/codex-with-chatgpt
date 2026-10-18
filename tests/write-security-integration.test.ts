@@ -32,7 +32,7 @@ function decode(result: Awaited<ReturnType<Client["callTool"]>>) {
 }
 async function call(client: Client, name: string, args: Record<string, unknown>, error?: string) {
   const result = await client.callTool({ name, arguments: args });
-  expect(result.isError ?? false).toBe(Boolean(error));
+  expect(result.isError ?? false, `Unexpected ${name} result: ${JSON.stringify(result)}`).toBe(Boolean(error));
   const data = decode(result);
   if (error) expect(data.error).toBe(error);
   return data;
@@ -186,7 +186,7 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
     expect(next.contentHash).toBe(first.contentHash);
   });
 
-  it("G/H: external.write is denied at level1 and creates/replaces/edits at level2", async () => {
+  it("G/H: external.write is denied at level1 and level2 mutations fail closed for Windows CAS", async () => {
     const { client } = await session(["filesystem.external.write"]);
     const file = path.join(outside, fresh());
     setPermission(bridge.workspace.id, "level1");
@@ -195,7 +195,9 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
     setPermission(bridge.workspace.id, "level2");
     const created = await call(client, "create_external_file", { path: file, content: "original" });
     const replaced = await call(client, "replace_external_file", { path: file, content: "replacement", expected_hash: created.newHash });
-    await call(client, "edit_external_file", { path: file, old_text: "replacement", new_text: "edited", expected_hash: replaced.newHash });
+    expect(replaced.oldHash).toBe(created.newHash);
+    const edited = await call(client, "edit_external_file", { path: file, old_text: "replacement", new_text: "edited", expected_hash: replaced.newHash });
+    expect(edited.oldHash).toBe(replaced.newHash);
     expect(fs.readFileSync(file, "utf8")).toBe("edited");
   });
 

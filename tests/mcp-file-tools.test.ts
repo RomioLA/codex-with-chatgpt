@@ -41,7 +41,7 @@ async function call(name: string, args: Record<string, unknown>, expected?: stri
     expect(result.isError).toBe(true);
     expect(data(result).error).toBe(expected);
   } else {
-    expect(result.isError ?? false).toBe(false);
+    expect(result.isError ?? false, JSON.stringify(result)).toBe(false);
     expect(result.structuredContent).toEqual(data(result));
   }
   return data(result);
@@ -136,10 +136,19 @@ describe("MCP file tools over real Streamable HTTP", () => {
         write(root, file, "original");
       }
       const read = await call("read_file", { path: file });
-      await call("replace_file", { path: file, content: "replacement", expected_hash: read.contentHash }, workspaceAllowed ? undefined : deny);
-      expect(fs.readFileSync(abs, "utf8")).toBe(workspaceAllowed ? "replacement" : "original");
+      const replacementResult = await call("replace_file", { path: file, content: "replacement", expected_hash: read.contentHash },
+        workspaceAllowed ? undefined : deny);
+      const replacementSucceeded = workspaceAllowed;
+      if (replacementSucceeded) expect(replacementResult.newHash).toBe(hash("replacement"));
+      expect(fs.readFileSync(abs, "utf8")).toBe(replacementSucceeded ? "replacement" : "original");
       const next = await call("read_file", { path: file });
-      await call("edit_file", { path: file, old_text: workspaceAllowed ? "replacement" : "original", new_text: "edited", expected_hash: next.contentHash }, workspaceAllowed ? undefined : deny);
+      const editResult = await call("edit_file", {
+        path: file,
+        old_text: replacementSucceeded ? "replacement" : "original",
+        new_text: "edited",
+        expected_hash: next.contentHash,
+      }, workspaceAllowed ? undefined : deny);
+      if (replacementSucceeded) expect(editResult.newHash).toBe(hash("edited"));
       const destination = fresh("moved.txt");
       await call("move_file", { source: file, destination }, workspaceAllowed ? undefined : deny);
       expect(fs.existsSync(abs)).toBe(!workspaceAllowed);
@@ -166,10 +175,22 @@ describe("MCP file tools over real Streamable HTTP", () => {
       await call("read_external_file", { path: file }, workspaceAllowed ? undefined : deny);
       await call("create_external_file", { path: created, content: "created" }, externalAllowed ? undefined : deny);
       expect(fs.existsSync(created)).toBe(externalAllowed);
-      await call("replace_external_file", { path: file, content: "external replacement", expected_hash: hash(before) }, externalAllowed ? undefined : deny);
+      const replacementResult = await call("replace_external_file", {
+        path: file,
+        content: "external replacement",
+        expected_hash: hash(before),
+      }, externalAllowed ? undefined : deny);
+      const replacementSucceeded = externalAllowed;
+      if (replacementSucceeded) expect(replacementResult.newHash).toBe(hash("external replacement"));
       const current = fs.readFileSync(file);
-      await call("edit_external_file", { path: file, old_text: externalAllowed ? "replacement" : "original", new_text: "edited", expected_hash: hash(current) }, externalAllowed ? undefined : deny);
-      expect(fs.readFileSync(file, "utf8")).toBe(externalAllowed ? "external edited" : "external original");
+      const editResult = await call("edit_external_file", {
+        path: file,
+        old_text: replacementSucceeded ? "replacement" : "original",
+        new_text: "edited",
+        expected_hash: hash(current),
+      }, externalAllowed ? undefined : deny);
+      if (replacementSucceeded) expect(editResult.newHash).toBe(hash("external edited"));
+      expect(fs.readFileSync(file, "utf8")).toBe(replacementSucceeded ? "external edited" : "external original");
     });
 
     it(`${mode}: external deletion and moves are unavailable and workspace tools cannot substitute`, async () => {
@@ -370,6 +391,13 @@ describe("MCP file tools over real Streamable HTTP", () => {
     expect(tools.find((tool) => tool.name === "create_file")?.annotations?.destructiveHint).toBe(false);
     for (const name of ["replace_file", "edit_file", "delete_file", "replace_external_file", "edit_external_file"]) {
       expect(tools.find((tool) => tool.name === name)?.inputSchema.required).toContain("expected_hash");
+    }
+    for (const name of ["replace_file", "edit_file", "replace_external_file", "edit_external_file"]) {
+      const description = tools.find((tool) => tool.name === name)?.description?.toLowerCase() ?? "";
+      expect(description).toContain("atomically");
+      expect(description).toContain("expected_hash");
+      expect(description).not.toContain("unavailable");
+      expect(description).not.toContain("cas_unsupported");
     }
   });
 

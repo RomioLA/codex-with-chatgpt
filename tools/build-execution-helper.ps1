@@ -32,7 +32,8 @@ $compileArguments = @(
     "/Fe$stagingPath",
     $sourcePath,
     '/link',
-    'bcrypt.lib'
+    'bcrypt.lib',
+    'advapi32.lib'
 )
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
@@ -80,7 +81,7 @@ if (-not (Test-Path -LiteralPath $devCommand -PathType Leaf)) {
 # VsDevCmd must initialize INCLUDE/LIB as well as PATH. Run the fixed compile
 # command in that environment; no request data is interpolated into this script.
 $clCommand = '/nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ' +
-             '/Fo"' + $objectPath + '" /Fe"' + $stagingPath + '" "' + $sourcePath + '" /link bcrypt.lib'
+             '/Fo"' + $objectPath + '" /Fe"' + $stagingPath + '" "' + $sourcePath + '" /link bcrypt.lib advapi32.lib'
 $command = 'call "' + $devCommand + '" -no_logo -arch=x64 -host_arch=x64 && cl.exe ' + $clCommand
 $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $processInfo.FileName = $env:ComSpec

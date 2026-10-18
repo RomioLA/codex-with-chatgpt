@@ -66,9 +66,10 @@ beforeEach(() => {
   isolateStateDir();
 });
 
-afterEach(() => {
+afterEach(async () => {
   if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
   else process.env.C2C_STATE_DIR = previousStateDir;
+  await new Promise<void>((resolve) => setImmediate(resolve));
 });
 
 describe("Git write planning", () => {

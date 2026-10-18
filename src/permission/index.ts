@@ -16,6 +16,8 @@ export {
   ensurePermissionMigrated,
   readPermission,
   readPermissionStatus,
+  readCurrentSessionGrant,
   setPermission,
+  type CurrentSessionGrant,
   type PermissionStatus,
 } from "./store.js";

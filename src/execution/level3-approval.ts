@@ -4,11 +4,20 @@ import path from "node:path";
 import { getStateDir } from "../config/paths.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
 import { resolveRepositoryIdentity, type RepositoryIdentity } from "./repository-identity.js";
+import { IgnoreRules } from "../workspace/ignore.js";
 import type { Workspace } from "../workspace/manager.js";
 import { isProtectedStatePath } from "../workspace/protected-state.js";
 import { bindLevel3ScriptEntries } from "./script-entry-binding.js";
 import { archiveRecord, readArchivedRecord } from "./record-archive.js";
 import { atomicReplace } from "./atomic-replace.js";
+import {
+  buildCommonGitArgs,
+  captureGitBundleCriticalMaterials,
+  configFilesAsMaterials,
+  loadGitConfig,
+  resolveGitExecutable,
+  validateLevel3GitConfig,
+} from "../git-write/security.js";
 
 export const LEVEL3_REQUEST_TTL_MS = 10 * 60 * 1000;
 export const MAX_LEVEL3_PENDING_REQUESTS = 50;
@@ -18,6 +27,7 @@ export const MAX_LEVEL3_FILE_BYTES = 128 * 1024 * 1024;
 export const MAX_LEVEL3_TOTAL_MATERIAL_BYTES = 256 * 1024 * 1024;
 
 const STATE_VERSION = 1;
+const LEVEL3_RISK_POLICY_VERSION = 6;
 const MAX_STATE_BYTES = 64 * 1024 * 1024;
 const MAX_SPEC_TEXT_BYTES = 64 * 1024;
 const MAX_ARGUMENTS = 128;
@@ -36,6 +46,14 @@ interface Level3SpecBase {
   timeoutSeconds: number;
   materials: string[];
   entryBinding?: { kind: "literal_entries" | "dynamic_code"; uncertainties: string[] };
+  /** Internal trusted Git hardening prefix, rebuilt from bound Git config on every check. */
+  gitSafetyArgs?: string[];
+  /** False means the local Git config needs local review before execution. */
+  gitConfigSafe?: boolean;
+  /** Exact HTTPS remotes whose local fetch command syntax is independently safe. */
+  gitFetchRemotes?: string[];
+  /** True only when the Git for Windows child helpers are included in the material snapshot. */
+  gitFetchHelpersBound?: boolean;
 }
 
 export type Level3Spec = Level3SpecBase & (
@@ -46,7 +64,7 @@ export type Level3Spec = Level3SpecBase & (
 export interface Level3MaterialSnapshot {
   /** Canonical absolute path passed to the native helper. */
   path: string;
-  /** Workspace-relative name shown in the local approval UI. */
+  /** Local approval display label for a workspace file or an external runtime material. */
   relativePath: string;
   fileIdentity: string;
   hash: string;
@@ -75,6 +93,10 @@ export interface Level3RequestRecord {
   createdAt: string;
   expiresAt: string;
   risk: Level3Risk | null;
+  /** Persisted classifier result for V1.3.2 requests. Missing on legacy records. */
+  riskClass?: Level3RiskClass;
+  /** Invalidates outstanding requests when the local command risk policy changes. */
+  riskPolicyVersion?: number;
   allowSystem: boolean;
   allowDynamic?: boolean;
   cleanupConfirmedAt?: string;
@@ -92,8 +114,11 @@ export interface Level3RequestRecord {
 export interface Level3RequestReceipt {
   requestId: string;
   digest: string;
-  status: "pending";
+  status: "pending" | "approved";
   expiresAt: string;
+  launchExpiresAt: string | null;
+  approvalRequired: boolean;
+  riskClass: Level3RiskClass;
 }
 
 export interface Level3RequestPreview {
@@ -105,6 +130,7 @@ export interface Level3RequestPreview {
   expiresAt: string;
   digest: string;
   risk: Level3Risk | null;
+  riskClass: Level3RiskClass;
 }
 
 export interface GenericCommandMaterial {
@@ -145,6 +171,7 @@ interface Level3Manifest {
   clientId: string;
   digest: string;
   risk: Level3Risk;
+  riskPolicyVersion: number;
   allowSystem: boolean;
   allowDynamic: boolean;
   repositoryPath: string;
@@ -174,6 +201,9 @@ export type Level3ApprovalErrorCode =
   | "LEVEL3_REQUEST_ALREADY_USED"
   | "LEVEL3_RISK_APPROVAL_REQUIRED"
   | "LEVEL3_MATERIAL_CHANGED"
+  | "LEVEL3_EXECUTION_TARGET_UNVERIFIED"
+  | "LEVEL3_GIT_ALIAS_CONFIG_UNSUPPORTED"
+  | "LEVEL3_GIT_WORKTREE_ADD_UNSUPPORTED"
   | "LEVEL3_REPOSITORY_CHANGED"
   | "LEVEL3_EXECUTABLE_UNAVAILABLE"
   | "LEVEL3_STORE_CORRUPT"
@@ -298,7 +328,11 @@ function validStoredRecord(value: unknown, workspaceId: string): value is Level3
     /^[a-f0-9]{64}$/.test(record.repositoryIdentity) && isSha256(record.digest) &&
     isLevel3Status(record.status) && typeof record.createdAt === "string" && typeof record.expiresAt === "string" &&
     typeof record.allowSystem === "boolean" &&
+    (record.riskPolicyVersion === undefined ||
+      (Number.isSafeInteger(record.riskPolicyVersion) && record.riskPolicyVersion >= 1)) &&
     (record.risk === null || record.risk === "development" || record.risk === "destructive-system") &&
+    (record.riskClass === undefined || record.riskClass === "safe-development" ||
+      record.riskClass === "needs-review" || record.riskClass === "destructive-system") &&
     (record.approvalId === null || (typeof record.approvalId === "string" && /^[A-Za-z0-9_-]{24,64}$/.test(record.approvalId))) &&
     (record.manifestPath === null || typeof record.manifestPath === "string") &&
     (record.manifestFileIdentity === null || isIdentity(record.manifestFileIdentity)) &&
@@ -426,6 +460,211 @@ function workspaceRelativeInput(workspace: Workspace, value: string): { abs: str
   return { abs: resolved.abs, rel: resolved.rel || ".", lexical };
 }
 
+function refMaterialPath(repository: RepositoryIdentity, refName: string): string {
+  const refPath = path.join(repository.commonGitDirectory, ...refName.split("/"));
+  if (fs.existsSync(refPath)) return refPath;
+  const packedRefs = path.join(repository.commonGitDirectory, "packed-refs");
+  if (fs.existsSync(packedRefs)) return packedRefs;
+  fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+}
+
+function gitMutationMaterialPaths(repository: RepositoryIdentity, args: readonly string[]): string[] {
+  const subcommand = args[0]?.toLowerCase();
+  const paths: string[] = [];
+  const headPath = path.join(repository.gitDirectory, "HEAD");
+  const headStat = fs.lstatSync(headPath);
+  if (!headStat.isFile() || headStat.isSymbolicLink()) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+  const headText = fs.readFileSync(headPath, "utf8").trim();
+  const headRef = /^ref:\s+(refs\/heads\/[A-Za-z0-9._/-]+)$/.exec(headText)?.[1];
+  const bindHead = () => {
+    paths.push(headPath);
+    if (headRef) paths.push(refMaterialPath(repository, headRef));
+    else if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(headText)) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+  };
+  const bindIndex = () => paths.push(path.join(repository.gitDirectory, "index"));
+
+  if (subcommand === "add") {
+    bindIndex();
+  } else if (subcommand === "commit") {
+    bindIndex();
+    bindHead();
+    const operationMarkers = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_LOG"];
+    if (operationMarkers.some((name) => fs.existsSync(path.join(repository.gitDirectory, name)))) {
+      fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+    }
+  } else if (subcommand === "branch") {
+    if (args.length > 1 && args[1] !== "--list") bindHead();
+  } else if (subcommand === "switch") {
+    bindIndex();
+    bindHead();
+    if (args.length === 2 && safeGitBranchName(args[1]!)) {
+      const localRef = `refs/heads/${args[1]}`;
+      const remoteRef = `refs/remotes/${args[1]}`;
+      const localPath = path.join(repository.commonGitDirectory, ...localRef.split("/"));
+      const remotePath = path.join(repository.commonGitDirectory, ...remoteRef.split("/"));
+      if (fs.existsSync(localPath)) paths.push(localPath);
+      else if (fs.existsSync(remotePath)) paths.push(remotePath);
+      else paths.push(refMaterialPath(repository, localRef));
+    }
+  } else if (subcommand === "worktree" && args[1]?.toLowerCase() === "add") {
+    bindHead();
+  }
+
+  return [...new Set(paths)];
+}
+
+function repositoryPathArgumentIsSafe(workspace: Workspace | undefined, spec: Level3Spec, value: string): boolean {
+  if (!workspace || path.isAbsolute(value) || path.win32.isAbsolute(value)) return false;
+  let repositoryRoot: string;
+  try { repositoryRoot = resolveRepositoryIdentity(workspace, spec.repositoryPath).canonicalPath; }
+  catch { return false; }
+  const lexical = path.resolve(workspace.root, spec.cwd, value.replace(/[\\/]/g, path.sep));
+  if (!isWithin(repositoryRoot, lexical)) return false;
+  const relative = path.relative(workspace.root, lexical).split(path.sep).join("/");
+  try {
+    const resolved = workspace.resolve(relative);
+    if (normPath(resolved.abs) !== normPath(lexical) || !fs.lstatSync(resolved.abs).isFile()) return false;
+    const repositoryRelative = path.relative(repositoryRoot, resolved.abs).split(path.sep).join("/");
+    const repositoryRules = new IgnoreRules(repositoryRoot);
+    return !isProtectedStatePath(resolved.abs) &&
+      !workspace.ignoreRules.isSensitive(relative) &&
+      !repositoryRules.isSensitive(repositoryRelative) &&
+      !(process.platform === "win32" &&
+        (workspace.ignoreRules.isSensitive(relative.toLowerCase()) || repositoryRules.isSensitive(repositoryRelative.toLowerCase())));
+  } catch {
+    return false;
+  }
+}
+
+function level3GitProfile(
+  workspace: Workspace,
+  repository: RepositoryIdentity,
+  executablePath: string,
+  commandArgs: readonly string[],
+): {
+  safetyArgs: string[];
+  configSafe: boolean;
+  fetchRemotes: string[];
+  fetchHelpersBound: boolean;
+  configMaterials: Level3MaterialSnapshot[];
+} {
+  try {
+    const gitExecutable = resolveGitExecutable();
+    if (normPath(gitExecutable.path) !== normPath(executablePath)) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+    const config = loadGitConfig(gitExecutable, repository.canonicalPath);
+    // Git aliases can expand an otherwise opaque command into shell code or a
+    // worktree operation. Level 3 does not attempt to interpret alias syntax.
+    if (config.some((entry) => /^alias\./i.test(entry.key))) {
+      fail("LEVEL3_GIT_ALIAS_CONFIG_UNSUPPORTED");
+    }
+    const configFiles = configFilesAsMaterials(config, repository.canonicalPath);
+    if (configFiles.length === 0) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+    const configMaterials: Level3MaterialSnapshot[] = [];
+    let totalBytes = 0;
+    for (const item of configFiles) {
+      if (!isWithin(workspace.root, item.path) || isProtectedStatePath(item.path)) {
+        fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      }
+      const relativePath = path.relative(workspace.root, item.path).split(path.sep).join("/");
+      if (!relativePath || relativePath === ".." || relativePath.startsWith("../")) {
+        fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      }
+      const current = hashRegularFile(item.path);
+      if (current.fileIdentity !== item.fileIdentity || current.hash !== item.hash) {
+        fail("LEVEL3_MATERIAL_CHANGED");
+      }
+      totalBytes += current.sizeBytes;
+      if (totalBytes > MAX_LEVEL3_TOTAL_MATERIAL_BYTES) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      configMaterials.push({ ...current, relativePath });
+    }
+
+    const seenMaterials = new Set(configMaterials.map((item) => normPath(item.path)));
+    seenMaterials.add(normPath(executablePath));
+    for (const statePath of gitMutationMaterialPaths(repository, commandArgs)) {
+      if (!fs.existsSync(statePath)) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      const canonical = pathWithoutReparsePoints(statePath);
+      if (!isWithin(workspace.root, canonical) || isProtectedStatePath(canonical)) {
+        fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      }
+      const key = normPath(canonical);
+      if (seenMaterials.has(key)) continue;
+      const relativePath = path.relative(workspace.root, canonical).split(path.sep).join("/");
+      if (!relativePath || relativePath === ".." || relativePath.startsWith("../")) {
+        fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      }
+      const current = hashRegularFile(canonical);
+      totalBytes += current.sizeBytes;
+      if (totalBytes > MAX_LEVEL3_TOTAL_MATERIAL_BYTES) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      seenMaterials.add(key);
+      configMaterials.push({ ...current, relativePath });
+    }
+
+    let fetchHelpersBound = false;
+    if (commandArgs[0] === "fetch" && process.platform === "win32") {
+      const helpers = captureGitBundleCriticalMaterials(gitExecutable, repository.canonicalPath);
+      if (helpers.length !== 5) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+      for (const helper of helpers) {
+        const current = hashRegularFile(helper.path);
+        if (current.fileIdentity !== helper.fileIdentity || current.hash !== helper.hash) {
+          fail("LEVEL3_MATERIAL_CHANGED");
+        }
+        const key = normPath(current.path);
+        if (seenMaterials.has(key)) continue;
+        const total = totalBytes + current.sizeBytes;
+        if (total > MAX_LEVEL3_TOTAL_MATERIAL_BYTES) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+        totalBytes = total;
+        seenMaterials.add(key);
+        const tail = current.path.split(/[\\/]/).filter(Boolean).slice(-3).join("/");
+        configMaterials.push({ ...current, relativePath: `[Git runtime] ${tail}` });
+      }
+      fetchHelpersBound = true;
+    }
+
+    const urlsByRemote = new Map<string, string[]>();
+    for (const entry of config) {
+      const match = /^remote\.(.+)\.url$/i.exec(entry.key);
+      if (!match) continue;
+      const remote = match[1]!;
+      const urls = urlsByRemote.get(remote) ?? [];
+      urls.push(entry.value);
+      urlsByRemote.set(remote, urls);
+    }
+    const fetchRemotes = [...urlsByRemote.entries()]
+      .filter(([name, urls]) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) &&
+        urls.length > 0 && urls.every((value) => {
+          try {
+            const parsed = new URL(value);
+            return parsed.protocol === "https:" && parsed.hostname.length > 0 &&
+              parsed.username === "" && parsed.password === "";
+          } catch {
+            return false;
+          }
+        }))
+      .map(([name]) => name.toLowerCase())
+      .sort();
+
+    let configSafe = true;
+    try { validateLevel3GitConfig(config); } catch { configSafe = false; }
+    const safetyArgs = [
+      ...buildCommonGitArgs(config, null),
+      "-c", "commit.gpgsign=false",
+      "-c", "tag.gpgSign=false",
+      "-c", "push.gpgSign=false",
+      "-c", "gpg.format=openpgp",
+      "-c", "gpg.program=",
+      "-c", "gpg.openpgp.program=",
+      "-c", "gpg.x509.program=",
+      "-c", "gpg.ssh.program=",
+      "-c", "gpg.ssh.defaultKeyCommand=",
+    ];
+    configMaterials.sort((a, b) => normPath(a.path).localeCompare(normPath(b.path)));
+    return { safetyArgs, configSafe, fetchRemotes, fetchHelpersBound, configMaterials };
+  } catch (error) {
+    if (error instanceof Level3ApprovalError) throw error;
+    fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+  }
+}
+
 function containsKnownCredential(value: string): boolean {
   if (/(?:^|[^A-Za-z0-9])(?:authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|api[_-]?key|apikey|token)(?:\s*[:=]|\s+\S)/i.test(value)) {
     return true;
@@ -438,7 +677,7 @@ function containsKnownCredential(value: string): boolean {
   return sanitizer.restrictedReason !== undefined || credentialMarkers(sanitized) > credentialMarkers(value);
 }
 
-function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
+function canonicalizeSpec(workspace: Workspace, raw: Level3Spec, storedRecord = false): {
   spec: Level3Spec;
   repositoryPath: string;
   repositoryIdentity: string;
@@ -490,6 +729,14 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
       }
       return arg;
     });
+    if (storedRecord && raw.gitSafetyArgs !== undefined) {
+      const prefix = raw.gitSafetyArgs;
+      if (!Array.isArray(prefix) || prefix.some((item) => typeof item !== "string") ||
+          args.length < prefix.length || prefix.some((item, index) => args[index] !== item)) {
+        fail("LEVEL3_MATERIAL_CHANGED");
+      }
+      args = args.slice(prefix.length);
+    }
   } else {
     if (raw.args !== undefined && (!Array.isArray(raw.args) || raw.args.length !== 0) ||
         typeof raw.command !== "string" || raw.command.trim() === "" || raw.command.includes("\0") ||
@@ -505,12 +752,28 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
     (command ? Buffer.byteLength(command, "utf8") : 0);
   if (totalArgumentBytes > MAX_SPEC_TEXT_BYTES) fail("INVALID_ARGUMENTS");
 
+  const isGitProgram = raw.engine === "program" && executableName === "git.exe";
+  if (isGitProgram && gitAliasConfigOverrideRequested(args)) fail("LEVEL3_GIT_ALIAS_CONFIG_UNSUPPORTED");
+  if (isGitProgram && gitWorktreeAddRequested(args)) fail("LEVEL3_GIT_WORKTREE_ADD_UNSUPPORTED");
+
   const normalizedMaterials: Level3MaterialSnapshot[] = [];
   const seen = new Set<string>();
   let totalMaterialBytes = 0;
   const entries = bindLevel3ScriptEntries({ engine: raw.engine, workspaceRoot: workspace.root, cwd: cwd.path,
     executable: executableMaterial.path, args, command });
-  if (entries.uncertainties.includes("unverified-execution-target")) fail("LEVEL3_MATERIAL_CHANGED");
+  if (entries.uncertainties.includes("unverified-execution-target")) fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+  const gitProfile = raw.engine === "program" && executableName === "git.exe"
+    ? level3GitProfile(workspace, repository, executableMaterial.path, args)
+    : null;
+  if (storedRecord && (gitProfile !== null || raw.gitSafetyArgs !== undefined)) {
+    if (!gitProfile || !Array.isArray(raw.gitSafetyArgs) ||
+        JSON.stringify(raw.gitSafetyArgs) !== JSON.stringify(gitProfile.safetyArgs) ||
+        raw.gitConfigSafe !== gitProfile.configSafe ||
+        JSON.stringify(raw.gitFetchRemotes ?? []) !== JSON.stringify(gitProfile.fetchRemotes) ||
+        raw.gitFetchHelpersBound !== gitProfile.fetchHelpersBound) {
+      fail("LEVEL3_MATERIAL_CHANGED");
+    }
+  }
   const allMaterials = [...new Set([...raw.materials, ...entries.materials])];
   if (allMaterials.length > MAX_LEVEL3_MATERIALS) fail("INVALID_ARGUMENTS");
   for (const materialInput of allMaterials) {
@@ -528,15 +791,33 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
   }
   normalizedMaterials.sort((a, b) => normPath(a.path).localeCompare(normPath(b.path)));
 
+  const snapshotMaterials = [...normalizedMaterials, ...(gitProfile?.configMaterials ?? [])];
+  snapshotMaterials.sort((a, b) => normPath(a.path).localeCompare(normPath(b.path)));
+  if (snapshotMaterials.length > MAX_LEVEL3_MATERIALS ||
+      snapshotMaterials.reduce((total, item) => total + item.sizeBytes, 0) > MAX_LEVEL3_TOTAL_MATERIAL_BYTES) {
+    fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+  }
+  const executionArgs = gitProfile ? [...gitProfile.safetyArgs, ...args] : args;
+  if (executionArgs.length > MAX_ARGUMENTS ||
+      executionArgs.reduce((sum, arg) => sum + Buffer.byteLength(arg, "utf8"), 0) > MAX_SPEC_TEXT_BYTES) {
+    fail("LEVEL3_EXECUTION_TARGET_UNVERIFIED");
+  }
+
   const spec: Level3Spec = raw.engine === "program"
     ? {
       engine: "program",
       repositoryPath: repository.workspaceRelativePath || ".",
       executable: executableMaterial.path,
-      args,
+      args: executionArgs,
       cwd: cwdInput.rel,
       timeoutSeconds: raw.timeoutSeconds,
       materials: normalizedMaterials.map((item) => item.relativePath),
+      ...(gitProfile ? {
+        gitSafetyArgs: gitProfile.safetyArgs,
+        gitConfigSafe: gitProfile.configSafe,
+        gitFetchRemotes: gitProfile.fetchRemotes,
+        gitFetchHelpersBound: gitProfile.fetchHelpersBound,
+      } : {}),
     }
     : {
       engine: raw.engine,
@@ -554,7 +835,7 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
     executableHash: executableMaterial.hash,
     cwd: cwd.path,
     cwdFileIdentity: cwd.fileIdentity,
-    materials: normalizedMaterials,
+    materials: snapshotMaterials,
   };
   spec.entryBinding = { kind: entries.hasUnresolvedSemantics ? "dynamic_code" : "literal_entries", uncertainties: entries.uncertainties };
   return {
@@ -565,9 +846,286 @@ function canonicalizeSpec(workspace: Workspace, raw: Level3Spec): {
   };
 }
 
+export type Level3RiskClass = "safe-development" | "needs-review" | "destructive-system";
+
+const HIGH_RISK_EXECUTABLES = new Set([
+  "bcdedit.exe", "cipher.exe", "diskpart.exe", "format.com", "manage-bde.exe",
+  "reg.exe", "regedit.exe", "sc.exe", "schtasks.exe", "shutdown.exe", "takeown.exe",
+  "vssadmin.exe",
+]);
+
+const SAFE_DEVELOPMENT_EXECUTABLES = new Set([
+  "cargo.exe", "clang.exe", "clang-cl.exe", "cl.exe", "cmake.exe", "corepack.exe",
+  "deno.exe", "dotnet.exe", "go.exe", "java.exe", "javac.exe", "link.exe", "msbuild.exe",
+  "ninja.exe", "node.exe", "npm.cmd", "npx.cmd", "pnpm.cmd", "python.exe", "python3.exe",
+  "py.exe", "rustc.exe", "tsx.cmd", "yarn.cmd",
+]);
+
+const GIT_WRITE_OR_DESTRUCTIVE_SUBCOMMANDS = new Set([
+  "add", "am", "apply", "bisect", "branch", "checkout", "cherry-pick", "clean", "clone", "commit",
+  "fetch", "gc", "merge", "mv", "pull", "push", "rebase", "reset", "restore", "revert", "rm",
+  "stash", "switch", "tag", "worktree",
+]);
+
+function executableName(value: string): string {
+  return path.basename(value).toLowerCase();
+}
+
+function containsDestructiveSystemIntent(text: string): boolean {
+  const value = text.toLowerCase();
+  const patterns = [
+    /(?:^|[\s;&|])shutdown(?:\.exe)?(?:\s|$)/,
+    /(?:^|[\s;&|])(?:restart-computer|stop-computer|set-executionpolicy)(?:\s|$)/,
+    /(?:^|[\s;&|])(?:format|diskpart|bcdedit|manage-bde|takeown|icacls)(?:\.exe)?(?:\s|$)/,
+    /(?:^|[\s;&|])reg(?:\.exe)?\s+(?:add|delete|import|load|restore|save|unload)(?:\s|$)/,
+    /(?:^|[\s;&|])sc(?:\.exe)?\s+(?:config|create|delete|start|stop)(?:\s|$)/,
+    /(?:^|[\s;&|])schtasks(?:\.exe)?\s+\/(?:change|create|delete|end|run)(?:\s|$)/,
+    /(?:^|[\s;&|])(?:remove-item|del|erase|rmdir|rd)(?:\s|$)/,
+    /(?:^|[\s;&|])vssadmin(?:\.exe)?\s+delete(?:\s|$)/,
+    /(?:^|[\s;&|])wevtutil(?:\.exe)?\s+cl(?:\s|$)/,
+  ];
+  return patterns.some((pattern) => pattern.test(value));
+}
+
+function safeGitBranchName(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(value) &&
+    !value.includes("..") && !value.includes("//") && !value.includes("@{") &&
+    !value.endsWith("/") && !value.endsWith(".") && !value.toLowerCase().endsWith(".lock");
+}
+
+function unsafeGitOption(value: string): boolean {
+  return /^-(?:c|C)(?:$|.+)/i.test(value) ||
+    /^--(?:config-env|git-dir|work-tree|exec-path|namespace)(?:=|$)/i.test(value) ||
+    /^--(?:ext-diff|textconv|no-index|output|pathspec-from-file|pathspec-file-nul|upload-pack|receive-pack|exec)(?:=|$)/i.test(value) ||
+    /^--no-verify$/i.test(value);
+}
+
+function gitWorktreeAddRequested(args: readonly string[]): boolean {
+  const takesValue = new Set(["-c", "-C", "--config-env", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
+  let index = 0;
+  while (index < args.length) {
+    const value = args[index]!;
+    if (value === "--") {
+      index += 1;
+      break;
+    }
+    if (takesValue.has(value)) {
+      index += 2;
+      continue;
+    }
+    if (/^-c.+/i.test(value) || /^-C.+/.test(value) ||
+        /^--(?:config-env|git-dir|work-tree|namespace|super-prefix)=/i.test(value) ||
+        value === "--exec-path" || value.startsWith("--exec-path=")) {
+      index += 1;
+      continue;
+    }
+    if (value.startsWith("-")) {
+      index += 1;
+      continue;
+    }
+    return value.toLowerCase() === "worktree" && args[index + 1]?.toLowerCase() === "add";
+  }
+  return args[index]?.toLowerCase() === "worktree" && args[index + 1]?.toLowerCase() === "add";
+}
+
+function gitAliasConfigOverrideRequested(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    let setting: string | undefined;
+    if (value === "-c") setting = args[index + 1];
+    else if (/^-c.+/i.test(value)) setting = value.slice(2);
+    else if (value === "--config-env") setting = args[index + 1]?.split("=", 1)[0];
+    else if (/^--config-env=/i.test(value)) setting = value.slice(value.indexOf("=") + 1).split("=", 1)[0];
+    if (setting && /^alias\./i.test(setting)) return true;
+  }
+  return false;
+}
+
+function classifyGitArgs(args: readonly string[], spec: Level3Spec, workspace?: Workspace): Level3RiskClass {
+  const prefix = spec.gitSafetyArgs;
+  if (!spec.gitConfigSafe || !Array.isArray(prefix) || args.length < prefix.length ||
+      prefix.some((value, index) => args[index] !== value)) return "needs-review";
+  const commandArgs = args.slice(prefix.length);
+  const subcommand = commandArgs[0];
+  if (!subcommand || subcommand.startsWith("-")) return "needs-review";
+  const after = commandArgs.slice(1);
+  if (after.some(unsafeGitOption)) return "needs-review";
+
+  // Read commands use fixed argument shapes. Complex commands such as grep,
+  // log, show, diff and cat-file can select external pagers, signature
+  // verifiers, filters, or nested helpers and always require local review.
+  if (subcommand === "status") {
+    return after.length === 0 ||
+      (after.length === 1 && ["--short", "--porcelain", "--porcelain=v1"].includes(after[0]!))
+      ? "safe-development"
+      : "needs-review";
+  }
+
+  if (subcommand === "rev-parse") {
+    return [["--show-toplevel"], ["--is-inside-work-tree"], ["--short", "HEAD"],
+      ["--abbrev-ref", "HEAD"], ["--verify", "HEAD"]]
+      .some((shape) => shape.length === after.length && shape.every((value, index) => value === after[index]))
+      ? "safe-development"
+      : "needs-review";
+  }
+
+  if (subcommand === "branch") {
+    if (after.length === 0 || (after.length === 1 && after[0] === "--list")) return "safe-development";
+    return after.length === 1 && safeGitBranchName(after[0]!) ? "safe-development" : "needs-review";
+  }
+
+  if (subcommand === "switch") {
+    if (after.length === 1 && safeGitBranchName(after[0]!)) return "safe-development";
+    if (after.length === 2 && after[0] === "-c" && safeGitBranchName(after[1]!)) return "safe-development";
+    return "needs-review";
+  }
+
+  if (subcommand === "worktree") {
+    if (after.length === 1 && after[0] === "list") return "safe-development";
+    return "needs-review";
+  }
+
+  if (subcommand === "add") {
+    const paths = after[0] === "--" ? after.slice(1) : [];
+    return paths.length > 0 && paths.every((value) => !value.startsWith("-") &&
+      repositoryPathArgumentIsSafe(workspace, spec, value))
+      ? "safe-development"
+      : "needs-review";
+  }
+
+  if (subcommand === "commit") {
+    return after.length === 2 && (after[0] === "-m" || after[0] === "--message") && after[1]!.length > 0
+      ? "safe-development"
+      : "needs-review";
+  }
+
+  if (subcommand === "fetch") {
+    return after.length === 1 && spec.gitFetchHelpersBound === true &&
+      spec.gitFetchRemotes?.includes(after[0]!.toLowerCase())
+      ? "safe-development"
+      : "needs-review";
+  }
+
+  // These narrow Git mutations have their own Level 3 path with a local enable
+  // switch, bound config/index/ref materials and hardened helper execution.
+  // Git Write policy and OAuth scopes remain independent.
+  if (GIT_WRITE_OR_DESTRUCTIVE_SUBCOMMANDS.has(subcommand)) return "needs-review";
+  return "needs-review";
+}
+
+function resolvePathExecutable(name: string): string | null {
+  const entries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean).slice(0, 1024);
+  for (const folder of entries) {
+    const candidate = path.resolve(folder, name);
+    try {
+      const canonical = pathWithoutReparsePoints(candidate);
+      const stat = fs.statSync(canonical);
+      if (stat.isFile()) return canonical;
+    } catch {
+      // Keep searching. Risk classification must fail closed if no trusted
+      // executable can be established from the Bridge process environment.
+    }
+  }
+  return null;
+}
+
+function trustedDevelopmentExecutable(spec: Level3Spec, workspace?: Workspace): boolean {
+  if (!workspace) return false;
+  if (isWithin(workspace.root, spec.executable)) return false;
+  const name = executableName(spec.executable);
+
+  if (name === "node.exe") {
+    try {
+      return normPath(pathWithoutReparsePoints(process.execPath)) === normPath(spec.executable);
+    } catch {
+      return false;
+    }
+  }
+
+  if (name === "git.exe") {
+    const expected = resolvePathExecutable("git.exe");
+    return expected !== null && normPath(expected) === normPath(spec.executable);
+  }
+
+  if (SAFE_DEVELOPMENT_EXECUTABLES.has(name)) {
+    const expected = resolvePathExecutable(name);
+    return expected !== null && normPath(expected) === normPath(spec.executable);
+  }
+
+  return false;
+}
+
+function hasBoundScript(spec: Level3Spec, workspace: Workspace | undefined, script: string): boolean {
+  if (!workspace || spec.engine !== "program" || spec.entryBinding?.kind !== "literal_entries") return false;
+  const absolute = path.resolve(workspace.root, spec.cwd, script);
+  if (!isWithin(workspace.root, absolute)) return false;
+  const relative = path.relative(workspace.root, absolute).split(path.sep).join("/");
+  return spec.materials.some((material) => normPath(material.replace(/\\/g, "/")) === normPath(relative));
+}
+
+function classifyDevelopmentProgramArgs(
+  name: string,
+  spec: Level3Spec,
+  workspace?: Workspace,
+): Level3RiskClass {
+  if (spec.engine !== "program") return "needs-review";
+  const args = spec.args;
+  if (args.length === 1 && ["--version", "-version", "-v", "--help", "-h"].includes(args[0]!.toLowerCase())) {
+    return "safe-development";
+  }
+  if (name === "node.exe") {
+    if (args.length === 2 && args[0] === "--check" &&
+        /\.(?:js|mjs|cjs|ts|mts|cts)$/i.test(args[1]!) && hasBoundScript(spec, workspace, args[1]!)) {
+      return "safe-development";
+    }
+  }
+  // Executable scripts, test discovery, build graphs and module preloads can
+  // run arbitrary project code. Their names and entry files alone do not prove
+  // the full execution graph or effects, so keep them on local review.
+  return "needs-review";
+}
+
+/**
+ * Local risk classifier for the V1.3.2 Level 3 fast path.
+ *
+ * Auto-authorization requires two independent properties:
+ * 1. the command shape is recognizable as normal development activity, and
+ * 2. the executable is the Bridge process' canonical PATH/runtime executable,
+ *    not a repository-controlled same-name binary.
+ *
+ * Unknown/dynamic commands fail closed to local review. Obvious
+ * host-destructive commands are always marked destructive-system.
+ */
+export function classifyLevel3Spec(spec: Level3Spec, workspace?: Workspace): Level3RiskClass {
+  const name = executableName(spec.executable);
+  const text = spec.engine === "program"
+    ? [name, ...spec.args].join(" ")
+    : [name, spec.command].join(" ");
+
+  if (HIGH_RISK_EXECUTABLES.has(name) || containsDestructiveSystemIntent(text)) {
+    return "destructive-system";
+  }
+
+  if (spec.entryBinding?.kind === "dynamic_code" || (spec.entryBinding?.uncertainties.length ?? 0) > 0) {
+    return "needs-review";
+  }
+
+  // Shell text is a script language, even when its first token looks like a
+  // harmless builtin. Keep CMD/PowerShell under local review until the entire
+  // command is parsed and every statement/material can be bound.
+  if (spec.engine !== "program") return "needs-review";
+
+  let intent: Level3RiskClass = "needs-review";
+  if (name === "git.exe") intent = classifyGitArgs(spec.args, spec, workspace);
+  else if (SAFE_DEVELOPMENT_EXECUTABLES.has(name)) intent = classifyDevelopmentProgramArgs(name, spec, workspace);
+  if (intent !== "safe-development") return intent;
+  return trustedDevelopmentExecutable(spec, workspace) ? "safe-development" : "needs-review";
+}
+
 function digestRequest(input: {
   workspaceId: string;
   clientId: string;
+  riskPolicyVersion: number;
   repositoryPath: string;
   repositoryIdentity: string;
   spec: Level3Spec;
@@ -576,6 +1134,7 @@ function digestRequest(input: {
   return hashBytes(JSON.stringify([
     input.workspaceId,
     input.clientId,
+    input.riskPolicyVersion,
     input.repositoryPath,
     input.repositoryIdentity,
     input.spec.engine,
@@ -675,7 +1234,8 @@ function verifyRequestBinding(record: Level3RequestRecord, clientId: string, dig
 }
 
 function currentSnapshot(workspace: Workspace, record: Level3RequestRecord): Level3ExecutionSnapshot {
-  const current = canonicalizeSpec(workspace, record.spec);
+  if (record.riskPolicyVersion !== LEVEL3_RISK_POLICY_VERSION) fail("LEVEL3_MATERIAL_CHANGED");
+  const current = canonicalizeSpec(workspace, record.spec, true);
   if (current.repositoryIdentity !== record.repositoryIdentity || current.repositoryPath !== record.repositoryPath) {
     fail("LEVEL3_REPOSITORY_CHANGED");
   }
@@ -684,12 +1244,14 @@ function currentSnapshot(workspace: Workspace, record: Level3RequestRecord): Lev
     // approval status when the current binder discovers unresolved semantics.
     fail("LEVEL3_MATERIAL_CHANGED");
   }
+  if (record.riskClass !== classifyLevel3Spec(current.spec, workspace)) fail("LEVEL3_MATERIAL_CHANGED");
   if (JSON.stringify(current.snapshot) !== JSON.stringify(record.snapshot)) fail("LEVEL3_MATERIAL_CHANGED");
   return current.snapshot;
 }
 
 function toManifest(record: Level3RequestRecord): Level3Manifest {
-  if (!record.approvalId || !record.risk || !record.approvedAt || !record.launchExpiresAt) fail("LEVEL3_STORE_CORRUPT");
+  if (!record.approvalId || !record.risk || !record.approvedAt || !record.launchExpiresAt ||
+      record.riskPolicyVersion !== LEVEL3_RISK_POLICY_VERSION) fail("LEVEL3_STORE_CORRUPT");
   return {
     version: 1,
     workspaceId: record.workspaceId,
@@ -698,6 +1260,7 @@ function toManifest(record: Level3RequestRecord): Level3Manifest {
     clientId: record.clientId,
     digest: record.digest,
     risk: record.risk,
+    riskPolicyVersion: record.riskPolicyVersion,
     allowSystem: record.allowSystem,
     allowDynamic: record.allowDynamic === true,
     repositoryPath: record.repositoryPath,
@@ -750,6 +1313,58 @@ function toGenericCommand(record: Level3RequestRecord, manifest: {
   return command;
 }
 
+function approveRecord(
+  workspace: Workspace,
+  record: Level3RequestRecord,
+  expectedDigest: string,
+  options: { risk: Level3Risk; allowSystem?: true; allowDynamic?: true },
+): Level3RequestRecord {
+  if (record.riskPolicyVersion !== LEVEL3_RISK_POLICY_VERSION) fail("LEVEL3_MATERIAL_CHANGED");
+  const riskClass = classifyLevel3Spec(record.spec, workspace);
+  if (record.riskClass !== riskClass) fail("LEVEL3_MATERIAL_CHANGED");
+  if (riskClass === "destructive-system" &&
+      (options.risk !== "destructive-system" || options.allowSystem !== true)) {
+    fail("LEVEL3_RISK_APPROVAL_REQUIRED");
+  }
+  if (options.risk === "destructive-system" && options.allowSystem !== true) {
+    fail("LEVEL3_RISK_APPROVAL_REQUIRED");
+  }
+  if (options.risk === "development" && options.allowSystem === true) {
+    fail("INVALID_ARGUMENTS");
+  }
+  if (record.spec.entryBinding?.kind === "dynamic_code" && options.allowDynamic !== true) {
+    fail("LEVEL3_RISK_APPROVAL_REQUIRED");
+  }
+
+  verifyRequestBinding(record, record.clientId, expectedDigest);
+  currentSnapshot(workspace, record);
+
+  const approvedAt = new Date().toISOString();
+  const launchExpiresAt = new Date(Date.now() + LEVEL3_REQUEST_TTL_MS).toISOString();
+  record.status = "approved";
+  record.risk = options.risk;
+  record.allowSystem = options.allowSystem === true;
+  record.allowDynamic = options.allowDynamic === true;
+  record.approvalId = randomBytes(24).toString("base64url");
+  record.approvedAt = approvedAt;
+  record.launchExpiresAt = launchExpiresAt;
+  record.manifestPath = manifestFile(workspace.id, record.requestId);
+  const bytes = Buffer.from(JSON.stringify(toManifest(record)), "utf8");
+  try {
+    fs.writeFileSync(record.manifestPath, bytes, { mode: 0o600, flag: "wx" });
+    try { fs.chmodSync(record.manifestPath, 0o600); } catch { /* best effort on Windows */ }
+  } catch {
+    record.status = "failed";
+    record.finishedAt = new Date().toISOString();
+    fail("LEVEL3_STORE_CORRUPT");
+  }
+  const material = hashRegularFile(record.manifestPath);
+  record.manifestFileIdentity = material.fileIdentity;
+  record.manifestHash = material.hash;
+  fs.writeFileSync(`${record.manifestPath}.permit`, material.hash, { mode: 0o600, flag: "wx" });
+  return record;
+}
+
 function assertRequestListLimit(limit: number): void {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LEVEL3_PENDING_REQUESTS) fail("INVALID_ARGUMENTS");
 }
@@ -767,6 +1382,7 @@ function preview(record: Level3RequestRecord): Level3RequestPreview {
     expiresAt: record.expiresAt,
     digest: record.digest,
     risk: record.risk,
+    riskClass: record.riskClass ?? classifyLevel3Spec(record.spec),
   };
 }
 
@@ -805,13 +1421,19 @@ export function isLevel3Enabled(workspaceId: string): boolean {
   try { return readState(workspaceId).enabled; } catch { return false; }
 }
 
-/** Remote-facing call: create a pending request only. No execution authority is returned. */
+/**
+ * Remote-facing call. V1.3.2 auto-authorizes only materially bound commands
+ * classified as safe-development. Review/destructive commands remain inert
+ * pending requests until the local user approves them.
+ */
 export function createLevel3Request(workspace: Workspace, clientId: string, rawSpec: Level3Spec): Level3RequestReceipt {
   if (!workspace || !validClientId(clientId)) fail("INVALID_ARGUMENTS");
   const normalized = canonicalizeSpec(workspace, rawSpec);
+  const riskClass = classifyLevel3Spec(normalized.spec, workspace);
   const digest = digestRequest({
     workspaceId: workspace.id,
     clientId,
+    riskPolicyVersion: LEVEL3_RISK_POLICY_VERSION,
     repositoryPath: normalized.repositoryPath,
     repositoryIdentity: normalized.repositoryIdentity,
     spec: normalized.spec,
@@ -834,6 +1456,8 @@ export function createLevel3Request(workspace: Workspace, clientId: string, rawS
     createdAt: now,
     expiresAt,
     risk: null,
+    riskClass,
+    riskPolicyVersion: LEVEL3_RISK_POLICY_VERSION,
     allowSystem: false,
     approvalId: null,
     approvedAt: null,
@@ -848,11 +1472,23 @@ export function createLevel3Request(workspace: Workspace, clientId: string, rawS
   withStateTransaction(workspace.id, (state) => {
     if (!state.enabled) fail("LEVEL3_DISABLED");
     ensureHistoryCapacity(state);
-    const pending = state.requests.filter((item) => item.status === "pending" && !recordExpired(item, nowMs)).length;
-    if (pending >= MAX_LEVEL3_PENDING_REQUESTS) fail("LEVEL3_STORE_FULL");
+    const active = state.requests.filter((item) =>
+      (item.status === "pending" || item.status === "approved") && !recordExpired(item, nowMs)).length;
+    if (active >= MAX_LEVEL3_PENDING_REQUESTS) fail("LEVEL3_STORE_FULL");
     state.requests.push(record);
+    if (riskClass === "safe-development") {
+      approveRecord(workspace, record, digest, { risk: "development" });
+    }
   });
-  return { requestId, digest, status: "pending", expiresAt };
+  return {
+    requestId,
+    digest,
+    status: record.status === "approved" ? "approved" : "pending",
+    expiresAt,
+    launchExpiresAt: record.launchExpiresAt,
+    approvalRequired: record.status !== "approved",
+    riskClass,
+  };
 }
 
 /** Local CLI only: full record includes material hashes and protected manifest path. */
@@ -882,7 +1518,7 @@ export function getLevel3RequestPreview(workspaceId: string, requestId: string, 
   return record?.clientId === clientId ? preview(record) : null;
 }
 
-/** Local CLI only. Risk classification is a local decision, never accepted from the remote spec. */
+/** Local CLI only. The remote caller cannot downgrade the local risk classifier. */
 export function approveLevel3Request(
   workspace: Workspace,
   requestId: string,
@@ -892,42 +1528,13 @@ export function approveLevel3Request(
 ): Level3RequestRecord {
   if (localApproval !== true || !workspace || !/^[A-Za-z0-9_-]{24,64}$/.test(requestId) || !isSha256(expectedDigest) ||
       !options || (options.risk !== "development" && options.risk !== "destructive-system")) fail("INVALID_ARGUMENTS");
-  if (options.risk === "destructive-system" && options.allowSystem !== true) fail("LEVEL3_RISK_APPROVAL_REQUIRED");
-  if (options.risk === "development" && options.allowSystem === true) fail("INVALID_ARGUMENTS");
   return withStateTransaction(workspace.id, (state) => {
     if (!state.enabled) fail("LEVEL3_DISABLED");
     const record = findRequest(state, requestId);
     if (record.digest !== expectedDigest) fail("LEVEL3_DIGEST_MISMATCH");
     if (record.status === "expired" || recordExpired(record, Date.now())) fail("LEVEL3_REQUEST_EXPIRED");
     if (record.status !== "pending") fail("LEVEL3_REQUEST_NOT_PENDING");
-    if (record.spec.entryBinding?.kind === "dynamic_code" && options.allowDynamic !== true) fail("LEVEL3_RISK_APPROVAL_REQUIRED");
-    verifyRequestBinding(record, record.clientId, expectedDigest);
-    currentSnapshot(workspace, record);
-    const approvedAt = new Date().toISOString();
-    const launchExpiresAt = new Date(Date.now() + LEVEL3_REQUEST_TTL_MS).toISOString();
-    const approvalId = randomBytes(24).toString("base64url");
-    record.status = "approved";
-    record.risk = options.risk;
-    record.allowSystem = options.allowSystem === true;
-    record.allowDynamic = options.allowDynamic === true;
-    record.approvalId = approvalId;
-    record.approvedAt = approvedAt;
-    record.launchExpiresAt = launchExpiresAt;
-    record.manifestPath = manifestFile(workspace.id, requestId);
-    const bytes = Buffer.from(JSON.stringify(toManifest(record)), "utf8");
-    try {
-      fs.writeFileSync(record.manifestPath, bytes, { mode: 0o600, flag: "wx" });
-      try { fs.chmodSync(record.manifestPath, 0o600); } catch { /* best effort on Windows */ }
-    } catch {
-      record.status = "failed";
-      record.finishedAt = new Date().toISOString();
-      fail("LEVEL3_STORE_CORRUPT");
-    }
-    const material = hashRegularFile(record.manifestPath);
-    record.manifestFileIdentity = material.fileIdentity;
-    record.manifestHash = material.hash;
-    fs.writeFileSync(`${record.manifestPath}.permit`, material.hash, { mode: 0o600, flag: "wx" });
-    return record;
+    return approveRecord(workspace, record, expectedDigest, options);
   });
 }
 

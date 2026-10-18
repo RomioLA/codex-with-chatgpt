@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Command } from "commander";
 import { Workspace } from "../workspace/manager.js";
-import { setLevel3Enabled, isLevel3Enabled, listLevel3Requests, getLevel3Request, getLevel3RequestPreview, approveLevel3Request, revokeLevel3Request, type Level3Risk } from "../execution/level3-approval.js";
+import { classifyLevel3Spec, setLevel3Enabled, isLevel3Enabled, listLevel3Requests, getLevel3Request, getLevel3RequestPreview, approveLevel3Request, revokeLevel3Request, type Level3Risk } from "../execution/level3-approval.js";
 import { approveGitRepository, previewGitRepositoryApproval, listGitRepositoryApprovals, revokeGitRepositoryApproval, type ApproveGitRepositoryInput } from "../git-write/index.js";
 import { previewGitReview, acknowledgeGitReview } from "../execution/git-review-hold.js";
 
@@ -16,14 +16,14 @@ function common(command: Command): Command { return command.option("-w, --worksp
 
 /** Local-only authority: these functions are never registered with MCP. */
 export function registerV13Cli(program: Command): void {
-  const level3 = program.command("level3").description("Individually approve exact commands; cwd is not an OS sandbox");
+  const level3 = program.command("level3").description("Persistent local command execution: safe-development auto-runs; high-risk or uncertain commands require review; cwd is not an OS sandbox");
   common(level3.command("status")).action(guarded((opts: Options) => {
     const ws = workspace(opts);
     return { ok: true, workspaceId: ws.id, enabled: isLevel3Enabled(ws.id) };
   }));
   for (const enabled of [true, false]) {
     const command = common(level3.command(enabled ? "enable" : "disable"));
-    if (enabled) command.requiredOption("--approve", "explicitly enable the separate Level 3 approval workflow");
+    if (enabled) command.requiredOption("--approve", "explicitly enable the separate Level 3 execution workflow");
     command.action(guarded((opts: Options) => {
       const ws = workspace(opts); setLevel3Enabled(ws.id, enabled, true);
       return { ok: true, workspaceId: ws.id, enabled: isLevel3Enabled(ws.id) };
@@ -32,13 +32,17 @@ export function registerV13Cli(program: Command): void {
   common(level3.command("list")).action(guarded((opts: Options) => {
     const ws = workspace(opts);
     return { ok: true, workspaceId: ws.id, requests: listLevel3Requests(ws.id).map((r) => ({ requestId: r.requestId,
-      digest: r.digest, clientId: r.clientId, repositoryPath: r.repositoryPath, status: r.status, expiresAt: r.expiresAt })) };
+      digest: r.digest, clientId: r.clientId, repositoryPath: r.repositoryPath, status: r.status, expiresAt: r.expiresAt,
+      launchExpiresAt: r.launchExpiresAt, riskClass: r.riskClass ?? classifyLevel3Spec(r.spec, ws),
+      approvalRequired: r.status === "pending" })) };
   }));
   common(level3.command("inspect").requiredOption("--request <id>")).action(guarded((opts: Options & { request: string }) => {
     const ws = workspace(opts); const record = getLevel3Request(ws.id, opts.request);
     const request = record ? getLevel3RequestPreview(ws.id, opts.request, record.clientId) : null;
     if (!request) throw new Error("LEVEL3_REQUEST_NOT_FOUND");
-    return { ok: true, workspaceId: ws.id, request, warning: "Review the entire command and materials. Approved programs run as this Windows user and can access resources beyond cwd. Only the exact request digest is approved." };
+    return { ok: true, workspaceId: ws.id, request, warning: request.status === "pending"
+      ? "This command requires local review. Review the entire command and materials. Approved programs run as this Windows user and can access resources beyond cwd."
+      : "This request is already authorized. Safe-development commands may be auto-authorized, but cwd is still not an OS sandbox and exact material/identity checks remain enforced." };
   }));
   common(level3.command("approve").requiredOption("--request <id>").requiredOption("--digest <sha256>")
     .requiredOption("--risk <risk>", "development or destructive-system")

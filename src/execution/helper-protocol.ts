@@ -1,8 +1,11 @@
-import type { ExecutionKind, PackageManager, OutputStream } from "./job-types.js";
+import type { ExecutionKind, FullAccessCommand, PackageManager, OutputStream } from "./job-types.js";
 import path from "node:path";
 
-const REQUEST_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x35, 0x00]); // C2CJOB5\0
-const RESPONSE_MAGIC = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x35, 0x00]); // C2COUT5\0
+const REQUEST_MAGIC_V5 = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x35, 0x00]); // C2CJOB5\0
+const RESPONSE_MAGIC_V5 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x35, 0x00]); // C2COUT5\0
+const REQUEST_MAGIC_V7 = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x37, 0x00]); // C2CJOB7\0
+const RESPONSE_MAGIC_V7 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x37, 0x00]); // C2COUT7\0
+export const EXECUTION_HELPER_PROTOCOL_VERSION = 7;
 export const HELPER_CANCEL_BYTE = 0x01;
 export const MAX_HELPER_STRING_BYTES = 128 * 1024;
 export const MAX_HELPER_FRAME_BYTES = 64 * 1024;
@@ -81,6 +84,25 @@ export interface HelperRequest {
   gitEntryHash: string;
   packageJsonHash: string;
   genericCommand?: GenericCommand;
+}
+
+export interface FullAccessHelperRequest {
+  timeoutSeconds: number;
+  workspaceId: string;
+  jobId: string;
+  oauthClientId: string;
+  permissionMode: "level2";
+  sessionGrantFingerprint: string;
+  sessionGrantId: string;
+  idempotencyKeyHash: string;
+  requestHash: string;
+  command: FullAccessCommand;
+  tempRootPath: string;
+  tempRootFileIdentity: string;
+  tempNonce: string;
+  tempCreatedAtMs: number;
+  jobTempDir: string;
+  jobTempFileIdentity: string;
 }
 
 export interface TempCleanupRequest {
@@ -213,7 +235,7 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
   tail.writeUInt32LE(request.timeoutSeconds, 4);
   const gitEntryKind = Buffer.from([request.gitEntryType === "file" ? 1 : 2]);
   const base = [
-    REQUEST_MAGIC,
+    REQUEST_MAGIC_V5,
     fixed,
     tail,
     encodeString(request.cwd),
@@ -294,6 +316,79 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
   ]);
 }
 
+export function serializeFullAccessHelperRequest(request: FullAccessHelperRequest): Buffer {
+  if (!Number.isInteger(request.timeoutSeconds) || request.timeoutSeconds < 1 || request.timeoutSeconds > 3600 ||
+      request.permissionMode !== "level2" ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(request.workspaceId) ||
+      !/^[A-Za-z0-9_-]{24,64}$/.test(request.jobId) ||
+      typeof request.oauthClientId !== "string" || request.oauthClientId.length < 1 || request.oauthClientId.length > 200 ||
+      !/^[a-f0-9]{64}$/.test(request.sessionGrantFingerprint) ||
+      !/^[a-f0-9]{64}$/.test(request.sessionGrantId) ||
+      !/^[a-f0-9]{64}$/.test(request.idempotencyKeyHash) ||
+      !/^[a-f0-9]{64}$/.test(request.requestHash) ||
+      !/^[a-f0-9]+:[a-f0-9]+$/i.test(request.tempRootFileIdentity) ||
+      !/^[a-f0-9]+:[a-f0-9]+$/i.test(request.jobTempFileIdentity) ||
+      !/^[a-f0-9]{64}$/i.test(request.tempNonce) ||
+      !Number.isSafeInteger(request.tempCreatedAtMs) || request.tempCreatedAtMs < 0) {
+    throw new TypeError("Invalid Full Access execution context");
+  }
+  const command = request.command;
+  if (!path.win32.isAbsolute(command.cwd) || command.cwd.includes("\0") ||
+      !/^[a-f0-9]+:[a-f0-9]+$/i.test(command.cwdFileIdentity) ||
+      !path.win32.isAbsolute(command.executable) || command.executable.includes("\0") ||
+      !/^[a-f0-9]+:[a-f0-9]+$/i.test(command.executableFileIdentity) ||
+      !/^[a-f0-9]{64}$/i.test(command.executableHash)) {
+    throw new TypeError("Invalid Full Access launch material");
+  }
+  const mode = command.engine === "program" ? 1 : command.engine === "cmd" ? 2 : 3;
+  const args = command.engine === "program" ? command.args : [];
+  const commandText = command.engine === "program" ? "" : command.command;
+  if (!Array.isArray(args) || args.length > 256 ||
+      args.some((argument) => typeof argument !== "string" || argument.includes("\0")) ||
+      (command.engine === "program" ? commandText !== "" : commandText.length === 0 || commandText.includes("\0"))) {
+    throw new TypeError("Invalid Full Access command shape");
+  }
+
+  const fixed = Buffer.alloc(4);
+  fixed.writeUInt16LE(EXECUTION_HELPER_PROTOCOL_VERSION, 0);
+  fixed.writeUInt8(3, 2); // host execution context
+  fixed.writeUInt8(0, 3); // no package manager
+  const tail = Buffer.alloc(8);
+  tail.writeUInt8(0, 0); // no recipe kind
+  tail.writeUInt8(0, 1);
+  tail.writeUInt16LE(0, 2);
+  tail.writeUInt32LE(request.timeoutSeconds, 4);
+  const modeByte = Buffer.from([mode]);
+  const argumentCount = Buffer.alloc(4);
+  argumentCount.writeUInt32LE(args.length);
+  const fields = [
+    encodeString(request.workspaceId),
+    encodeString(request.jobId),
+    encodeString(request.oauthClientId),
+    encodeString(request.permissionMode),
+    encodeString(request.sessionGrantFingerprint),
+    encodeString(request.sessionGrantId),
+    encodeString(request.idempotencyKeyHash),
+    encodeString(request.requestHash),
+    modeByte,
+    encodeString(command.executable),
+    encodeString(command.executableFileIdentity),
+    encodeString(command.executableHash),
+    argumentCount,
+    ...args.map((argument) => encodeString(argument, true)),
+    encodeString(commandText, true),
+    encodeString(command.cwd),
+    encodeString(command.cwdFileIdentity),
+    encodeString(request.tempRootPath),
+    encodeString(request.tempRootFileIdentity),
+    encodeString(request.tempNonce),
+    encodeString(String(request.tempCreatedAtMs)),
+    encodeString(request.jobTempDir),
+    encodeString(request.jobTempFileIdentity),
+  ];
+  return Buffer.concat([REQUEST_MAGIC_V7, fixed, tail, ...fields]);
+}
+
 function isPrefix(buffer: Buffer, expected: Buffer): boolean {
   return buffer.length <= expected.length && buffer.equals(expected.subarray(0, buffer.length));
 }
@@ -310,14 +405,20 @@ export class HelperOutputDecoder {
   private headerSeen = false;
   private resultSeen = false;
 
+  constructor(private readonly expectedProtocolVersion?: 5 | 7) {}
+
   push(chunk: Buffer): HelperFrame[] {
     if (this.resultSeen && chunk.byteLength > 0) throw new Error("HELPER_PROTOCOL_TRAILING_DATA");
     this.pending = Buffer.concat([this.pending, chunk]);
     const frames: HelperFrame[] = [];
     if (!this.headerSeen) {
-      if (!isPrefix(this.pending, RESPONSE_MAGIC)) throw new Error("HELPER_PROTOCOL_BAD_HEADER");
-      if (this.pending.byteLength < RESPONSE_MAGIC.byteLength) return frames;
-      this.pending = this.pending.subarray(RESPONSE_MAGIC.byteLength);
+      const candidates = this.expectedProtocolVersion === 5 ? [RESPONSE_MAGIC_V5]
+        : this.expectedProtocolVersion === 7 ? [RESPONSE_MAGIC_V7]
+          : [RESPONSE_MAGIC_V5, RESPONSE_MAGIC_V7];
+      const matched = candidates.find((magic) => isPrefix(this.pending, magic));
+      if (!matched) throw new Error("HELPER_PROTOCOL_BAD_HEADER");
+      if (this.pending.byteLength < matched.byteLength) return frames;
+      this.pending = this.pending.subarray(matched.byteLength);
       this.headerSeen = true;
     }
     while (this.pending.byteLength >= 5) {

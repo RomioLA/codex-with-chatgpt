@@ -7,7 +7,7 @@ import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
-import { createMcpHttpHandler } from "../mcp/http.js";
+import { createMcpHttpHandler, safeToolName } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
@@ -19,6 +19,12 @@ import { probeBridge, writeRuntimeState, clearRuntimeState, type RuntimeState } 
 import { acquireBridgeInstanceLock, type BridgeInstanceLock } from "./instance-lock.js";
 import { ensurePermissionMigrated, readPermission } from "../permission/index.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../execution/supervisor.js";
+import {
+  eventLoopTraceMiddleware,
+  getEventLoopTraceSnapshot,
+  isEventLoopTraceEnabled,
+  recordEventLoopTrace,
+} from "../diagnostics/event-loop-trace.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -119,6 +125,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const app = express();
   app.set("trust proxy", true);
   app.disable("x-powered-by");
+  if (isEventLoopTraceEnabled()) app.use(eventLoopTraceMiddleware);
 
   const localBaseUrl = (): string => `http://${host === "::1" ? "[::1]" : host}:${port}`;
   // OAuth discovery and challenges share the trusted tunnel/bind authority.
@@ -128,6 +135,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- Health (public but minimal) ---------------------------------------
 
   app.get("/health", (_req, res) => {
+    if (isEventLoopTraceEnabled()) recordEventLoopTrace("handler_start");
     res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
   });
 
@@ -160,6 +168,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     express.json({ limit: "8mb" }),
     bearerAuth({ store: authStore, workspaceId: workspace.id, getBaseUrl, logger }),
     (req: Request, res: Response) => {
+      if (isEventLoopTraceEnabled()) {
+        const toolName = safeToolName(req.body);
+        recordEventLoopTrace("auth_done", toolName ? { toolName } : {});
+      }
       void mcpHandler(req, res);
     }
   );
@@ -179,6 +191,12 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }
     next();
   };
+
+  if (isEventLoopTraceEnabled()) {
+    app.get("/admin/event-loop-trace", adminGuard, (_req, res) => {
+      res.json(getEventLoopTraceSnapshot());
+    });
+  }
 
   app.post("/admin/pairing", adminGuard, (_req, res) => {
     const session = pairing.create();
