@@ -302,10 +302,15 @@ describe("autostart transactional registration", () => {
     const xml = saved!.subarray(2).toString("utf16le");
     const runtimeRoot = path.resolve(path.dirname(f.cliPath), "..", "..");
     const commandProcessorPath = path.join(process.env.SystemRoot ?? process.env.WINDIR!, "System32", "cmd.exe");
-    expect(xml).toContain(`<LogonTrigger><Enabled>true</Enabled><UserId>${userSid}</UserId></LogonTrigger>`);
-    expect(xml).toContain(`<UserId>${userSid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>`);
+    const expectTaskContract = (taskXml: string): void => {
+      expect(taskXml).toContain(`<LogonTrigger><Enabled>true</Enabled><UserId>${userSid}</UserId></LogonTrigger>`);
+      expect(taskXml).toContain(`<UserId>${userSid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>`);
+      expect(taskXml).toContain("<StartWhenAvailable>true</StartWhenAvailable>");
+      expect(taskXml).toMatch(/<RestartOnFailure>\s*<Interval>PT1M<\/Interval>\s*<Count>3<\/Count>\s*<\/RestartOnFailure>/);
+      expect(taskXml).toContain("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>");
+    };
+    expectTaskContract(xml);
     expect(xml.match(/<Command>([\s\S]*?)<\/Command>/i)?.[1]?.toLowerCase()).toBe(commandProcessorPath.toLowerCase());
-    expect(xml).toContain("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>");
     expect(xml).toContain("<ExecutionTimeLimit>PT3M</ExecutionTimeLimit>");
     expect(xml).toContain("<WorkingDirectory>");
     expect(xml).toContain(`${runtimeRoot}\\assets\\c2c-autostart-task.cmd`);
@@ -325,6 +330,13 @@ describe("autostart transactional registration", () => {
     expect(payload).not.toHaveProperty("command");
     expect(payload).not.toHaveProperty("arguments");
     expect(payload).not.toHaveProperty("nodePath");
+
+    // Re-enabling an existing registration replaces its task XML via /Create /F.
+    runtime.service.enable(f.workspaceRoot);
+    const updated = taskDefinitions.get(f.registration.taskName);
+    expect(updated).toBeDefined();
+    expectTaskContract(updated!.subarray(2).toString("utf16le"));
+    expect(taskEvents.filter((event) => event.operation === "create" && event.taskName === f.registration.taskName)).toHaveLength(2);
   });
 
   it("restores the complete old Scheduled Task XML when an update cannot publish its registration", () => {
