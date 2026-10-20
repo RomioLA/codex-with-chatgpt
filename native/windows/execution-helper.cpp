@@ -3374,10 +3374,11 @@ bool AtomicResult(const std::string& payload, DWORD& error) {
 
 bool AtomicOpen(const std::wstring& path, UniqueHandle& handle, DWORD& error,
                 DWORD desiredAccess = GENERIC_READ | READ_CONTROL,
-                DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_DELETE) {
+                DWORD shareMode = FILE_SHARE_READ | FILE_SHARE_DELETE,
+                DWORD extraFlags = 0) {
     for (DWORD attempt = 0; attempt <= 10; ++attempt) {
         handle.reset(CreateFileW(path.c_str(), desiredAccess, shareMode, nullptr,
-            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+            OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | extraFlags, nullptr));
         if (handle.valid()) break;
         error = GetLastError();
         if ((error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) || attempt == 10) {
@@ -3508,7 +3509,8 @@ int RunAtomicReplace(const std::wstring& destination, const std::wstring& source
     UniqueHandle replacement;
     if (!AtomicOpen(canonicalSource, replacement, error,
                     GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE | WRITE_DAC,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)) {
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_FLAG_WRITE_THROUGH)) {
         AtomicResult("ERROR|" + std::to_string(error) + "|final-validation|0|" +
             std::to_string(ElapsedMicroseconds(validationStart)) + "|0", error);
         return 0;
@@ -3594,6 +3596,132 @@ int RunAtomicReplace(const std::wstring& destination, const std::wstring& source
     return 0;
 }
 
+bool ValidateDurablePublishPaths(const std::wstring& destination, const std::wstring& source,
+                                std::wstring& canonicalDestination,
+                                std::wstring& canonicalSource, DWORD& error) {
+    if (destination.empty() || destination.size() > 32760 ||
+        !IsAsciiDriveAbsolutePath(destination) ||
+        destination.find(L'/') != std::wstring::npos || destination.back() == L'\\') {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
+    const DWORD needed = GetFullPathNameW(destination.c_str(), 0, nullptr, nullptr);
+    if (needed == 0 || needed > 32760) {
+        error = needed == 0 ? GetLastError() : ERROR_FILENAME_EXCED_RANGE;
+        return false;
+    }
+    std::vector<wchar_t> fullBuffer(static_cast<size_t>(needed) + 1, L'\0');
+    const DWORD fullLength = GetFullPathNameW(destination.c_str(),
+        static_cast<DWORD>(fullBuffer.size()), fullBuffer.data(), nullptr);
+    if (fullLength == 0 || fullLength >= fullBuffer.size() ||
+        CompareStringOrdinal(destination.c_str(), -1, fullBuffer.data(), -1, TRUE) != CSTR_EQUAL) {
+        error = fullLength == 0 ? GetLastError() : ERROR_INVALID_NAME;
+        return false;
+    }
+    const std::wstring leaf = PathBasename(destination);
+    if (leaf.empty() || leaf == L"." || leaf == L".." || leaf.back() == L'.' || leaf.back() == L' ' ||
+        leaf.find_first_of(L"<>:\"|?*") != std::wstring::npos) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
+    const std::wstring requestedParent = ParentDirectory(destination);
+    std::wstring canonicalParent;
+    if (!ValidateCanonicalPath(requestedParent, true, canonicalParent, error) ||
+        !ValidateCanonicalPath(source, false, canonicalSource, error) ||
+        !SameOrdinal(ParentDirectory(canonicalSource), canonicalParent)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_NAME;
+        return false;
+    }
+    canonicalDestination = canonicalParent;
+    if (canonicalDestination.back() != L'\\') canonicalDestination.push_back(L'\\');
+    canonicalDestination += leaf;
+
+    const DWORD attributes = GetFileAttributesW(canonicalDestination.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD attributeError = GetLastError();
+        if (attributeError != ERROR_FILE_NOT_FOUND && attributeError != ERROR_PATH_NOT_FOUND) {
+            error = attributeError;
+            return false;
+        }
+    } else if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+               (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        error = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? ERROR_DIRECTORY : ERROR_REPARSE_TAG_INVALID;
+        return false;
+    }
+
+    wchar_t volumeRoot[MAX_PATH]{};
+    wchar_t fileSystem[MAX_PATH]{};
+    if (!GetVolumePathNameW(canonicalSource.c_str(), volumeRoot, MAX_PATH) ||
+        !GetVolumeInformationW(volumeRoot, nullptr, 0, nullptr, nullptr, nullptr, fileSystem, MAX_PATH)) {
+        error = GetLastError();
+        return false;
+    }
+    if (GetDriveTypeW(volumeRoot) != DRIVE_FIXED || !SameOrdinal(fileSystem, L"NTFS")) {
+        error = ERROR_NOT_SUPPORTED;
+        return false;
+    }
+    return true;
+}
+
+int RunDurableAtomicPublish(const std::wstring& destination, const std::wstring& source,
+                            const std::wstring& expectedNewHash) {
+    const auto validationStart = std::chrono::steady_clock::now();
+    DWORD error = ERROR_SUCCESS;
+    if (!IsHex(expectedNewHash, 64)) {
+        AtomicResult("ERROR|87|preflight|0", error);
+        return 0;
+    }
+    std::wstring canonicalDestination;
+    std::wstring canonicalSource;
+    if (!ValidateDurablePublishPaths(destination, source, canonicalDestination, canonicalSource, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|preflight|0", error);
+        return 0;
+    }
+
+    UniqueHandle replacement;
+    if (!AtomicOpen(canonicalSource, replacement, error,
+                    GENERIC_READ | GENERIC_WRITE | READ_CONTROL | DELETE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_FLAG_WRITE_THROUGH)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|preflight|0", error);
+        return 0;
+    }
+    std::wstring tempHash;
+    if (!Sha256(replacement.get(), tempHash, error) || !SameOrdinal(tempHash, expectedNewHash)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        AtomicResult("ERROR|" + std::to_string(error) + "|preflight|0", error);
+        return 0;
+    }
+
+    const auto flushStart = std::chrono::steady_clock::now();
+    if (!FlushFileBuffers(replacement.get())) {
+        error = GetLastError();
+        AtomicResult("ERROR|" + std::to_string(error) + "|flush|0", error);
+        return 0;
+    }
+    const std::uint64_t flushUs = ElapsedMicroseconds(flushStart);
+
+    const auto replaceStart = std::chrono::steady_clock::now();
+    if (!AtomicRenameReplace(replacement.get(), canonicalDestination, error)) {
+        AtomicResult("ERROR|" + std::to_string(error) + "|publish|0", error);
+        return 0;
+    }
+    const std::uint64_t replaceUs = ElapsedMicroseconds(replaceStart);
+
+    const auto verificationStart = std::chrono::steady_clock::now();
+    std::wstring finalHash;
+    if (!Sha256(replacement.get(), finalHash, error) || !SameOrdinal(finalHash, expectedNewHash)) {
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        AtomicResult("ERROR|" + std::to_string(error) + "|post-verification|1", error);
+        return 0;
+    }
+    std::string finalHashAscii;
+    if (!ToAscii(finalHash, finalHashAscii)) finalHashAscii = std::string(64, '0');
+    AtomicResult("OK|" + finalHashAscii + "|" + std::to_string(flushUs) + "|" +
+        std::to_string(replaceUs) + "|" + std::to_string(ElapsedMicroseconds(verificationStart)), error);
+    return 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -3603,6 +3731,10 @@ int wmain(int argc, wchar_t** argv) {
         CompareStringOrdinal(argv[1], -1, L"--cleanup-temp", -1, FALSE) == CSTR_EQUAL) {
         if (input == nullptr || input == INVALID_HANDLE_VALUE) return 1;
         return RunTempCleanup(input);
+    }
+    if (argc == 5 && argv != nullptr &&
+        CompareStringOrdinal(argv[1], -1, L"--durable-atomic-publish", -1, FALSE) == CSTR_EQUAL) {
+        return RunDurableAtomicPublish(argv[2], argv[3], argv[4]);
     }
     if (argc == 8 && argv != nullptr &&
         CompareStringOrdinal(argv[1], -1, L"--atomic-replace", -1, FALSE) == CSTR_EQUAL) {

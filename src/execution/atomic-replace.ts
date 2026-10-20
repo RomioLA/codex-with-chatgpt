@@ -307,3 +307,84 @@ export function atomicReplace(source: string, destination: string, options: Atom
   }
   return { finalHash, timings: { finalValidationMs, atomicReplaceMs, postVerificationMs: performance.now() - verifyStarted } };
 }
+
+/**
+ * Publish a same-directory temp file whose contents the caller has flushed.
+ * Windows uses the verified native helper with a write-through source handle
+ * for the handle-based rename; POSIX also syncs the containing directory.
+ */
+export function durableAtomicReplace(source: string, destination: string, expectedNewHash: string): AtomicReplaceResult {
+  if (typeof expectedNewHash !== "string" || !/^[a-f0-9]{64}$/i.test(expectedNewHash)) {
+    throw new AtomicReplaceError(undefined, { stage: "durable-publish", systemCode: "EXPECTED_HASH_REQUIRED" });
+  }
+  const normalizedHash = expectedNewHash.toLowerCase();
+  if (process.platform === "win32") {
+    const started = performance.now();
+    const helperPath = verifiedExecutionHelperPath();
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+    const result = childProcess.spawnSync(helperPath, [
+      "--durable-atomic-publish",
+      destination,
+      source,
+      normalizedHash,
+    ], {
+      cwd: path.dirname(destination),
+      encoding: "utf8",
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot, PATH: path.join(systemRoot, "System32") },
+      maxBuffer: 64 * 1024,
+      timeout: 10_000,
+      windowsHide: true,
+      shell: false,
+    });
+    const helperWallMs = performance.now() - started;
+    if (result.error) throw new AtomicReplaceError(result.error, { stage: "durable-publish" });
+    const stdout = result.stdout ?? "";
+    const marker = stdout.split(/\r?\n/).find((line) => line.startsWith("C2C_RESULT|"));
+    if (!marker || result.status !== 0) {
+      throw new AtomicReplaceError(undefined, { stage: "durable-publish", systemCode: "WINDOWS_DURABLE_PUBLISH_FAILED" });
+    }
+    const parts = marker.split("|");
+    if (parts[1] !== "OK" || parts.length < 3 || !/^[a-f0-9]{64}$/i.test(parts[2]!)) {
+      const stage = parts[1] === "ERROR" && parts.length >= 4 ? parts[3]! : "durable-publish";
+      const nativeCode = parts[1] === "ERROR" && /^\d+$/.test(parts[2] ?? "")
+        ? systemCodeFromWin32(`WIN32_${parts[2]}`)
+        : "WINDOWS_DURABLE_PUBLISH_FAILED";
+      throw new AtomicReplaceError(undefined, {
+        stage,
+        systemCode: nativeCode,
+        operationApplied: parts[1] === "ERROR" && parts[4] === "1",
+      });
+    }
+    const finalHash = parts[2]!.toLowerCase();
+    if (finalHash !== normalizedHash) {
+      throw new AtomicReplaceError(undefined, { stage: "post-verification", systemCode: "POST_HASH_MISMATCH", operationApplied: true, finalHash });
+    }
+    const flushMs = parseMicroseconds(parts[3]);
+    const replaceMs = parseMicroseconds(parts[4]);
+    const verifyMs = parseMicroseconds(parts[5]);
+    return {
+      finalHash,
+      timings: {
+        finalValidationMs: 0,
+        atomicReplaceMs: replaceMs || Math.max(0, helperWallMs - flushMs - verifyMs),
+        postVerificationMs: verifyMs,
+      },
+    };
+  }
+
+  const replaceResult = atomicReplace(source, destination, { expectedNewHash: normalizedHash });
+  const directory = fs.openSync(path.dirname(destination), "r");
+  try {
+    fs.fsyncSync(directory);
+  } catch (error) {
+    throw new AtomicReplaceError(error, {
+      stage: "directory-flush",
+      operationApplied: true,
+      finalHash: replaceResult.finalHash,
+      timings: replaceResult.timings,
+    });
+  } finally {
+    fs.closeSync(directory);
+  }
+  return replaceResult;
+}

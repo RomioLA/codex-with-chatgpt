@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { incrementAuthorizationEpoch } from "../permission/store.js";
 
 // Newly authorized connections receive only this explicitly approved scope set.
 export const DEFAULT_SCOPES = [
@@ -266,6 +267,9 @@ export class AuthStore {
   /** Used by `c2c unpair`: revoke everything for this workspace. */
   revokeAll(): number {
     const count = this.tokens.size;
+    // Revoke persisted Tasks even when this AuthStore is used by the offline
+    // `c2c unpair` path. The workspace epoch survives Bridge restarts.
+    incrementAuthorizationEpoch(this.workspaceId);
     this.tokens.clear();
     this.authCodes.clear();
     this.save();
@@ -276,7 +280,24 @@ export class AuthStore {
     return this.tokens.size;
   }
 
+  /**
+   * True when this OAuth client still has a non-expired token family carrying
+   * every scope bound to a persistent Task. This is used only for restart and
+   * background-resume revalidation; MCP requests still check their own token.
+   */
+  hasActiveAuthorization(clientId: string, requiredScopes: readonly string[]): boolean {
+    if (typeof clientId !== "string" || clientId.length < 1 || !Array.isArray(requiredScopes)) return false;
+    const now = Date.now();
+    for (const token of this.tokens.values()) {
+      if (!token.revoked && token.expiresAt > now && token.workspaceId === this.workspaceId && token.clientId === clientId) {
+        if (requiredScopes.every((scope) => token.scopes.includes(scope))) return true;
+      }
+    }
+    return false;
+  }
+
   static deleteStateFile(workspaceId: string): void {
+    incrementAuthorizationEpoch(workspaceId);
     const file = path.join(getStateDir(), "auth", `${workspaceId}.json`);
     try {
       fs.rmSync(file, { force: true });

@@ -1,9 +1,22 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { getStateDir, ensureDir } from "../config/paths.js";
-import { isExecutionJobState, isExecutionKind, type ExecutionJob, type ExecutionStreamMeta, type FullAccessCommand, type OutputStream } from "./job-types.js";
+import { isExecutionJobState, isExecutionKind, type ExecutionJob, type ExecutionStreamMeta, type FullAccessCommand, type FullAccessRepositoryScope, type OutputStream } from "./job-types.js";
 import { isTerminalExecutionState, transitionExecutionJob } from "./state-machine.js";
-import { archiveRecord, readArchivedRecord, jobCanBeArchived, archivedIdempotencyKey } from "./record-archive.js";
+import {
+  archiveRecord,
+  readArchivedRecord,
+  jobCanBeArchived,
+  archivedIdempotencyKey,
+  scanArchivedJobRecords,
+  DEFAULT_ARCHIVE_RECORD_OPERATIONS,
+  DEFAULT_ARCHIVED_JOB_SCAN_LIMITS,
+  type ArchiveJobRecordReader,
+  type ArchiveScanClock,
+  type ArchiveScanLimits,
+  type ArchiveRecordOperations,
+} from "./record-archive.js";
 import { atomicReplace } from "./atomic-replace.js";
 import { beginEventLoopTraceSpan, isEventLoopTraceEnabled, type RetainedSizeBucket } from "../diagnostics/event-loop-trace.js";
 
@@ -77,6 +90,12 @@ export interface JobStoreCorruption {
   reason: "read_failed" | "invalid_json" | "unsupported_schema" | "workspace_mismatch" | "invalid_record" | "duplicate_job_id";
 }
 
+export type IdempotentJobLookup =
+  | { kind: "found"; job: ExecutionJob }
+  | { kind: "trusted_absent" }
+  | { kind: "unknown"; reason: string }
+  | { kind: "conflict" };
+
 export type ReadJobOutputResult =
   | {
       ok: true;
@@ -142,14 +161,15 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
       (authorization.type === "level3" || authorization.type === "git") &&
       typeof authorization.requestId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(authorization.requestId) &&
       typeof authorization.digest === "string" && /^[a-f0-9]{64}$/.test(authorization.digest)
-    )) && job.fullAccessCommand === undefined;
+    )) && job.fullAccessCommand === undefined && job.repositoryScope === undefined;
   const validHostFields = hostJob && job.repositoryIdentity === null && job.repositoryPath === null && recipe === null &&
     authorization?.type === "full_access" && authorization.permissionMode === "level2" &&
     typeof authorization.sessionGrantFingerprint === "string" && /^[a-f0-9]{64}$/.test(authorization.sessionGrantFingerprint) &&
     (authorization.sessionGrantId === undefined ||
       (typeof authorization.sessionGrantId === "string" && /^[a-f0-9]{64}$/.test(authorization.sessionGrantId))) &&
     typeof authorization.requestHash === "string" && /^[a-f0-9]{64}$/.test(authorization.requestHash) &&
-    isValidFullAccessCommand(job.fullAccessCommand);
+    isValidFullAccessCommand(job.fullAccessCommand) &&
+    (job.repositoryScope === undefined || isValidFullAccessRepositoryScope(job.repositoryScope));
   const gitResult = job.gitResult as Record<string, unknown> | undefined;
   const validGitResult = gitResult === undefined || (
     ["confirmed", "changed", "identity_changed", "unavailable"].includes(String(gitResult.confirmation)) &&
@@ -176,6 +196,18 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     isStreamMeta(job.stdout) && isStreamMeta(job.stderr);
 }
 
+function sameLogicalJob(active: ExecutionJob, archived: ExecutionJob): boolean {
+  const requestHash = (job: ExecutionJob): string | null =>
+    job.authorization?.type === "full_access" ? job.authorization.requestHash : null;
+  return active.workspaceId === archived.workspaceId && active.jobId === archived.jobId &&
+    active.oauthClientId === archived.oauthClientId && active.idempotencyKeyHash === archived.idempotencyKeyHash &&
+    requestHash(active) === requestHash(archived) && active.executionContext === archived.executionContext &&
+    active.repositoryIdentity === archived.repositoryIdentity && active.repositoryPath === archived.repositoryPath &&
+    active.timeoutSeconds === archived.timeoutSeconds && active.state === archived.state &&
+    active.startedAt === archived.startedAt && active.finishedAt === archived.finishedAt &&
+    active.exitCode === archived.exitCode && active.failureCode === archived.failureCode;
+}
+
 function isValidFullAccessCommand(value: unknown): value is FullAccessCommand {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const command = value as Record<string, unknown>;
@@ -194,6 +226,14 @@ function isValidFullAccessCommand(value: unknown): value is FullAccessCommand {
   return (command.engine === "powershell" || command.engine === "cmd") &&
     typeof command.command === "string" && command.command.length > 0 && command.command.length <= 32767 &&
     !command.command.includes("\0") && command.args === undefined;
+}
+
+function isValidFullAccessRepositoryScope(value: unknown): value is FullAccessRepositoryScope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const scope = value as Record<string, unknown>;
+  return typeof scope.identity === "string" && /^[a-f0-9]{64}$/.test(scope.identity) &&
+    typeof scope.path === "string" && path.win32.isAbsolute(scope.path) &&
+    scope.path.length <= 32767 && !scope.path.includes("\0");
 }
 
 function isStreamMeta(value: unknown): value is ExecutionStreamMeta {
@@ -215,16 +255,25 @@ function isTempOwnership(value: unknown): value is NonNullable<ExecutionJob["tem
     Number.isSafeInteger(ownership.createdAtMs) && ownership.createdAtMs! >= 0;
 }
 
-function serializeAtomic(file: string, value: unknown): void {
+function serializeAtomic(file: string, value: unknown, publish: typeof atomicReplace = atomicReplace): void {
   ensureDir(path.dirname(file));
-  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const temporary = `${file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
   try {
     fs.chmodSync(temporary, 0o600);
   } catch {
     /* best effort on Windows */
   }
-  atomicReplace(temporary, file);
+  publish(temporary, file);
+}
+
+export interface ExecutionJobStoreOptions {
+  directory?: string;
+  archiveOperations?: Readonly<ArchiveRecordOperations>;
+  replaceActiveIndex?: typeof atomicReplace;
+  archiveScanLimits?: Readonly<ArchiveScanLimits>;
+  archiveScanClock?: ArchiveScanClock;
+  archiveScanReader?: ArchiveJobRecordReader;
 }
 
 function isOutputStream(value: string): value is OutputStream {
@@ -236,10 +285,20 @@ export class ExecutionJobStore {
   private readonly file: string;
   private readonly jobs = new Map<string, ExecutionJob>();
   private readonly outputWriters = new Map<string, OutputWriter>();
+  private readonly archiveOperations: Readonly<ArchiveRecordOperations>;
+  private readonly replaceActiveIndex: typeof atomicReplace;
+  private readonly archiveScanLimits: Readonly<ArchiveScanLimits>;
+  private readonly archiveScanClock: ArchiveScanClock;
+  private readonly archiveScanReader: ArchiveJobRecordReader;
   corruption: JobStoreCorruption | null = null;
 
-  constructor(readonly workspaceId: string, opts: { directory?: string } = {}) {
+  constructor(readonly workspaceId: string, opts: ExecutionJobStoreOptions = {}) {
     this.directory = opts.directory ?? path.join(getStateDir(), "execution-jobs", workspaceId);
+    this.archiveOperations = opts.archiveOperations ?? DEFAULT_ARCHIVE_RECORD_OPERATIONS;
+    this.replaceActiveIndex = opts.replaceActiveIndex ?? atomicReplace;
+    this.archiveScanLimits = opts.archiveScanLimits ?? DEFAULT_ARCHIVED_JOB_SCAN_LIMITS;
+    this.archiveScanClock = opts.archiveScanClock ?? Date.now;
+    this.archiveScanReader = opts.archiveScanReader ?? ((archiveRoot, jobId) => readArchivedRecord(archiveRoot, "jobs", jobId));
     ensureDir(this.directory);
     this.file = path.join(this.directory, "jobs.json");
     this.load();
@@ -322,32 +381,46 @@ export class ExecutionJobStore {
         }));
       }
     }
-    for (const [jobId, job] of loaded) this.jobs.set(jobId, job);
-    this.prune();
-    this.persist();
+    const retained = this.prune(loaded);
+    this.persist(retained);
+    this.commitJobs(retained, loaded);
   }
 
-  private persist(): void {
+  private withDurableOutputMetadata(job: ExecutionJob): ExecutionJob {
+    let persisted = job;
+    for (const stream of ["stdout", "stderr"] as const) {
+      const durable = this.outputWriters.get(outputWriterKey(job.jobId, stream))?.durableMeta;
+      if (!durable) continue;
+      persisted = {
+        ...persisted,
+        [stream]: {
+          ...persisted[stream],
+          totalBytes: durable.totalBytes,
+          retainedBytes: durable.retainedBytes,
+          oldestAvailableOffset: durable.oldestAvailableOffset,
+          truncated: durable.truncated,
+        },
+      };
+    }
+    return persisted;
+  }
+
+  private commitJobs(next: Map<string, ExecutionJob>, previous: ReadonlyMap<string, ExecutionJob> = this.jobs): void {
+    for (const jobId of previous.keys()) {
+      if (next.has(jobId)) continue;
+      this.outputWriters.delete(outputWriterKey(jobId, "stdout"));
+      this.outputWriters.delete(outputWriterKey(jobId, "stderr"));
+    }
+    this.jobs.clear();
+    for (const [jobId, job] of next) this.jobs.set(jobId, job);
+  }
+
+  private persist(jobs: ReadonlyMap<string, ExecutionJob> = this.jobs): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
-    const jobs = [...this.jobs.values()].map((job) => {
-      let persisted = job;
-      for (const stream of ["stdout", "stderr"] as const) {
-        const durable = this.outputWriters.get(outputWriterKey(job.jobId, stream))?.durableMeta;
-        if (!durable) continue;
-        persisted = {
-          ...persisted,
-          [stream]: {
-            ...persisted[stream],
-            totalBytes: durable.totalBytes,
-            retainedBytes: durable.retainedBytes,
-            oldestAvailableOffset: durable.oldestAvailableOffset,
-            truncated: durable.truncated,
-          },
-        };
-      }
-      return persisted;
-    }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    serializeAtomic(this.file, { version: 1, workspaceId: this.workspaceId, jobs } satisfies PersistedJobs);
+    const persistedJobs = [...jobs.values()]
+      .map((job) => this.withDurableOutputMetadata(job))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    serializeAtomic(this.file, { version: 1, workspaceId: this.workspaceId, jobs: persistedJobs } satisfies PersistedJobs, this.replaceActiveIndex);
   }
 
   private outputFile(jobId: string, stream: OutputStream): string {
@@ -444,16 +517,23 @@ export class ExecutionJobStore {
   }
 
   private archiveJob(job: ExecutionJob): void {
-    archiveRecord(this.directory, "jobs", job.jobId, job);
-    archiveRecord(this.directory, "idempotency", archivedIdempotencyKey(job.oauthClientId, job.idempotencyKeyHash), { workspaceId: this.workspaceId, jobId: job.jobId });
-    // Output and uncertain evidence are retained. Only the active index shrinks.
-    this.jobs.delete(job.jobId);
-    this.outputWriters.delete(outputWriterKey(job.jobId, "stdout"));
-    this.outputWriters.delete(outputWriterKey(job.jobId, "stderr"));
+    const authoritativeRecord = this.withDurableOutputMetadata(job);
+    archiveRecord(this.directory, "jobs", job.jobId, authoritativeRecord, this.archiveOperations);
+    archiveRecord(
+      this.directory,
+      "idempotency",
+      archivedIdempotencyKey(job.oauthClientId, job.idempotencyKeyHash),
+      { workspaceId: this.workspaceId, jobId: job.jobId },
+      this.archiveOperations,
+    );
   }
 
-  private prune(now = Date.now(), reserveSlot = false): void {
-    const ordered = [...this.jobs.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  private prune(
+    jobs: ReadonlyMap<string, ExecutionJob>,
+    now = Date.now(),
+    reserveSlot = false,
+  ): Map<string, ExecutionJob> {
+    const ordered = [...jobs.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     const keep: ExecutionJob[] = [];
     for (const job of ordered) {
       const age = now - Date.parse(job.createdAt);
@@ -470,23 +550,26 @@ export class ExecutionJobStore {
       const [dropped] = keep.splice(index, 1);
       this.archiveJob(dropped);
     }
+    return new Map(keep.map((job) => [job.jobId, job]));
   }
 
   create(job: ExecutionJob): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
     if (job.workspaceId !== this.workspaceId || this.jobs.has(job.jobId)) throw new TypeError("Invalid execution job");
-    this.prune(Date.now(), true);
-    if (this.jobs.size >= MAX_JOBS_PER_WORKSPACE) throw new Error("JOB_STORE_FULL");
-    this.jobs.set(job.jobId, { ...job, stdout: { ...EMPTY_STREAM }, stderr: { ...EMPTY_STREAM } });
-    this.persist();
+    const next = this.prune(new Map(this.jobs), Date.now(), true);
+    if (next.size >= MAX_JOBS_PER_WORKSPACE) throw new Error("JOB_STORE_FULL");
+    next.set(job.jobId, { ...job, stdout: { ...EMPTY_STREAM }, stderr: { ...EMPTY_STREAM } });
+    this.persist(next);
+    this.commitJobs(next);
     this.outputWriters.set(outputWriterKey(job.jobId, "stdout"), newOutputWriter());
     this.outputWriters.set(outputWriterKey(job.jobId, "stderr"), newOutputWriter());
   }
 
   prepareCapacity(): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
-    this.prune(Date.now(), true);
-    this.persist();
+    const next = this.prune(new Map(this.jobs), Date.now(), true);
+    this.persist(next);
+    this.commitJobs(next);
     if (this.jobs.size >= MAX_JOBS_PER_WORKSPACE) throw new Error("JOB_STORE_FULL");
   }
 
@@ -515,23 +598,109 @@ export class ExecutionJobStore {
   }
 
   findIdempotent(clientId: string, idempotencyKeyHash: string): ExecutionJob | null {
-    const active = [...this.jobs.values()].find((job) =>
+    const active = [...this.jobs.values()].filter((job) =>
       job.oauthClientId === clientId && job.idempotencyKeyHash === idempotencyKeyHash
     );
-    if (active) return active;
     const pointer = readArchivedRecord<{workspaceId: string; jobId: string}>(this.directory, "idempotency", archivedIdempotencyKey(clientId, idempotencyKeyHash));
-    if (!pointer) return null;
-    const job = this.get(pointer.jobId);
-    if (!job || pointer.workspaceId !== this.workspaceId || job.oauthClientId !== clientId || job.idempotencyKeyHash !== idempotencyKeyHash) throw new Error("ARCHIVE_CORRUPT");
-    return job;
+    const matches = new Map(active.map((job) => [job.jobId, job]));
+    if (pointer) {
+      const job = this.get(pointer.jobId);
+      if (!job || pointer.workspaceId !== this.workspaceId || job.oauthClientId !== clientId || job.idempotencyKeyHash !== idempotencyKeyHash) {
+        throw new Error("ARCHIVE_CORRUPT");
+      }
+      matches.set(job.jobId, job);
+    }
+    if (matches.size > 1) throw new Error("IDEMPOTENCY_CONFLICT");
+    return matches.values().next().value ?? null;
+  }
+
+  /**
+   * Recovery-grade lookup. Unlike findIdempotent(), a missing index pointer is
+   * not treated as proof of absence: the complete archived job catalog must
+   * also be scanned and verified before returning trusted_absent.
+   */
+  lookupIdempotentForReconciliation(clientId: string, idempotencyKeyHash: string): IdempotentJobLookup {
+    if (this.corruption) return { kind: "unknown", reason: "JOB_STORE_CORRUPT" };
+    if (typeof clientId !== "string" || clientId.length < 1 || clientId.length > 200 ||
+        typeof idempotencyKeyHash !== "string" || !/^[a-f0-9]{64}$/.test(idempotencyKeyHash)) {
+      return { kind: "unknown", reason: "IDEMPOTENCY_LOOKUP_INVALID" };
+    }
+
+    const activeMatches = [...this.jobs.values()].filter((job) =>
+      job.oauthClientId === clientId && job.idempotencyKeyHash === idempotencyKeyHash
+    );
+    if (activeMatches.some((job) => !isValidJob(job, this.workspaceId))) {
+      return { kind: "unknown", reason: "ACTIVE_JOB_RECORD_INVALID" };
+    }
+    if (activeMatches.length > 1) return { kind: "conflict" };
+
+    let pointer: { workspaceId: string; jobId: string } | null;
+    try {
+      const value = readArchivedRecord<unknown>(
+        this.directory,
+        "idempotency",
+        archivedIdempotencyKey(clientId, idempotencyKeyHash),
+      );
+      if (value === null) {
+        pointer = null;
+      } else if (value && typeof value === "object" && !Array.isArray(value) &&
+          typeof (value as Record<string, unknown>).workspaceId === "string" &&
+          typeof (value as Record<string, unknown>).jobId === "string" &&
+          /^[A-Za-z0-9_-]{24,64}$/.test((value as Record<string, string>).jobId)) {
+        pointer = value as { workspaceId: string; jobId: string };
+      } else {
+        return { kind: "unknown", reason: "ARCHIVE_POINTER_INVALID" };
+      }
+    } catch {
+      return { kind: "unknown", reason: "ARCHIVE_POINTER_CORRUPT" };
+    }
+    if (pointer && pointer.workspaceId !== this.workspaceId) {
+      return { kind: "unknown", reason: "ARCHIVE_POINTER_INVALID" };
+    }
+
+    const matchingJobs = new Map(activeMatches.map((job) => [job.jobId, job]));
+    let activeArchiveMismatch = false;
+    const pointedJob: { value: ExecutionJob | null } = { value: null };
+    const scan = scanArchivedJobRecords<unknown>(this.directory, (jobId, value) => {
+      if (!isValidJob(value, this.workspaceId) || value.jobId !== jobId || !jobCanBeArchived(value)) {
+        throw new Error("ARCHIVE_CORRUPT");
+      }
+      const job = value as ExecutionJob;
+      if (pointer?.jobId === jobId) pointedJob.value = job;
+      if (job.oauthClientId === clientId && job.idempotencyKeyHash === idempotencyKeyHash) {
+        const existing = matchingJobs.get(jobId);
+        if (existing && !sameLogicalJob(existing, job)) activeArchiveMismatch = true;
+        else matchingJobs.set(jobId, existing ?? job);
+      }
+    }, this.archiveScanLimits, this.archiveScanClock, this.archiveScanReader);
+    if (scan.kind === "incomplete") return { kind: "unknown", reason: scan.reason };
+
+    if (pointer && (!pointedJob.value || pointedJob.value.oauthClientId !== clientId ||
+        pointedJob.value.idempotencyKeyHash !== idempotencyKeyHash)) {
+      return { kind: "unknown", reason: "ARCHIVE_POINTER_MISMATCH" };
+    }
+    if (activeArchiveMismatch) return { kind: "unknown", reason: "ARCHIVE_ACTIVE_RECORD_MISMATCH" };
+    if (matchingJobs.size > 1) return { kind: "conflict" };
+    const matchingJob = matchingJobs.values().next().value as ExecutionJob | undefined;
+    if (matchingJob) return { kind: "found", job: matchingJob };
+    return { kind: "trusted_absent" };
   }
 
   replace(job: ExecutionJob): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
     if (job.workspaceId !== this.workspaceId || !this.jobs.has(job.jobId)) throw new TypeError("Unknown execution job");
-    this.jobs.set(job.jobId, job);
-    this.prune();
-    this.persist();
+    const staged = new Map(this.jobs);
+    staged.set(job.jobId, job);
+    const next = this.prune(staged);
+    if (next.size === staged.size) {
+      // Preserve the existing transition-failure contract when no archive move
+      // is involved; archive removals remain staged until the index publishes.
+      this.jobs.set(job.jobId, job);
+      this.persist();
+      return;
+    }
+    this.persist(next);
+    this.commitJobs(next);
   }
 
   appendSanitized(jobId: string, stream: OutputStream, text: string): Promise<void> {

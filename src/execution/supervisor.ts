@@ -45,6 +45,7 @@ interface StartExecutionInput {
 }
 
 type StartFullAccessInput = FullAccessCommandInput & {
+  repositoryPath?: string;
   timeoutSeconds: number;
   idempotencyKey: string;
   oauthClientId: string;
@@ -87,6 +88,7 @@ interface ActiveExecution {
   handle: NativeRunnerHandle;
   intent: "cancelled" | "timed_out" | null;
   workspaceSlot: string;
+  slotReservation: GlobalSlotReservation;
   timeoutTimer: NodeJS.Timeout;
   graceTimer: NodeJS.Timeout | null;
   sanitizers: Record<OutputStream, StreamingSanitizer>;
@@ -101,8 +103,21 @@ interface ActiveExecution {
   outputFinalization: Promise<void> | null;
 }
 
+interface GlobalSlotReservation {
+  workspaceId: string;
+  repositoryIdentity: string | null;
+}
+
 const supervisors = new Set<ExecutionSupervisor>();
-const globalSlots = new Map<string, { workspaceId: string; repositoryIdentity: string | null }>();
+const globalSlots = new Map<string, GlobalSlotReservation>();
+
+function releaseGlobalSlot(key: string, reservation: GlobalSlotReservation): boolean {
+  if (globalSlots.get(key) !== reservation) {
+    return false;
+  }
+  globalSlots.delete(key);
+  return true;
+}
 
 function scheduleAll(): void {
   for (const supervisor of supervisors) supervisor.schedule();
@@ -122,6 +137,10 @@ function fixedManager(value: unknown): value is PackageManager {
 
 function cleanCode(value: string): string {
   return /^[A-Z0-9_]{1,64}$/.test(value) ? value : "EXECUTION_FAILED";
+}
+
+function jobRepositoryIdentity(job: ExecutionJob): string | null {
+  return isFullAccessExecutionJob(job) ? job.repositoryScope?.identity ?? null : job.repositoryIdentity;
 }
 
 export class ExecutionSupervisor {
@@ -365,21 +384,35 @@ export class ExecutionSupervisor {
       current.grantId === job.authorization.sessionGrantId;
   }
 
-  async startFullAccess(input: StartFullAccessInput): Promise<StartExecutionResult<FullAccessExecutionJob>> {
+  async startFullAccess(
+    input: StartFullAccessInput,
+    expectedGrant?: { identityFingerprint: string; grantId: string },
+    beforeCreate?: () => boolean,
+  ): Promise<StartExecutionResult<FullAccessExecutionJob>> {
     if (!this.accepting) return { ok: false, error: "SUPERVISOR_CLOSING" };
     if (this.store.corruption) return { ok: false, error: "STORE_CORRUPT" };
     if (!input || typeof input !== "object" ||
         !["program", "powershell", "cmd"].includes(input.engine) ||
         !Number.isSafeInteger(input.timeoutSeconds) || input.timeoutSeconds < 1 || input.timeoutSeconds > MAX_EXECUTION_TIMEOUT_SECONDS ||
         typeof input.idempotencyKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(input.idempotencyKey) ||
-        typeof input.oauthClientId !== "string" || input.oauthClientId.length < 1 || input.oauthClientId.length > 200) {
+        typeof input.oauthClientId !== "string" || input.oauthClientId.length < 1 || input.oauthClientId.length > 200 ||
+        (input.repositoryPath !== undefined && (typeof input.repositoryPath !== "string" ||
+          input.repositoryPath.length < 1 || input.repositoryPath.length > 32767))) {
       return { ok: false, error: "INVALID_ARGUMENTS" };
     }
     if (!Array.isArray(input.scopes) || !input.scopes.includes("execution.run")) {
       return { ok: false, error: "INSUFFICIENT_SCOPE" };
     }
+    if (expectedGrant !== undefined &&
+        (typeof expectedGrant.identityFingerprint !== "string" || expectedGrant.identityFingerprint.length === 0 ||
+         typeof expectedGrant.grantId !== "string" || expectedGrant.grantId.length === 0)) {
+      return { ok: false, error: "FULL_ACCESS_REQUIRED" };
+    }
     const sessionGrant = this.currentFullAccessGrant();
-    if (!sessionGrant) return { ok: false, error: "FULL_ACCESS_REQUIRED" };
+    if (!sessionGrant || expectedGrant &&
+        (sessionGrant.identityFingerprint !== expectedGrant.identityFingerprint || sessionGrant.grantId !== expectedGrant.grantId)) {
+      return { ok: false, error: "FULL_ACCESS_REQUIRED" };
+    }
 
     let command;
     try {
@@ -387,8 +420,23 @@ export class ExecutionSupervisor {
     } catch (error) {
       return { ok: false, error: cleanCode((error as Error).message) };
     }
+    let repositoryScope: { identity: string; path: string } | undefined;
+    if (input.repositoryPath !== undefined) {
+      try {
+        const repository = resolveRepositoryIdentity(this.workspace, input.repositoryPath);
+        repositoryScope = { identity: repository.identity, path: repository.canonicalPath };
+      } catch (error) {
+        if (error instanceof RepositoryIdentityError) {
+          return { ok: false, error: error.code === "REPARSE_POINT" ? "REPARSE_POINT" : "INVALID_REPOSITORY" };
+        }
+        return { ok: false, error: cleanCode((error as Error).message) };
+      }
+    }
     const idempotencyKeyHash = createHash("sha256").update(input.idempotencyKey, "utf8").digest("hex");
-    const requestHash = createHash("sha256").update(JSON.stringify({ command, timeoutSeconds: input.timeoutSeconds }), "utf8").digest("hex");
+    const requestMaterial = repositoryScope
+      ? { command, timeoutSeconds: input.timeoutSeconds, repositoryScope }
+      : { command, timeoutSeconds: input.timeoutSeconds };
+    const requestHash = createHash("sha256").update(JSON.stringify(requestMaterial), "utf8").digest("hex");
     const previous = this.store.findIdempotent(input.oauthClientId, idempotencyKeyHash);
     if (previous) {
       const sameRequest = isFullAccessExecutionJob(previous) &&
@@ -397,6 +445,11 @@ export class ExecutionSupervisor {
         ? { ok: true, job: previous, duplicate: true }
         : { ok: false, error: "IDEMPOTENCY_CONFLICT" };
     }
+
+    // Persistent Task cancellation/revocation may race asynchronous command
+    // validation above. Re-read its authoritative state at the last point
+    // before a new child job becomes durable and eligible for dispatch.
+    if (beforeCreate && !beforeCreate()) return { ok: false, error: "TASK_STATE_CONFLICT" };
 
     try { this.store.prepareCapacity(); } catch (error) {
       return { ok: false, error: cleanCode((error as Error).message) };
@@ -417,6 +470,7 @@ export class ExecutionSupervisor {
         requestHash,
       },
       fullAccessCommand: command,
+      ...(repositoryScope ? { repositoryScope } : {}),
       state: "queued",
       createdAt: new Date(this.now()).toISOString(),
       startedAt: null,
@@ -443,6 +497,58 @@ export class ExecutionSupervisor {
     });
     this.schedule();
     return { ok: true, job: (this.store.get(job.jobId) as FullAccessExecutionJob | null) ?? job, duplicate: false };
+  }
+
+  /** Resolve the active/archive idempotency namespace without starting a child. */
+  async lookupFullAccessIdempotent(
+    input: StartFullAccessInput,
+    candidate?: ExecutionJob | null,
+  ): Promise<{ ok: true; job: FullAccessExecutionJob | null } | { ok: false; error: string }> {
+    if (this.store.corruption) return { ok: false, error: "STORE_CORRUPT" };
+    if (!input || typeof input !== "object" ||
+        !["program", "powershell", "cmd"].includes(input.engine) ||
+        !Number.isSafeInteger(input.timeoutSeconds) || input.timeoutSeconds < 1 || input.timeoutSeconds > MAX_EXECUTION_TIMEOUT_SECONDS ||
+        typeof input.idempotencyKey !== "string" || !/^[A-Za-z0-9._:-]{16,128}$/.test(input.idempotencyKey) ||
+        typeof input.oauthClientId !== "string" || input.oauthClientId.length < 1 || input.oauthClientId.length > 200 ||
+        !Array.isArray(input.scopes) || !input.scopes.includes("execution.run") ||
+        (input.repositoryPath !== undefined && (typeof input.repositoryPath !== "string" || input.repositoryPath.length < 1 || input.repositoryPath.length > 32767))) {
+      return { ok: false, error: "INVALID_ARGUMENTS" };
+    }
+    let command;
+    try { command = await resolveFullAccessCommand(input, this.workspace.root); }
+    catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
+    let repositoryScope: { identity: string; path: string } | undefined;
+    if (input.repositoryPath !== undefined) {
+      try {
+        const repository = resolveRepositoryIdentity(this.workspace, input.repositoryPath);
+        repositoryScope = { identity: repository.identity, path: repository.canonicalPath };
+      } catch (error) {
+        if (error instanceof RepositoryIdentityError) {
+          return { ok: false, error: error.code === "REPARSE_POINT" ? "REPARSE_POINT" : "INVALID_REPOSITORY" };
+        }
+        return { ok: false, error: cleanCode((error as Error).message) };
+      }
+    }
+    const keyHash = createHash("sha256").update(input.idempotencyKey, "utf8").digest("hex");
+    let previous: ExecutionJob | null;
+    if (candidate !== undefined) {
+      previous = candidate;
+      if (previous && (previous.workspaceId !== this.workspace.id || previous.oauthClientId !== input.oauthClientId ||
+          previous.idempotencyKeyHash !== keyHash)) return { ok: false, error: "IDEMPOTENCY_CONFLICT" };
+    } else {
+      try { previous = this.store.findIdempotent(input.oauthClientId, keyHash); }
+      catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
+    }
+    if (!previous) return { ok: true, job: null };
+    const requestMaterial = repositoryScope
+      ? { command, timeoutSeconds: input.timeoutSeconds, repositoryScope }
+      : { command, timeoutSeconds: input.timeoutSeconds };
+    const requestHash = createHash("sha256").update(JSON.stringify(requestMaterial), "utf8").digest("hex");
+    if (!isFullAccessExecutionJob(previous) || previous.authorization.requestHash !== requestHash ||
+        previous.timeoutSeconds !== input.timeoutSeconds) {
+      return { ok: false, error: "IDEMPOTENCY_CONFLICT" };
+    }
+    return { ok: true, job: previous };
   }
 
   getForClient(jobId: string, clientId: string): ExecutionJob | null {
@@ -500,23 +606,44 @@ export class ExecutionSupervisor {
       if (workspaceActive >= MAX_WORKSPACE_EXECUTIONS) break;
       const busyRepositories = new Set([...globalSlots.values()]
         .flatMap((slot) => slot.repositoryIdentity === null ? [] : [slot.repositoryIdentity]));
-      const next = this.allQueuedOldestFirst().find((job) =>
-        isFullAccessExecutionJob(job) || !busyRepositories.has(job.repositoryIdentity));
+      const next = this.allQueuedOldestFirst().find((job) => {
+        const repositoryIdentity = jobRepositoryIdentity(job);
+        return repositoryIdentity === null || !busyRepositories.has(repositoryIdentity);
+      });
       if (!next) break;
       const workspaceSlot = `${this.workspace.id}:${next.jobId}`;
       if (globalSlots.has(workspaceSlot)) break;
-      globalSlots.set(workspaceSlot, {
+      const slotReservation: GlobalSlotReservation = {
         workspaceId: this.workspace.id,
-        repositoryIdentity: isFullAccessExecutionJob(next) ? null : next.repositoryIdentity,
-      });
-      void this.startQueued(next, workspaceSlot).catch((error: unknown) => {
-        const current = this.store.get(next.jobId);
-        if (current?.state === "queued") {
-          this.store.replace(transitionExecutionJob(current, "failed", { failureCode: cleanCode((error as Error).message) }));
-          if (!isFullAccessExecutionJob(current)) this.auditControlledCompletion(current.jobId);
+        repositoryIdentity: jobRepositoryIdentity(next),
+      };
+      globalSlots.set(workspaceSlot, slotReservation);
+      void this.startQueued(next, workspaceSlot, slotReservation).catch((error: unknown) => {
+        try {
+          const current = this.store.get(next.jobId);
+          if (current?.state === "queued" || (current?.state === "running" && !this.active.has(next.jobId))) {
+            this.store.replace(transitionExecutionJob(current, "failed", { failureCode: cleanCode((error as Error).message) }));
+            if (!isFullAccessExecutionJob(current)) this.auditControlledCompletion(current.jobId);
+          }
+        } catch (persistError) {
+          this.logger.error("Failed to persist queued execution failure", {
+            workspaceId: this.workspace.id,
+            jobId: next.jobId,
+            startupFailureCode: cleanCode((error as Error).message),
+            persistenceFailureCode: cleanCode((persistError as Error).message),
+          });
+        } finally {
+          releaseGlobalSlot(workspaceSlot, slotReservation);
+          try {
+            scheduleAll();
+          } catch (scheduleError) {
+            this.logger.error("Failed to schedule after queued execution cleanup", {
+              workspaceId: this.workspace.id,
+              jobId: next.jobId,
+              failureCode: cleanCode((scheduleError as Error).message),
+            });
+          }
         }
-        globalSlots.delete(workspaceSlot);
-        scheduleAll();
       });
     }
   }
@@ -527,10 +654,10 @@ export class ExecutionSupervisor {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
-  private async startQueued(job: ExecutionJob, workspaceSlot: string): Promise<void> {
+  private async startQueued(job: ExecutionJob, workspaceSlot: string, slotReservation: GlobalSlotReservation): Promise<void> {
     const permission = readPermission(this.workspace.id);
     if (permission === "readonly") {
-      globalSlots.delete(workspaceSlot);
+      releaseGlobalSlot(workspaceSlot, slotReservation);
       this.cancelQueuedForDowngrade();
       return;
     }
@@ -538,12 +665,26 @@ export class ExecutionSupervisor {
     let trustedCommand: TrustedCommand | undefined;
     let genericCommand: GenericCommand | undefined;
     let releaseWriteLock: (() => void) | undefined;
-    const fullAccessJob = isFullAccessExecutionJob(job);
     try {
-      if (fullAccessJob) {
-        if (!this.hasCurrentFullAccessGrant(job)) throw new Error("FULL_ACCESS_REQUIRED");
-        await verifyFullAccessCommand(job.fullAccessCommand);
-        if (!this.hasCurrentFullAccessGrant(job)) throw new Error("FULL_ACCESS_REQUIRED");
+      if (isFullAccessExecutionJob(job)) {
+        const queuedFullAccessJob = job;
+        const initialGrantValid = this.hasCurrentFullAccessGrant(queuedFullAccessJob);
+        if (!initialGrantValid) throw new Error("FULL_ACCESS_REQUIRED");
+        await verifyFullAccessCommand(queuedFullAccessJob.fullAccessCommand);
+        const current = this.store.get(queuedFullAccessJob.jobId);
+        if (!current || current.state !== "queued" || !isFullAccessExecutionJob(current)) {
+          releaseGlobalSlot(workspaceSlot, slotReservation);
+          scheduleAll();
+          return;
+        }
+        job = current;
+        const finalGrantValid = this.hasCurrentFullAccessGrant(job);
+        if (!finalGrantValid) throw new Error("FULL_ACCESS_REQUIRED");
+        if (job.repositoryScope) {
+          repository = resolveRepositoryIdentity(this.workspace, job.repositoryScope.path);
+          if (repository.identity !== job.repositoryScope.identity) throw new RepositoryIdentityError("PATH_CHANGED");
+          releaseWriteLock = acquireRepositoryWriteLock(repository, job.jobId);
+        }
       } else {
         repository = resolveRepositoryIdentity(this.workspace, job.repositoryPath);
         if (repository.identity !== job.repositoryIdentity) throw new RepositoryIdentityError("PATH_CHANGED");
@@ -568,19 +709,30 @@ export class ExecutionSupervisor {
       }
     } catch (error) {
       releaseWriteLock?.();
-      globalSlots.delete(workspaceSlot);
-      const failureCode = error instanceof RepositoryIdentityError
-        ? error.code === "REPARSE_POINT" ? "REPARSE_POINT" : "REPOSITORY_IDENTITY_CHANGED"
-        : fullAccessJob || job.authorization ? cleanCode((error as Error).message) : "COMMAND_NOT_APPROVED";
-      const failed = transitionExecutionJob(job, "failed", { failureCode });
-      this.store.replace(failed);
-      if (!fullAccessJob) this.auditControlledCompletion(job.jobId);
+      releaseGlobalSlot(workspaceSlot, slotReservation);
+      const current = this.store.get(job.jobId);
+      if (current?.state === "queued") {
+        const failedJobIsFullAccess = isFullAccessExecutionJob(current);
+        const failureCode = error instanceof RepositoryIdentityError
+          ? error.code === "REPARSE_POINT" ? "REPARSE_POINT" : "REPOSITORY_IDENTITY_CHANGED"
+          : failedJobIsFullAccess || current.authorization ? cleanCode((error as Error).message) : "COMMAND_NOT_APPROVED";
+        const failed = transitionExecutionJob(current, "failed", { failureCode });
+        this.store.replace(failed);
+        if (!failedJobIsFullAccess) this.auditControlledCompletion(current.jobId);
+      }
       scheduleAll();
       return;
     }
 
-    const running = transitionExecutionJob(job, "running", { failureCode: null });
-    this.store.replace(running);
+    const fullAccessJob = isFullAccessExecutionJob(job);
+    let running: ExecutionJob;
+    try {
+      running = transitionExecutionJob(job, "running", { failureCode: null });
+      this.store.replace(running);
+    } catch (error) {
+      releaseWriteLock?.();
+      throw error;
+    }
     const sanitizers = { stdout: new StreamingSanitizer(), stderr: new StreamingSanitizer() };
     const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
     let active!: ActiveExecution;
@@ -592,7 +744,7 @@ export class ExecutionSupervisor {
         nonce: tempLease.nonce,
         createdAtMs: tempLease.createdAtMs,
       } });
-      const runnerRequest: NativeRunnerRequest = fullAccessJob ? {
+      const runnerRequest: NativeRunnerRequest = isFullAccessExecutionJob(job) ? {
         jobId: job.jobId,
         timeoutSeconds: job.timeoutSeconds,
         stateDirectory: this.store.directory,
@@ -630,6 +782,7 @@ export class ExecutionSupervisor {
         handle,
         intent: null,
         workspaceSlot,
+        slotReservation,
         timeoutTimer,
         graceTimer: null,
         sanitizers,
@@ -670,7 +823,7 @@ export class ExecutionSupervisor {
       });
       this.store.replace(failed);
       if (!fullAccessJob) this.auditControlledCompletion(job.jobId);
-      globalSlots.delete(workspaceSlot);
+      releaseGlobalSlot(workspaceSlot, slotReservation);
       scheduleAll();
     }
   }
@@ -809,7 +962,7 @@ export class ExecutionSupervisor {
     clearTimeout(active.timeoutTimer);
     if (active.graceTimer) clearTimeout(active.graceTimer);
     if (this.active.get(jobId) === active) this.active.delete(jobId);
-    globalSlots.delete(active.workspaceSlot);
+    releaseGlobalSlot(active.workspaceSlot, active.slotReservation);
     this.auditControlledCompletion(jobId);
     if (active.treeConfirmed) active.releaseWriteLock?.();
     scheduleAll();

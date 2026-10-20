@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { createMcpServer } from "../src/mcp/server.js";
+import { safeToolName } from "../src/mcp/http.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
 import { approveTrustedCommand } from "../src/execution/trusted-registry.js";
@@ -24,6 +25,8 @@ let accessToken: string;
 let stateDir: string;
 let executionToken: string;
 let secondExecutionToken: string;
+let evidenceFileToken: string;
+let evidenceOtherFileToken: string;
 
 interface CapturedExecution {
   callbacks: Parameters<ExecutionRunner["start"]>[1];
@@ -74,6 +77,28 @@ function structuredJsonOf<T = Record<string, unknown>>(result: unknown): T {
   return parsed;
 }
 
+function structuredContentOf<T = Record<string, unknown>>(result: unknown): T {
+  const structured = (result as { structuredContent?: unknown } | null)?.structuredContent;
+  expect(structured).toBeDefined();
+  return structured as T;
+}
+
+async function waitUntil(check: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("MCP_INTEGRATION_TEST_TIMEOUT");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function connectHttpClient(token: string, name: string): Promise<Client> {
+  const connected = new Client({ name, version: "1.0.0" });
+  await connected.connect(new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
+    requestInit: { headers: { authorization: `Bearer ${token}` } },
+  }));
+  return connected;
+}
+
 function expectToolOutputSchema(
   tools: Awaited<ReturnType<Client["listTools"]>>["tools"],
   name: string,
@@ -116,6 +141,14 @@ beforeAll(async () => {
     clientId: "execution-client-b",
     scopes: ["execution.jobs.read", "execution.run", "execution.cancel"],
   }).accessToken;
+  evidenceFileToken = bridge.authStore.issueTokens({
+    clientId: "evidence-file-only",
+    scopes: ["workspace.read"],
+  }).accessToken;
+  evidenceOtherFileToken = bridge.authStore.issueTokens({
+    clientId: "evidence-other-file-only",
+    scopes: ["workspace.read"],
+  }).accessToken;
 
   client = new Client({ name: "c2c-test-client", version: "1.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
@@ -143,6 +176,10 @@ describe("MCP tools over Streamable HTTP", () => {
     { name: "level3_start", scope: "execution.level3", args: { request_id: "a".repeat(24), digest: "a".repeat(64), idempotency_key: "v13-scope-key-0123456" } },
     { name: "git_write", scope: "git.write", args: { repository_path: ".", operation: { kind: "branch_list", expectedHead: null, expectedBranch: null }, timeout_seconds: 30, idempotency_key: "v13-git-scope-0123456" } },
   ];
+  const batchPolicies = [
+    { name: "batch_read", scope: "workspace.read" },
+    { name: "batch_search", scope: "workspace.search" },
+  ];
 
   it("publishes execution OAuth policies on the actual tools/list wire response", async () => {
     // SDK 1.30's client ToolSchema strips unknown top-level fields, so inspect
@@ -153,7 +190,7 @@ describe("MCP tools over Streamable HTTP", () => {
       body: JSON.stringify({ jsonrpc: "2.0", id: 41, method: "tools/list", params: {} }),
     });
     expect(response.status).toBe(200);
-    const rpc = await response.json() as { result: { tools: { name: string; securitySchemes?: unknown; _meta?: Record<string, unknown> }[] } };
+    const rpc = await response.json() as { result: { tools: { name: string; title?: string; description?: string; securitySchemes?: unknown; _meta?: Record<string, unknown> }[] } };
     const sdk = await client.listTools();
     for (const { name, scope } of executionPolicies) {
       const schemes = [{ type: "oauth2", scopes: [scope] }];
@@ -162,11 +199,33 @@ describe("MCP tools over Streamable HTTP", () => {
       expect(tool?._meta?.securitySchemes).toEqual(schemes);
       expect(sdk.tools.find((tool) => tool.name === name)?._meta?.securitySchemes).toEqual(schemes);
     }
+    const fullAccess = rpc.result.tools.find((tool) => tool.name === "execution_run");
+    expect(fullAccess?.title).toBe("Run a generic Full Access command");
+    expect(fullAccess?.description).toContain("does not require trusted-command registration or per-command approval");
+    const restrictedRecipe = rpc.result.tools.find((tool) => tool.name === "execution_start");
+    expect(restrictedRecipe?.title).toBe("Restricted: start a pre-approved package-script recipe");
+    expect(restrictedRecipe?.description).toContain("use execution_run");
     const gitCompareSecurity = [{ type: "oauth2", scopes: ["git.read"] }];
     const gitCompare = rpc.result.tools.find((tool) => tool.name === "git_compare");
     expect(gitCompare?.securitySchemes).toEqual(gitCompareSecurity);
     expect(gitCompare?._meta?.securitySchemes).toEqual(gitCompareSecurity);
     expect(sdk.tools.find((tool) => tool.name === "git_compare")?._meta?.securitySchemes).toEqual(gitCompareSecurity);
+    for (const { name, scope } of batchPolicies) {
+      const schemes = [{ type: "oauth2", scopes: [scope] }];
+      const tool = rpc.result.tools.find((tool) => tool.name === name);
+      expect(tool?.securitySchemes).toEqual(schemes);
+      expect(tool?._meta?.securitySchemes).toEqual(schemes);
+      expect(sdk.tools.find((tool) => tool.name === name)?._meta?.securitySchemes).toEqual(schemes);
+    }
+    const collectEvidence = rpc.result.tools.find((tool) => tool.name === "collect_evidence");
+    expect(collectEvidence?.description).toContain("files require workspace.read");
+    expect(collectEvidence?.description).toContain("execution_jobs execution.jobs.read");
+    expect(collectEvidence?._meta?.["io.romiola.c2c/requiredScopesBySection"]).toEqual({
+      files: "workspace.read",
+      searches: "workspace.search",
+      repositories: "git.read",
+      execution_jobs: "execution.jobs.read",
+    });
   });
 
   it.each(executionPolicies)("returns a scope-specific OAuth challenge for old-token $name", async ({ name, scope, args }) => {
@@ -198,6 +257,9 @@ describe("MCP tools over Streamable HTTP", () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
+      "batch_read",
+      "batch_search",
+      "collect_evidence",
       "create_directory",
       "create_external_file",
       "create_file",
@@ -237,6 +299,12 @@ describe("MCP tools over Streamable HTTP", () => {
       "replace_external_file",
       "replace_file",
       "search_workspace",
+      "task_cancel",
+      "task_create",
+      "task_list",
+      "task_output",
+      "task_result",
+      "task_status",
       "test_status",
       "workspace_info",
     ]);
@@ -245,6 +313,19 @@ describe("MCP tools over Streamable HTTP", () => {
     }
 
     expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
+    expectToolOutputSchema(tools, "batch_read", ["results", "returnedBytes", "sourceBytesScanned", "truncated", "nextCursor"]);
+    expectToolOutputSchema(tools, "batch_search", ["queries", "matches", "bytesScanned", "complete", "scanComplete", "resultsComplete", "totalMatches", "nextCursor"]);
+    expectToolOutputSchema(tools, "collect_evidence", ["snapshotId", "requestHash", "packageHash", "page", "nextCursor"]);
+    expect(JSON.stringify(tools.find((tool) => tool.name === "batch_search")?.outputSchema)).toContain("scanComplete");
+    expect(JSON.stringify(tools.find((tool) => tool.name === "batch_search")?.outputSchema)).toContain("resultsComplete");
+    expect(JSON.stringify(tools.find((tool) => tool.name === "collect_evidence")?.outputSchema)).toContain("continuationMode");
+    expect(JSON.stringify(tools.find((tool) => tool.name === "collect_evidence")?.outputSchema)).toContain("unavailable");
+    expect(JSON.stringify(tools.find((tool) => tool.name === "collect_evidence")?.outputSchema)).toContain("nextStartLine");
+    expect(tools.find((tool) => tool.name === "collect_evidence")?.description).toContain("continuationMode=byte");
+    expect(tools.find((tool) => tool.name === "collect_evidence")?.description).toContain("continuationMode=unavailable");
+    expect(safeToolName({ params: { name: "batch_read" } })).toBe("batch_read");
+    expect(safeToolName({ params: { name: "batch_search" } })).toBe("batch_search");
+    expect(safeToolName({ params: { name: "collect_evidence" } })).toBe("collect_evidence");
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
     expectToolOutputSchema(tools, "read_file", ["path", "content", "contentHash", "startLine", "endLine", "nextStartLine"]);
     expectToolOutputSchema(tools, "read_image", ["path", "sizeBytes", "mimeType"]);
@@ -262,11 +343,13 @@ describe("MCP tools over Streamable HTTP", () => {
     expectToolOutputSchema(tools, "execution_job_output", ["offset", "next_offset", "oldest_available_offset", "eof", "truncated", "text"]);
     expectToolOutputSchema(tools, "execution_cancel", ["job"]);
     expect(tools.find((tool) => tool.name === "execution_run")?.description)
-      .toContain("Preferred local command execution tool for C2C Full Access");
+      .toContain("Preferred local command execution tool for C2C Level 2 Full Access");
     expect(tools.find((tool) => tool.name === "execution_run")?.description)
-      .toContain("before generic remote-terminal tools");
+      .toContain("does not require trusted-command registration or per-command approval");
     expect(tools.find((tool) => tool.name === "execution_start")?.description)
       .toContain("Restricted trusted-recipe execution path");
+    expect(tools.find((tool) => tool.name === "execution_start")?.description)
+      .toContain("use execution_run");
     expect(tools.find((tool) => tool.name === "level3_request")?.description)
       .toContain("Historical restricted controlled path");
   });
@@ -278,6 +361,243 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(description).toContain("nextOffset");
     expect(description).not.toContain("has_more");
     expect(description).not.toContain("next_offset");
+  });
+
+  it("calls all three Wave 2 tools over HTTP with partial results and per-section scope checks", async () => {
+    const read = structuredContentOf<{
+      results: Array<{ id: string; ok: boolean; error?: { code: string } }>;
+      returnedBytes: number;
+      sourceBytesScanned: number;
+      truncated: boolean;
+    }>(await client.callTool({
+      name: "batch_read",
+      arguments: { items: [
+        { id: "present", path: "src/index.ts", start_line: 1 },
+        { id: "missing", path: "missing-wave2.txt", start_line: 1 },
+      ] },
+    }));
+    expect(read.results.map((item) => item.id)).toEqual(["present", "missing"]);
+    expect(read.results[0]).toMatchObject({ ok: true });
+    expect(read.results[1]).toMatchObject({ ok: false, error: { code: "FILE_NOT_FOUND" } });
+    expect(read.sourceBytesScanned).toBeGreaterThan(0);
+
+    const search = structuredContentOf<{
+      queries: Array<{ id: string; complete: boolean; scanComplete: boolean; resultsComplete: boolean; errors: Array<{ code: string }> }>;
+      matches: Array<{ id: string; path: string; text: string; untrusted: true }>;
+      complete: boolean;
+      scanComplete: boolean;
+      resultsComplete: boolean;
+    }>(await client.callTool({
+      name: "batch_search",
+      arguments: { queries: [{ id: "answer", query: "answer", mode: "literal", paths: ["src/index.ts"] }] },
+    }));
+    expect(search.queries.map((query) => query.id)).toEqual(["answer"]);
+    expect(search).toMatchObject({ complete: true, scanComplete: true, resultsComplete: true });
+    expect(search.queries[0]).toMatchObject({ complete: true, scanComplete: true, resultsComplete: true });
+    expect(search.matches.some((match) => match.text.includes("answer") && match.untrusted)).toBe(true);
+
+    const evidence = structuredContentOf<{
+      complete: boolean;
+      packageHash: string;
+      page: { files: Array<{ path: string; ranges: Array<{ continuationMode: string; nextStartLine: number | null }> }>; searches: Array<{ id: string }>; repositories: Array<{ path: string }> };
+    }>(await client.callTool({
+      name: "collect_evidence",
+      arguments: {
+        files: [{ id: "file", path: "src/index.ts", ranges: [{ start_line: 1 }] }],
+        searches: [{ id: "query", query: "answer", path: "src/index.ts" }],
+        repositories: [{ id: "repo", path: "." }],
+      },
+    }));
+    expect(evidence.packageHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(evidence.page.files[0]?.path).toBe("src/index.ts");
+    expect(evidence.page.files[0]?.ranges[0]).toMatchObject({ continuationMode: "complete", nextStartLine: null });
+    expect(evidence.page.searches[0]?.id).toBe("query");
+    expect(evidence.page.repositories[0]?.path).toBe(".");
+
+    const fileOnly = await connectHttpClient(evidenceFileToken, "c2c-evidence-file-only");
+    try {
+      const fileEvidence = structuredContentOf<{ page: { files: Array<{ id: string }> } }>(await fileOnly.callTool({
+        name: "collect_evidence",
+        arguments: { files: [{ id: "file", path: "package.json", ranges: [{ start_line: 1 }] }] },
+      }));
+      expect(fileEvidence.page.files.map((item) => item.id)).toEqual(["file:1"]);
+
+      const deniedSearch = await fileOnly.callTool({
+        name: "collect_evidence",
+        arguments: { searches: [{ id: "query", query: "react", path: "package.json" }] },
+      });
+      expect(deniedSearch.isError).toBe(true);
+      expect(textOf(deniedSearch)).toContain("INSUFFICIENT_SCOPE");
+      expect(deniedSearch._meta?.["mcp/www_authenticate"]).toEqual([
+        `Bearer resource_metadata="${bridge.localBaseUrl()}/.well-known/oauth-protected-resource/mcp", error="insufficient_scope", error_description="This operation requires the 'workspace.search' scope.", scope="workspace.search"`,
+      ]);
+
+      const deniedBatchSearch = await fileOnly.callTool({
+        name: "batch_search",
+        arguments: { queries: [{ id: "query", query: "react", mode: "literal" }] },
+      });
+      expect(deniedBatchSearch.isError).toBe(true);
+      expect(textOf(deniedBatchSearch)).toContain("INSUFFICIENT_SCOPE");
+
+      const malformed = await fileOnly.callTool({ name: "batch_read", arguments: { items: [] } });
+      expect(malformed.isError).toBe(true);
+    } finally {
+      await fileOnly.close();
+    }
+
+    const deniedJobs = await client.callTool({
+      name: "collect_evidence",
+      arguments: { execution_jobs: [{ id: "job", job_id: "a".repeat(24) }] },
+    });
+    expect(deniedJobs.isError).toBe(true);
+    expect(deniedJobs._meta?.["mcp/www_authenticate"]).toEqual([
+      `Bearer resource_metadata="${bridge.localBaseUrl()}/.well-known/oauth-protected-resource/mcp", error="insufficient_scope", error_description="This operation requires the 'execution.jobs.read' scope.", scope="execution.jobs.read"`,
+    ]);
+  });
+
+  it("keeps each complete JSON-RPC HTTP payload within the 256 KiB wire bound", async () => {
+    write(root, "wire-read.txt", "r".repeat(64 * 1024));
+    write(root, "wire-search.txt", Array.from({ length: 60 }, (_, index) =>
+      `needle-${String(index).padStart(3, "0")}-${"s".repeat(480)}`).join("\n"));
+    const evidenceFiles = Array.from({ length: 4 }, (_, index) => {
+      const filePath = `wire-evidence-${index}.txt`;
+      write(root, filePath, "e".repeat(64 * 1024));
+      return { id: `file-${index}`, path: filePath, ranges: [{ start_line: 1 }] };
+    });
+    const calls = [
+      {
+        name: "batch_read",
+        arguments: { items: [{ id: "wire", path: "wire-read.txt", offset_bytes: 0, max_bytes: 64 * 1024 }], max_total_bytes: 64 * 1024 },
+      },
+      {
+        name: "batch_search",
+        arguments: { queries: [{ id: "wire", query: "needle", mode: "literal", paths: ["wire-search.txt"], max_matches: 50 }] },
+      },
+      { name: "collect_evidence", arguments: { files: evidenceFiles } },
+    ];
+    const responseBytes = new Map<string, number>();
+
+    for (const [index, call] of calls.entries()) {
+      const response = await fetch(`${bridge.localBaseUrl()}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 100 + index,
+          method: "tools/call",
+          params: { name: call.name, arguments: call.arguments },
+        }),
+      });
+      const payload = await response.text();
+      expect(response.status).toBe(200);
+      const bytes = Buffer.byteLength(payload, "utf8");
+      responseBytes.set(call.name, bytes);
+      expect(bytes).toBeLessThanOrEqual(256 * 1024);
+
+      const rpc = JSON.parse(payload) as {
+        result?: { structuredContent?: Record<string, unknown>; isError?: boolean };
+      };
+      expect(rpc.result?.isError).not.toBe(true);
+      expect(rpc.result?.structuredContent).toBeDefined();
+      if (call.name === "batch_search") {
+        const structured = rpc.result?.structuredContent as {
+          complete: boolean;
+          scanComplete: boolean;
+          resultsComplete: boolean;
+          queries: Array<{ complete: boolean; scanComplete: boolean; resultsComplete: boolean; matchesObserved: number }>;
+        };
+        expect(structured).toMatchObject({ complete: false, scanComplete: true, resultsComplete: false });
+        expect(structured.queries[0]).toMatchObject({
+          complete: false,
+          scanComplete: true,
+          resultsComplete: false,
+          matchesObserved: 60,
+        });
+      }
+    }
+
+    expect(responseBytes.get("batch_read")).toBeGreaterThan(64 * 1024);
+    expect(responseBytes.get("batch_search")).toBeGreaterThan(20 * 1024);
+    expect(responseBytes.get("collect_evidence")).toBeGreaterThan(180 * 1024);
+  });
+
+  it("keeps batch_read and Evidence cursors alive across stateless HTTP server instances", async () => {
+    const batchItems = Array.from({ length: 10 }, (_, index) => {
+      const filePath = `batch-page-${index}.txt`;
+      write(root, filePath, `${"b".repeat(29_990)}\n`);
+      return { id: `batch-${index}`, path: filePath, start_line: 1, max_bytes: 30_000 };
+    });
+    const batchRequest = { items: batchItems, max_total_bytes: 512 * 1024 };
+    const batchPages: Array<{ results: Array<{ id: string }>; nextCursor?: string }> = [];
+    const batchWireResponse = await fetch(`${bridge.localBaseUrl()}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 71, method: "tools/call", params: { name: "batch_read", arguments: batchRequest } }),
+    });
+    expect(batchWireResponse.status).toBe(200);
+    const batchWireBody = await batchWireResponse.text();
+    expect(Buffer.byteLength(batchWireBody, "utf8")).toBeLessThanOrEqual(256 * 1024);
+    const batchWireResult = (JSON.parse(batchWireBody) as { result: unknown }).result;
+    let batchPage = structuredContentOf<typeof batchPages[number]>(batchWireResult);
+    expect(((batchWireResult as { content: Array<{ text: string }> }).content[0]?.text.length ?? 0)).toBeLessThan(512);
+    batchPages.push(batchPage);
+    expect(batchPage.nextCursor).toBeDefined();
+
+    const otherOwner = await connectHttpClient(evidenceOtherFileToken, "c2c-other-cursor-owner");
+    try {
+      const deniedCursor = await otherOwner.callTool({
+        name: "batch_read",
+        arguments: { ...batchRequest, cursor: batchPage.nextCursor },
+      });
+      expect(deniedCursor.isError).toBe(true);
+      expect(textOf(deniedCursor)).toContain("CURSOR_INVALID");
+    } finally {
+      await otherOwner.close();
+    }
+
+    while (batchPage.nextCursor) {
+      batchPage = structuredContentOf<typeof batchPages[number]>(await client.callTool({
+        name: "batch_read",
+        arguments: { ...batchRequest, cursor: batchPage.nextCursor },
+      }));
+      batchPages.push(batchPage);
+    }
+    expect(batchPages.flatMap((page) => page.results.map((item) => item.id)))
+      .toEqual(batchItems.map((item) => item.id));
+
+    const evidenceFiles = Array.from({ length: 10 }, (_, index) => {
+      const filePath = `evidence-page-${index}.txt`;
+      write(root, filePath, `${"e".repeat(29_990)}\n`);
+      return { id: `evidence-${index}`, path: filePath, ranges: [{ start_line: 1 }] };
+    });
+    const evidenceRequest = { files: evidenceFiles };
+    const evidencePages: Array<{ page: { files: Array<{ id: string }> }; nextCursor?: string }> = [];
+    const evidenceWireResponse = await fetch(`${bridge.localBaseUrl()}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 72, method: "tools/call", params: { name: "collect_evidence", arguments: evidenceRequest } }),
+    });
+    expect(evidenceWireResponse.status).toBe(200);
+    const evidenceWireBody = await evidenceWireResponse.text();
+    expect(Buffer.byteLength(evidenceWireBody, "utf8")).toBeLessThanOrEqual(256 * 1024);
+    const evidenceWireResult = (JSON.parse(evidenceWireBody) as { result: unknown }).result;
+    let evidencePage = structuredContentOf<typeof evidencePages[number]>(evidenceWireResult);
+    expect(((evidenceWireResult as { content: Array<{ text: string }> }).content[0]?.text.length ?? 0)).toBeLessThan(512);
+    evidencePages.push(evidencePage);
+    expect(evidencePage.nextCursor).toBeDefined();
+    while (evidencePage.nextCursor) {
+      evidencePage = structuredContentOf<typeof evidencePages[number]>(await client.callTool({
+        name: "collect_evidence",
+        arguments: { ...evidenceRequest, cursor: evidencePage.nextCursor },
+      }));
+      evidencePages.push(evidencePage);
+    }
+    expect(evidencePages.flatMap((page) => page.page.files.map((item) => item.id)))
+      .toEqual(evidenceFiles.map((item) => `${item.id}:1`));
   });
 
   it("reads branches with git.read while Git write remains unauthorized", async () => {
@@ -790,6 +1110,12 @@ describe("MCP tools over Streamable HTTP", () => {
     });
     expect(unauthenticated.isError).toBe(true);
     expect(textOf(unauthenticated)).toContain("UNAUTHENTICATED");
+    const unauthenticatedEvidence = await localClient.callTool({
+      name: "collect_evidence",
+      arguments: { execution_jobs: [{ id: "job", job_id: "a".repeat(24) }] },
+    });
+    expect(unauthenticatedEvidence.isError).toBe(true);
+    expect(textOf(unauthenticatedEvidence)).toContain("UNAUTHENTICATED");
     await localClient.close();
     await localServer.close();
 
@@ -863,7 +1189,33 @@ describe("MCP tools over Streamable HTTP", () => {
       }));
       expect(started.duplicate).toBe(false);
       expect(started.job.state).toBe("running");
+
+      const ownedEvidence = structuredContentOf<{ page: { artifacts: Array<{ jobId: string; ownerVerified: true }> } }>(
+        await startClient.callTool({
+          name: "collect_evidence",
+          arguments: { execution_jobs: [{ id: "owned", job_id: started.job.job_id }] },
+        })
+      );
+      expect(ownedEvidence.page.artifacts).toMatchObject([{ jobId: started.job.job_id, ownerVerified: true }]);
+
       executionRunner.emit(started.job.job_id, "stdout", `ready\n${"x".repeat(200)}`);
+      executionRunner.emit(started.job.job_id, "stdout", "FOREIGN_OWNER_OUTPUT_SENTINEL");
+
+      const foreignEvidence = structuredContentOf<{
+        page: { artifacts: unknown[]; omitted: Array<{ id: string; code: string }> };
+      }>(await otherClient.callTool({
+        name: "collect_evidence",
+        arguments: { execution_jobs: [{ id: "foreign", job_id: started.job.job_id }] },
+      }));
+      expect(foreignEvidence.page.artifacts).toEqual([]);
+      expect(foreignEvidence.page.omitted).toContainEqual({
+        kind: "execution_job", id: "foreign", code: "JOB_NOT_FOUND_OR_NOT_OWNED",
+      });
+      const foreignJson = JSON.stringify(foreignEvidence);
+      for (const restrictedField of ["state", "exitCode", "failureCode", "stdout", "stderr"]) {
+        expect(foreignJson).not.toContain(`"${restrictedField}"`);
+      }
+      expect(foreignJson).not.toContain("FOREIGN_OWNER_OUTPUT_SENTINEL");
 
       const listed = structuredJsonOf<{ jobs: McpExecutionJob[] }>(await startClient.callTool({
         name: "execution_list",
@@ -944,10 +1296,15 @@ describe("MCP tools over Streamable HTTP", () => {
       expect(hostStarted.duplicate).toBe(false);
       expect(["queued", "running"]).toContain(hostStarted.state);
       expect(hostStarted.stdout_tail).toBeUndefined();
-      for (let attempt = 0; attempt < 100 && !executionRunner.runs.has(hostStarted.job_id); attempt += 1) {
+      for (let attempt = 0; attempt < 1000 && !executionRunner.runs.has(hostStarted.job_id); attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      expect(executionRunner.runs.has(hostStarted.job_id)).toBe(true);
+      if (!executionRunner.runs.has(hostStarted.job_id)) {
+        const queuedStatus = structuredJsonOf<{ job: McpExecutionJob }>(await startClient.callTool({
+          name: "execution_status", arguments: { job_id: hostStarted.job_id },
+        }));
+        throw new Error(`FULL_ACCESS_RUNNER_START_TIMEOUT:${queuedStatus.job.state}`);
+      }
       executionRunner.emit(hostStarted.job_id, "stdout", "full access stdout tail\n");
       executionRunner.emit(hostStarted.job_id, "stderr", "full access stderr tail\n");
       executionRunner.finish(hostStarted.job_id, 0);
@@ -974,14 +1331,20 @@ describe("MCP tools over Streamable HTTP", () => {
       const inlineCwd = makeTmpDir("mcp-inline-wait-cwd");
       const inlineArgs = {
         engine: "program", executable: process.execPath, args: [], cwd: inlineCwd,
-        timeout_seconds: 30, idempotency_key: "mcp-full-access-inline-0001", wait_seconds: 2,
+        timeout_seconds: 30, idempotency_key: "mcp-full-access-inline-0001", wait_seconds: 10,
       };
       const beforeInline = new Set(executionRunner.runs.keys());
       const inlinePending = startClient.callTool({ name: "execution_run", arguments: inlineArgs });
       let inlineJobId: string | undefined;
-      for (let attempt = 0; attempt < 150 && !inlineJobId; attempt += 1) {
+      try {
+        await waitUntil(() => {
+          inlineJobId = [...executionRunner.runs.keys()].find((jobId) => !beforeInline.has(jobId));
+          return inlineJobId !== undefined;
+        }, 9_000);
+      } catch {
+        const inlineResponse = structuredJsonOf<{ job_id: string; state: string }>(await inlinePending);
         inlineJobId = [...executionRunner.runs.keys()].find((jobId) => !beforeInline.has(jobId));
-        if (!inlineJobId) await new Promise((resolve) => setTimeout(resolve, 10));
+        if (!inlineJobId) throw new Error(`MCP_INLINE_RUNNER_START_TIMEOUT:${inlineResponse.state}`);
       }
       expect(inlineJobId).toBeDefined();
       executionRunner.emit(inlineJobId!, "stdout", "finished inside inline wait\n");
@@ -1014,6 +1377,33 @@ describe("MCP tools over Streamable HTTP", () => {
       setPermission(bridge.workspace.id, "readonly");
       await startClient.close();
       await otherClient.close();
+    }
+  }, 60_000);
+
+  it("uses the Bridge-owned persistent Task runtime through the production MCP route", async () => {
+    const taskClient = await connectHttpClient(executionToken, "task-api-bridge-owner");
+    try {
+      const listedTools = await taskClient.listTools();
+      expect(listedTools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+        "task_create", "task_status", "task_list", "task_result", "task_output", "task_cancel",
+      ]));
+      const created = structuredContentOf<{ task_id: string; state: string; plan_hash: string; duplicate: boolean }>(
+        await taskClient.callTool({
+          name: "task_create",
+          arguments: {
+            idempotency_key: "bridge-task-api-empty-plan-001",
+            plan: { version: 1, maxDurationMs: 60_000, steps: [] },
+          },
+        }),
+      );
+      expect(created).toMatchObject({ state: "QUEUED", duplicate: false });
+      await waitUntil(() => bridge.taskStore.get(created.task_id)?.state === "COMPLETED");
+      const status = structuredContentOf<{ task_id: string; state: string; completed_steps: number; total_steps: number }>(
+        await taskClient.callTool({ name: "task_status", arguments: { task_id: created.task_id } }),
+      );
+      expect(status).toEqual(expect.objectContaining({ task_id: created.task_id, state: "COMPLETED", completed_steps: 0, total_steps: 0 }));
+    } finally {
+      await taskClient.close();
     }
   });
 });

@@ -26,12 +26,19 @@ export const SYSTEM_TOOL_SCOPES = {
   path_inspect: "system.read",
 } as const;
 
+export const BATCH_TOOL_SCOPES = {
+  batch_read: "workspace.read",
+  batch_search: "workspace.search",
+} as const;
+
 type ExecutionTool = keyof typeof EXECUTION_TOOL_SCOPES;
 type ExecutionScope = (typeof EXECUTION_TOOL_SCOPES)[ExecutionTool];
 type SystemTool = keyof typeof SYSTEM_TOOL_SCOPES;
-type OAuthScope = ExecutionScope | (typeof SYSTEM_TOOL_SCOPES)[SystemTool];
+type BatchTool = keyof typeof BATCH_TOOL_SCOPES;
+type OAuthScope = ExecutionScope | (typeof SYSTEM_TOOL_SCOPES)[SystemTool] | (typeof BATCH_TOOL_SCOPES)[BatchTool];
 type OAuthScheme = { type: "oauth2"; scopes: ExecutionScope[] };
 type SystemOAuthScheme = { type: "oauth2"; scopes: (typeof SYSTEM_TOOL_SCOPES)[SystemTool][] };
+type BatchOAuthScheme = { type: "oauth2"; scopes: (typeof BATCH_TOOL_SCOPES)[BatchTool][] };
 
 export function executionToolAuth(name: ExecutionTool) {
   const securitySchemes: OAuthScheme[] = [{ type: "oauth2", scopes: [EXECUTION_TOOL_SCOPES[name]] }];
@@ -41,6 +48,23 @@ export function executionToolAuth(name: ExecutionTool) {
 export function systemToolAuth(name: SystemTool) {
   const securitySchemes: SystemOAuthScheme[] = [{ type: "oauth2", scopes: [SYSTEM_TOOL_SCOPES[name]] }];
   return { securitySchemes, _meta: { securitySchemes } };
+}
+
+export function batchToolAuth(name: BatchTool) {
+  const securitySchemes: BatchOAuthScheme[] = [{ type: "oauth2", scopes: [BATCH_TOOL_SCOPES[name]] }];
+  return { securitySchemes, _meta: { securitySchemes } };
+}
+
+/** Task creation scopes depend on the immutable plan and are enforced per call. */
+export function taskCreateToolAuth() {
+  const securitySchemes = [{ type: "oauth2" as const, scopes: [] as string[] }];
+  return {
+    securitySchemes,
+    _meta: {
+      securitySchemes,
+      "c2c/task-scope-model": "plan-derived",
+    },
+  };
 }
 
 /** Quote RFC 7235 auth parameters; never allow a header/challenge line break. */
@@ -80,8 +104,16 @@ export function installExecutionOAuthListing(server: McpServer): () => void {
   return () => { server.server.setRequestHandler = original; };
 }
 
-function authForTool(name: string): ReturnType<typeof executionToolAuth> | ReturnType<typeof systemToolAuth> | null {
+function authForTool(
+  name: string
+): ReturnType<typeof executionToolAuth> | ReturnType<typeof systemToolAuth> | ReturnType<typeof batchToolAuth> | ReturnType<typeof taskCreateToolAuth> | null {
+  if (name === "task_create") return taskCreateToolAuth();
+  if (name === "task_status" || name === "task_result") return executionToolAuth("execution_status");
+  if (name === "task_list") return executionToolAuth("execution_list");
+  if (name === "task_output") return executionToolAuth("execution_job_output");
+  if (name === "task_cancel") return executionToolAuth("execution_cancel");
   if (Object.hasOwn(EXECUTION_TOOL_SCOPES, name)) return executionToolAuth(name as ExecutionTool);
   if (Object.hasOwn(SYSTEM_TOOL_SCOPES, name)) return systemToolAuth(name as SystemTool);
+  if (Object.hasOwn(BATCH_TOOL_SCOPES, name)) return batchToolAuth(name as BatchTool);
   return null;
 }

@@ -16,6 +16,16 @@ describe("sanitizeExecutionOutput", () => {
     }
   });
 
+  it("redacts bare OpenAI project API keys", () => {
+    const key = `sk-proj-${"p".repeat(32)}`;
+    const result = sanitizeExecutionOutput(`value ${key} suffix`);
+    expect(result.allowed).toBe(true);
+    if (result.allowed) {
+      expect(result.text).not.toContain(key);
+      expect(result.text).toContain("[REDACTED]");
+    }
+  });
+
   it("rejects private keys entirely", () => {
     const result = sanitizeExecutionOutput("oops\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----");
     expect(result.allowed).toBe(false);

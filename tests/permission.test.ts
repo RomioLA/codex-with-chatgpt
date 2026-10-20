@@ -159,6 +159,49 @@ describe("permission state", () => {
     }
   });
 
+  it("keeps a grant readable when its Native launch permit is released during the owner probe", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    setPermission(WORKSPACE_A, "level2");
+    const lockFile = `${stateFile(WORKSPACE_A)}.lock`;
+    const ownerPid = 987654321;
+    fs.writeFileSync(lockFile, `launch:${ownerPid}\n`, { flag: "wx" });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid === ownerPid) {
+        fs.unlinkSync(lockFile);
+        throw Object.assign(new Error("launch owner exited during probe"), { code: "ESRCH" });
+      }
+      return true;
+    });
+    try {
+      expect(readCurrentSessionGrant(WORKSPACE_A) !== null).toBe(true);
+      expect(killSpy).toHaveBeenCalledWith(ownerPid, 0);
+    } finally {
+      killSpy.mockRestore();
+      if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+    }
+  });
+
+  it("keeps a grant readable when Native releases its launch permit before lock identity recheck", () => {
+    usedWorkspaceIds.add(WORKSPACE_A);
+    setPermission(WORKSPACE_A, "level2");
+    const grant = readCurrentSessionGrant(WORKSPACE_A);
+    const lockFile = `${stateFile(WORKSPACE_A)}.lock`;
+    fs.writeFileSync(lockFile, `launch:${process.pid}\n`, { flag: "wx" });
+    const originalLstat = fs.lstatSync;
+    let lockStats = 0;
+    const releaseDuringIdentityRecheck = vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+      if (file === lockFile && ++lockStats === 2) fs.unlinkSync(lockFile);
+      return Reflect.apply(originalLstat, fs, [file, ...args]);
+    }) as typeof fs.lstatSync);
+    try {
+      expect(readCurrentSessionGrant(WORKSPACE_A)).toEqual(grant);
+      expect(readPermission(WORKSPACE_A)).toBe("level2");
+    } finally {
+      releaseDuringIdentityRecheck.mockRestore();
+      if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+    }
+  });
+
   it("does not treat a non-canonical grant timestamp or missing state timestamp as current", () => {
     usedWorkspaceIds.add(WORKSPACE_A);
     setPermission(WORKSPACE_A, "level2");

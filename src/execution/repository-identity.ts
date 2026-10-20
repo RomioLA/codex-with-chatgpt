@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { runGit } from "../workspace/git.js";
+import { runGit, type GitReadOptions } from "../workspace/git.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 
 const normPath = (value: string): string =>
@@ -90,7 +90,11 @@ function directoryFileIdentity(value: string): string {
 }
 
 /** Resolve an existing in-workspace Git repository/worktree and fingerprint its canonical identity. */
-export function resolveRepositoryIdentity(workspace: Workspace, requestedPath: string): RepositoryIdentity {
+export function resolveRepositoryIdentity(
+  workspace: Workspace,
+  requestedPath: string,
+  options: GitReadOptions = {}
+): RepositoryIdentity {
   let selected: { abs: string; rel: string };
   try {
     const lexicalPath = requestedRepositoryPath(workspace.root, requestedPath);
@@ -103,9 +107,9 @@ export function resolveRepositoryIdentity(workspace: Workspace, requestedPath: s
   }
   assertNoReparseComponents(workspace.root, selected.abs);
 
-  const top = runGit(selected.abs, ["rev-parse", "--show-toplevel"]);
-  const gitDir = runGit(selected.abs, ["rev-parse", "--absolute-git-dir"]);
-  const commonDir = runGit(selected.abs, ["rev-parse", "--git-common-dir"]);
+  const top = runGit(selected.abs, ["rev-parse", "--show-toplevel"], options);
+  const gitDir = runGit(selected.abs, ["rev-parse", "--absolute-git-dir"], options);
+  const commonDir = runGit(selected.abs, ["rev-parse", "--git-common-dir"], options);
   if (!top.ok || !gitDir.ok || !commonDir.ok) throw new RepositoryIdentityError("INVALID_REPOSITORY");
 
   let canonicalTop: string;

@@ -12,6 +12,7 @@ const HARD_REJECT: RegExp[] = [
 const EXTRA_REDACT: RegExp[] = [
   /\bghp_[A-Za-z0-9]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bsk-proj-[A-Za-z0-9_-]{20,}\b/g,
   /\bsk-[A-Za-z0-9]{20,}\b/g,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
   /\bAKIA[0-9A-Z]{16}\b/g,

@@ -2,6 +2,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import { Workspace } from "../workspace/manager.js";
+import { SnapshotRegistry } from "../workspace/batch.js";
 import { AuthStore } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
@@ -19,6 +20,8 @@ import { probeBridge, writeRuntimeState, clearRuntimeState, type RuntimeState } 
 import { acquireBridgeInstanceLock, type BridgeInstanceLock } from "./instance-lock.js";
 import { ensurePermissionMigrated, readPermission } from "../permission/index.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../execution/supervisor.js";
+import { TaskStore } from "../tasks/task-store.js";
+import { TaskSupervisor } from "../tasks/task-supervisor.js";
 import {
   eventLoopTraceMiddleware,
   getEventLoopTraceSnapshot,
@@ -62,6 +65,9 @@ export interface Bridge {
   pairing: PairingManager;
   tunnel: TunnelProvider;
   executionSupervisor: ExecutionSupervisor;
+  /** Internal persistent Task runtime. No Task MCP tools are registered in this wave. */
+  taskStore: TaskStore;
+  taskSupervisor: TaskSupervisor;
   getPublicBaseUrl(): string | null;
   localBaseUrl(): string;
   close(): Promise<void>;
@@ -108,6 +114,7 @@ function listen(
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  const snapshotRegistry = new SnapshotRegistry();
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -154,11 +161,14 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
   let executionSupervisor: ExecutionSupervisor | null = null;
+  let taskSupervisor: TaskSupervisor | null = null;
   const mcpHandler = createMcpHttpHandler(
     () => createMcpServer({
       workspace,
       logger,
+      snapshotRegistry,
       executionSupervisor: executionSupervisor ?? undefined,
+      taskSupervisor: taskSupervisor ?? undefined,
       oauthResourceMetadataUri: `${getBaseUrl()}/.well-known/oauth-protected-resource/mcp`,
     }),
     logger
@@ -281,9 +291,27 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // including persistRuntime:false instances, must hold it before listening.
   const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id);
   const supervisor = new ExecutionSupervisor(workspace, { runner: opts.executionRunner, logger });
+  let taskStore: TaskStore;
+  try {
+    taskStore = new TaskStore(workspace.id);
+  } catch (error) {
+    await supervisor.shutdown().catch(() => undefined);
+    await instanceLock.release().catch(() => undefined);
+    throw error;
+  }
+  const persistentTaskSupervisor = new TaskSupervisor(workspace, taskStore, supervisor, {
+    snapshotRegistry,
+    requireRecovery: true,
+    authorizationValid: (task) => authStore.hasActiveAuthorization(task.ownerClientId, task.authBinding.requiredScopes),
+  });
+  taskSupervisor = persistentTaskSupervisor;
+  // ExecutionJobStore loads in the ExecutionSupervisor constructor. Reconcile
+  // TaskStore against it before the listener accepts Task API mutations.
+  await persistentTaskSupervisor.recover();
   executionSupervisor = supervisor;
   const listening = await listen(app, host, opts.port ?? DEFAULT_PORT, workspace.id).catch(async (error: unknown) => {
     await supervisor.shutdown().catch(() => undefined);
+    await persistentTaskSupervisor.shutdown().catch(() => undefined);
     await instanceLock.release().catch(() => undefined);
     throw error;
   });
@@ -310,6 +338,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     persistRuntime();
   } catch (error) {
     await supervisor.shutdown().catch(() => undefined);
+    await persistentTaskSupervisor.shutdown().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await instanceLock.release().catch(() => undefined);
     throw error;
@@ -320,6 +349,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     if (closed) return;
     closed = true;
     await supervisor.shutdown();
+    await persistentTaskSupervisor.shutdown();
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
@@ -336,6 +366,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     pairing,
     tunnel,
     executionSupervisor: supervisor,
+    taskStore,
+    taskSupervisor: persistentTaskSupervisor,
     getPublicBaseUrl: () => publicBaseUrl,
     localBaseUrl,
     close: shutdown,

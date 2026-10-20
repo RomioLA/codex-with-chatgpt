@@ -53,6 +53,11 @@ export type FullAccessExecutionAuthorization = {
   requestHash: string;
 };
 
+export interface FullAccessRepositoryScope {
+  identity: string;
+  path: string;
+}
+
 export interface ExecutionTempOwnership {
   rootFileIdentity: string;
   directoryFileIdentity: string;
@@ -105,6 +110,8 @@ export interface FullAccessExecutionJob extends ExecutionJobBase {
   recipe: null;
   authorization: FullAccessExecutionAuthorization;
   fullAccessCommand: FullAccessCommand;
+  /** Optional repository lock scope for host commands launched on behalf of a task. */
+  repositoryScope?: FullAccessRepositoryScope;
   gitResult?: never;
 }
 

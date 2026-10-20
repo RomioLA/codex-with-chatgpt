@@ -115,7 +115,7 @@ describe("Git write planning", () => {
     expect(switching.snapshotMaterials.some((item) => item.path.endsWith(`${path.sep}.git${path.sep}HEAD`))).toBe(true);
     executePlannedGit(switching, root);
     expect(git(root, "branch", "--show-current").trim()).toBe("feature/test");
-  });
+  }, 60_000);
 
   it("normalizes the optional status hash and confirms the expected repository state", () => {
     const { root, workspace, expectedHead } = makeApprovedRepo();

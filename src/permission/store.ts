@@ -28,6 +28,7 @@ interface PersistedPermission {
   workspaceId: string;
   baselineMode: PermissionBaselineMode;
   sessionGrant?: unknown;
+  authorizationEpoch?: number;
   updatedAt: string;
 }
 
@@ -77,8 +78,15 @@ function permissionLockBlocksRead(workspaceId: string): boolean {
   catch { return true; }
   try {
     const current = fs.lstatSync(file);
-    if (current.dev !== observed.dev || current.ino !== observed.ino || !current.isFile() || current.isSymbolicLink()) return true;
-  } catch { return true; }
+    if (current.dev !== observed.dev || current.ino !== observed.ino || !current.isFile() || current.isSymbolicLink()) {
+      return true;
+    }
+  } catch (error) {
+    // A lock that disappeared after its owner record was read has been released.
+    // Callers verify the lock again after reading permission state.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    return true;
+  }
 
   // A live Native launch permit holds this same exclusive lock only across
   // permission validation and ResumeThread. It does not mutate the manifest,
@@ -88,7 +96,15 @@ function permissionLockBlocksRead(workspaceId: string): boolean {
   const pid = Number(launchOwner[1]);
   if (!Number.isSafeInteger(pid)) return true;
   try { process.kill(pid, 0); return false; }
-  catch { return true; }
+  catch {
+    // The Native helper can release its launch permit between the identity
+    // check above and this PID probe. Only treat the failed probe as blocking
+    // while a lock path still exists; replaced or unreadable locks stay closed.
+    try {
+      fs.lstatSync(file);
+      return true;
+    } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+  }
 }
 
 function removeStalePermissionLock(file: string): boolean {
@@ -244,11 +260,17 @@ function withPermissionLock<T>(workspaceId: string, action: () => T): T {
   }
 }
 
-function buildState(workspaceId: string, baselineMode: PermissionBaselineMode, identityFingerprint?: string): PersistedPermission {
+function buildState(
+  workspaceId: string,
+  baselineMode: PermissionBaselineMode,
+  identityFingerprint?: string,
+  authorizationEpoch = 0,
+): PersistedPermission {
   const state: PersistedPermission = {
     version: PERMISSION_STATE_VERSION,
     workspaceId,
     baselineMode,
+    authorizationEpoch,
     updatedAt: new Date().toISOString(),
   };
   if (identityFingerprint && SESSION_FINGERPRINT_PATTERN.test(identityFingerprint)) {
@@ -286,6 +308,63 @@ export function readCurrentSessionGrant(workspaceId: string): CurrentSessionGran
   }
 }
 
+function readAuthorizationEpochFile(workspaceId: string): number | null {
+  const file = permissionFile(workspaceId);
+  let stat: ReturnType<typeof fs.lstatSync>;
+  try { stat = fs.lstatSync(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    return null;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) return null;
+  const value = readJsonIfExists<unknown>(file);
+  if (isCurrentState(value, workspaceId)) {
+    if (value.authorizationEpoch === undefined) return 0;
+    return Number.isSafeInteger(value.authorizationEpoch) && value.authorizationEpoch >= 0
+      ? value.authorizationEpoch
+      : null;
+  }
+  if (isLegacyState(value, workspaceId)) return 0;
+  return null;
+}
+
+/**
+ * Monotonic workspace authorization version used by persistent Tasks.
+ * A malformed or busy permission record is unverifiable and therefore null.
+ */
+export function readAuthorizationEpoch(workspaceId: string): number | null {
+  if (!isWorkspaceId(workspaceId) || permissionLockBlocksRead(workspaceId)) return null;
+  const epoch = readAuthorizationEpochFile(workspaceId);
+  return permissionLockBlocksRead(workspaceId) ? null : epoch;
+}
+
+/** Persist one strong authorization revocation/reset under the permission lock. */
+export function incrementAuthorizationEpoch(workspaceId: string): number {
+  if (!isWorkspaceId(workspaceId)) throw new TypeError("Invalid workspaceId");
+  return withPermissionLock(workspaceId, () => {
+    const current = readAuthorizationEpochFile(workspaceId);
+    if (current === null || current >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("AUTHORIZATION_EPOCH_UNAVAILABLE");
+    }
+    const file = permissionFile(workspaceId);
+    const value = readJsonIfExists<unknown>(file);
+    let next: PersistedPermission;
+    if (isCurrentState(value, workspaceId)) {
+      next = { ...value, authorizationEpoch: current + 1, updatedAt: new Date().toISOString() };
+    } else if (isLegacyState(value, workspaceId)) {
+      next = buildState(workspaceId, baselineForLegacyState(value), undefined, current + 1);
+    } else {
+      let exists = true;
+      try { fs.lstatSync(file); }
+      catch (error) { exists = (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+      if (exists) throw new Error("AUTHORIZATION_EPOCH_UNAVAILABLE");
+      next = buildState(workspaceId, "readonly", undefined, current + 1);
+    }
+    writePermissionState(file, next);
+    return current + 1;
+  });
+}
+
 /**
  * Local startup/CLI migration only. MCP status reads never call this function,
  * so a remote read cannot create a Level 2 session grant from legacy state.
@@ -309,7 +388,10 @@ export function ensurePermissionMigrated(workspaceId: string): PermissionStatus 
         if (!identity || !isPreGenerationSessionGrant(previousGrant) || identity !== previousGrant.identityFingerprint) {
           return makeStatus(value.baselineMode, false);
         }
-        const upgraded = buildState(workspaceId, value.baselineMode, identity);
+        const epoch = Number.isSafeInteger(value.authorizationEpoch) && Number(value.authorizationEpoch) >= 0
+          ? Number(value.authorizationEpoch)
+          : 0;
+        const upgraded = buildState(workspaceId, value.baselineMode, identity, epoch);
         try {
           writePermissionState(file, upgraded);
         } catch {
@@ -343,8 +425,14 @@ export function setPermission(workspaceId: string, mode: PermissionMode): Permis
 
   const baselineMode: PermissionBaselineMode = mode === "readonly" ? "readonly" : "level1";
   const fingerprint = mode === "level2" ? getCurrentSessionIdentityFingerprint() : null;
-  const state = buildState(workspaceId, baselineMode, fingerprint ?? undefined);
   return withPermissionLock(workspaceId, () => {
+    const epoch = readAuthorizationEpochFile(workspaceId);
+    if (epoch === null || epoch >= Number.MAX_SAFE_INTEGER) throw new Error("AUTHORIZATION_EPOCH_UNAVAILABLE");
+    const previous = readJsonIfExists<unknown>(permissionFile(workspaceId));
+    const previousGrant = isCurrentState(previous, workspaceId) && isSessionGrant(previous.sessionGrant) ||
+      isLegacyState(previous, workspaceId) && previous.mode === "level2";
+    const authorizationEpoch = epoch + (mode === "level2" || previousGrant ? 1 : 0);
+    const state = buildState(workspaceId, baselineMode, fingerprint ?? undefined, authorizationEpoch);
     writePermissionState(permissionFile(workspaceId), state);
     return statusForCurrentState(state).effectiveMode;
   });

@@ -38,6 +38,7 @@ describe("StreamingSanitizer", () => {
     const secrets = [
       `ghp_${"g".repeat(24)}`,
       `github_pat_${"p".repeat(24)}`,
+      `sk-proj-${"q".repeat(30)}`,
       `sk-${"s".repeat(24)}`,
       `xoxb-${"x".repeat(16)}`,
       `AKIA${"A".repeat(16)}`,

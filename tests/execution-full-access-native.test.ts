@@ -302,7 +302,9 @@ describe("Windows Full Access native execution", () => {
         (state) => `${JSON.stringify(state)} trailing-data`,
       ];
 
+      let validState: Record<string, unknown> | undefined;
       for (let index = 0; index < variants.length; index += 1) {
+        if (validState) fs.writeFileSync(permissionFile, JSON.stringify(validState));
         const marker = path.join(cwd, `invalid-state-${index}.txt`);
         const request = await createRequest(stateRoot, workspace, {
           engine: "program",
@@ -310,7 +312,7 @@ describe("Windows Full Access native execution", () => {
           args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'unexpected')`],
           cwd,
         });
-        const validState = JSON.parse(fs.readFileSync(permissionFile, "utf8")) as Record<string, unknown>;
+        validState = JSON.parse(fs.readFileSync(permissionFile, "utf8")) as Record<string, unknown>;
         fs.writeFileSync(permissionFile, variants[index](validState));
         const run = start(new WindowsNativeExecutionRunner({ moduleDirectory }), request);
         const completion = await waitCompletion(run.handle, 15_000);

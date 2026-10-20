@@ -46,6 +46,7 @@ const TOKEN_PATTERNS: Array<{
   { pattern: /c2c_(?:at|rt|ac|admin)_[A-Za-z0-9_-]+/g, skipClass: /[A-Za-z0-9_-]/, boundaryBefore: false, boundaryAfter: "none" },
   { pattern: /ghp_[A-Za-z0-9]{20,}/g, skipClass: /[A-Za-z0-9]/, boundaryBefore: true, boundaryAfter: "none" },
   { pattern: /github_pat_[A-Za-z0-9_]{20,}/g, skipClass: /[A-Za-z0-9_]/, boundaryBefore: true, boundaryAfter: "none" },
+  { pattern: /sk-proj-[A-Za-z0-9_-]{20,}/g, skipClass: /[A-Za-z0-9_-]/, boundaryBefore: true, boundaryAfter: "none" },
   { pattern: /sk-[A-Za-z0-9]{20,}/g, skipClass: /[A-Za-z0-9]/, boundaryBefore: true, boundaryAfter: "none" },
   { pattern: /xox[baprs]-[A-Za-z0-9-]{10,}/g, skipClass: /[A-Za-z0-9-]/, boundaryBefore: true, boundaryAfter: "none" },
   { pattern: /AKIA[0-9A-Z]{16}/g, skipClass: /[A-Za-z0-9_]/, boundaryBefore: true, boundaryAfter: "word" },

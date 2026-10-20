@@ -13,6 +13,17 @@ export interface GitCommandResult {
   code: number | null;
 }
 
+export interface GitReadOptions {
+  /** Absolute performance.now() deadline shared by a bounded read operation. */
+  deadlineAt?: number;
+}
+
+function assertGitDeadline(options: GitReadOptions): void {
+  if (options.deadlineAt !== undefined && performance.now() >= options.deadlineAt) {
+    throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+  }
+}
+
 const SAFE_GIT_GLOBAL_ARGS = [
   "--no-pager",
   "-c", "core.fsmonitor=false",
@@ -97,17 +108,32 @@ function resolveTrustedGitExecutable(root: string): GitExecutable | null {
   return null;
 }
 
-function spawnGit(executable: string, root: string, args: string[], env: NodeJS.ProcessEnv) {
+function spawnGit(
+  executable: string,
+  root: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  deadlineAt?: number
+) {
+  if (deadlineAt !== undefined && performance.now() >= deadlineAt) {
+    throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+  }
+  const remainingMs = deadlineAt === undefined ? 30_000 : Math.max(1, Math.floor(deadlineAt - performance.now()));
   const options = {
     cwd: root,
     encoding: "utf8" as const,
     env,
     maxBuffer: 64 * 1024 * 1024,
-    timeout: 30_000,
+    timeout: remainingMs,
     windowsHide: true,
     shell: false,
   };
-  if (!isEventLoopTraceEnabled()) return spawnSync(executable, args, options);
+  if (!isEventLoopTraceEnabled()) {
+    if (deadlineAt !== undefined && performance.now() >= deadlineAt) {
+      throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+    }
+    return spawnSync(executable, args, options);
+  }
 
   let operationClass: "rev-parse" | "status" | "diff" | "config" | "other" = "other";
   for (let index = 0; index < args.length; index += 1) {
@@ -122,6 +148,9 @@ function spawnGit(executable: string, root: string, args: string[], env: NodeJS.
   }
   const span = beginEventLoopTraceSpan("git_sync", { operationClass });
   try {
+    if (deadlineAt !== undefined && performance.now() >= deadlineAt) {
+      throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+    }
     const result = spawnSync(executable, args, options);
     const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
     const timedOut = errorCode === "ETIMEDOUT";
@@ -140,7 +169,12 @@ function spawnGit(executable: string, root: string, args: string[], env: NodeJS.
 }
 
 /** Find configured clean/process filters so worktree queries can disable their commands. */
-function getFilterExecutionConfigKeys(root: string, env: NodeJS.ProcessEnv, executable: string): string[] | null {
+function getFilterExecutionConfigKeys(
+  root: string,
+  env: NodeJS.ProcessEnv,
+  executable: string,
+  deadlineAt?: number
+): string[] | null {
   const result = spawnGit(executable, root, [
     ...SAFE_GIT_GLOBAL_ARGS,
     "config",
@@ -148,7 +182,7 @@ function getFilterExecutionConfigKeys(root: string, env: NodeJS.ProcessEnv, exec
     "--name-only",
     "--get-regexp",
     "^filter\\..*\\.(clean|process)$",
-  ], env);
+  ], env, deadlineAt);
   // `git config --get-regexp` returns 1 when there are no matching keys.
   if (result.status !== 0 && result.status !== 1) return null;
 
@@ -166,8 +200,15 @@ function getFilterExecutionConfigKeys(root: string, env: NodeJS.ProcessEnv, exec
   return keys;
 }
 
-export function runGit(root: string, args: string[]): GitCommandResult {
+export function runGit(root: string, args: string[], options: GitReadOptions = {}): GitCommandResult {
+  if (options.deadlineAt !== undefined && (!Number.isFinite(options.deadlineAt) || options.deadlineAt <= 0)) {
+    throw new RangeError("deadlineAt must be a positive finite performance.now() timestamp");
+  }
+  if (options.deadlineAt !== undefined && performance.now() >= options.deadlineAt) {
+    throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+  }
   const executable = resolveTrustedGitExecutable(root);
+  assertGitDeadline(options);
   if (!executable) {
     throw new WorkspaceError("GIT_EXECUTABLE_UNTRUSTED", "Unable to establish a trusted Git executable.");
   }
@@ -175,8 +216,11 @@ export function runGit(root: string, args: string[]): GitCommandResult {
   let safeArgs = [...SAFE_GIT_GLOBAL_ARGS, ...args];
 
   if (args[0] === "diff" || args[0] === "status") {
-    const filterKeys = getFilterExecutionConfigKeys(root, env, executable.path);
+    const filterKeys = getFilterExecutionConfigKeys(root, env, executable.path, options.deadlineAt);
     if (filterKeys === null) {
+      if (options.deadlineAt !== undefined && performance.now() >= options.deadlineAt) {
+        throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+      }
       return {
         ok: false,
         stdout: "",
@@ -197,7 +241,15 @@ export function runGit(root: string, args: string[]): GitCommandResult {
       : [...SAFE_GIT_GLOBAL_ARGS, ...filterOverrides, ...args];
   }
 
-  const result = spawnGit(executable.path, root, safeArgs, env);
+  if (options.deadlineAt !== undefined && performance.now() >= options.deadlineAt) {
+    throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+  }
+  const result = spawnGit(executable.path, root, safeArgs, env, options.deadlineAt);
+  const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+  if (options.deadlineAt !== undefined &&
+    (timedOut || performance.now() >= options.deadlineAt)) {
+    throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+  }
   return {
     ok: result.status === 0,
     stdout: result.stdout ?? "",
@@ -287,8 +339,10 @@ function createNestedSensitivePolicy(workspace: Workspace, repositoryRoot: strin
 /** Resolve an optional workspace-relative repository selector without allowing parent-repo fallback. */
 export function selectGitRepository(
   workspace: Workspace,
-  requestedRepositoryPath?: string
+  requestedRepositoryPath?: string,
+  options: GitReadOptions = {}
 ): GitRepositorySelection {
+  assertGitDeadline(options);
   const explicit = requestedRepositoryPath !== undefined;
   const resolved = explicit
     ? workspace.resolveRepositoryPath(requestedRepositoryPath)
@@ -297,7 +351,8 @@ export function selectGitRepository(
   const target: WorkspaceLike = explicit
     ? { root, ignoreRules: createNestedSensitivePolicy(workspace, root) }
     : workspace;
-  const topResult = runGit(root, ["rev-parse", "--show-toplevel"]);
+  const topResult = runGit(root, ["rev-parse", "--show-toplevel"], options);
+  assertGitDeadline(options);
   let topAbs: string | null = null;
   let topLevel: string | null = null;
   if (topResult.ok) {
@@ -335,7 +390,8 @@ export interface GitRepositoryInfo {
   dirty: boolean | null;
 }
 
-export function gitRepositoryInfo(selection: GitRepositorySelection): GitRepositoryInfo {
+export function gitRepositoryInfo(selection: GitRepositorySelection, options: GitReadOptions = {}): GitRepositoryInfo {
+  assertGitDeadline(options);
   const empty: GitRepositoryInfo = {
     isRepo: false,
     requestedRepositoryPath: selection.requestedRepositoryPath,
@@ -347,9 +403,12 @@ export function gitRepositoryInfo(selection: GitRepositorySelection): GitReposit
   };
   if (!selection.isRepo) return empty;
 
-  const branch = runGit(selection.target.root, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  const head = runGit(selection.target.root, ["rev-parse", "HEAD"]);
-  const status = runGit(selection.target.root, ["status", "--porcelain", "--", "."]);
+  const branch = runGit(selection.target.root, ["rev-parse", "--abbrev-ref", "HEAD"], options);
+  assertGitDeadline(options);
+  const head = runGit(selection.target.root, ["rev-parse", "HEAD"], options);
+  assertGitDeadline(options);
+  const status = runGit(selection.target.root, ["status", "--porcelain", "--", "."], options);
+  assertGitDeadline(options);
   return {
     ...empty,
     isRepo: true,
@@ -374,7 +433,8 @@ export interface GitStatusResult {
   hidden: { changes: number; conflicts: number };
 }
 
-export function gitStatus(target: GitTarget): GitStatusResult {
+export function gitStatus(target: GitTarget, options: GitReadOptions = {}): GitStatusResult {
+  assertGitDeadline(options);
   const root = typeof target === "string" ? target : target.root;
   const ignoreRules =
     typeof target === "object" && target.ignoreRules ? target.ignoreRules : new IgnoreRules(root);
@@ -390,9 +450,11 @@ export function gitStatus(target: GitTarget): GitStatusResult {
     conflicted: [],
     hidden: { changes: 0, conflicts: 0 },
   };
-  const result = runGit(root, ["status", "--porcelain=v2", "-z", "--branch", "--", "."]);
+  const result = runGit(root, ["status", "--porcelain=v2", "-z", "--branch", "--", "."], options);
+  assertGitDeadline(options);
   if (!result.ok) return empty;
-  const prefixResult = runGit(root, ["rev-parse", "--show-prefix"]);
+  const prefixResult = runGit(root, ["rev-parse", "--show-prefix"], options);
+  assertGitDeadline(options);
   if (!prefixResult.ok) return empty;
   const repositoryPrefix = prefixResult.stdout.replace(/\r?\n$/, "");
   const toWorkspacePath = (repositoryPath: string): string | null => {
@@ -419,6 +481,7 @@ export function gitStatus(target: GitTarget): GitStatusResult {
 
   const records = result.stdout.split("\0");
   for (let i = 0; i < records.length; i += 1) {
+    assertGitDeadline(options);
     const line = records[i] ?? "";
     if (line.startsWith("# branch.head ")) {
       out.branch = line.slice("# branch.head ".length).trim();
@@ -474,6 +537,7 @@ export function gitStatus(target: GitTarget): GitStatusResult {
       return empty;
     }
   }
+  assertGitDeadline(options);
   return out;
 }
 
@@ -543,8 +607,10 @@ function isSensitiveGitPath(ignoreRules: SensitivePathPolicy, filePath: string):
 export function gitDiff(
   target: GitTarget,
   opts: GitDiffOptions = {},
-  relPath?: string
+  relPath?: string,
+  options: GitReadOptions = {}
 ): GitDiffResult {
+  assertGitDeadline(options);
   const root = typeof target === "string" ? target : target.root;
   const ignoreRules =
     typeof target === "object" && target.ignoreRules
@@ -567,7 +633,8 @@ export function gitDiff(
     "--",
     ".",
   ];
-  const listResult = runGit(root, listArgs);
+  const listResult = runGit(root, listArgs, options);
+  assertGitDeadline(options);
   if (!listResult.ok) {
     return {
       isRepo: false,
@@ -584,6 +651,7 @@ export function gitDiff(
   const tokens = listResult.stdout.split("\0");
   const safePaths: string[] = [];
   for (let i = 0; i < tokens.length; ) {
+    assertGitDeadline(options);
     const status = tokens[i++];
     if (!status) break;
     if (status.startsWith("R") || status.startsWith("C")) {
@@ -611,6 +679,7 @@ export function gitDiff(
   }
 
   if (safePaths.length === 0) {
+    assertGitDeadline(options);
     return {
       isRepo: true,
       mode,
@@ -630,6 +699,7 @@ export function gitDiff(
   const MAX_AGGREGATE_DIFF_BYTES = 64 * 1024 * 1024;
 
   for (const batch of batches) {
+    assertGitDeadline(options);
     const pathspecs = batch.map((p) => `:(literal)${p}`);
     const diffArgs = [
       "diff",
@@ -640,7 +710,8 @@ export function gitDiff(
       "--",
       ...pathspecs,
     ];
-    const diffResult = runGit(root, diffArgs);
+    const diffResult = runGit(root, diffArgs, options);
+    assertGitDeadline(options);
     if (!diffResult.ok) {
       // Fail closed on any batch error: never return partial silent success
       return {
@@ -687,6 +758,7 @@ export function gitDiff(
     }
   }
   const hasMore = offset + sliceLen < full.length;
+  assertGitDeadline(options);
   return {
     isRepo: true,
     mode,

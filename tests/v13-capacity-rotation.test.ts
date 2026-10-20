@@ -25,6 +25,8 @@ import {
 import { ExecutionJobStore, MAX_JOBS_PER_WORKSPACE } from "../src/execution/job-store.js";
 import type { ExecutionJob } from "../src/execution/job-types.js";
 import { transitionExecutionJob } from "../src/execution/state-machine.js";
+import { atomicReplace } from "../src/execution/atomic-replace.js";
+import { DEFAULT_ARCHIVE_RECORD_OPERATIONS } from "../src/execution/record-archive.js";
 import { git, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 const CLIENT_ID = "f05-capacity-client";
@@ -160,7 +162,13 @@ function branchListOperation() {
 describe("V1.3 F-05 durable capacity rotation", () => {
   it("archives at least 300 terminal jobs across store reconstruction with idempotency and output intact", async () => {
     const directory = makeTmpDir("v13-capacity-job-store");
-    let store = new ExecutionJobStore(JOB_WORKSPACE_ID, { directory });
+    const archiveOperations = {
+      ...DEFAULT_ARCHIVE_RECORD_OPERATIONS,
+      publish(source: string, destination: string, expectedHash: string) {
+        atomicReplace(source, destination, { expectedNewHash: expectedHash });
+      },
+    };
+    let store = new ExecutionJobStore(JOB_WORKSPACE_ID, { directory, archiveOperations });
     let firstJob: ExecutionJob | undefined;
 
     for (let index = 0; index < 300; index += 1) {
@@ -174,11 +182,11 @@ describe("V1.3 F-05 durable capacity rotation", () => {
       const terminal = transitionExecutionJob(started, "succeeded", { exitCode: 0 }, new Date(Date.parse(queued.createdAt) + 1).toISOString());
       store.replace(terminal);
       if (index === 0) firstJob = terminal;
-      if (index === 149) store = new ExecutionJobStore(JOB_WORKSPACE_ID, { directory });
+      if (index === 149) store = new ExecutionJobStore(JOB_WORKSPACE_ID, { directory, archiveOperations });
     }
 
     expect(firstJob).toBeDefined();
-    const restarted = new ExecutionJobStore(JOB_WORKSPACE_ID, { directory });
+    const restarted = new ExecutionJobStore(JOB_WORKSPACE_ID, { directory, archiveOperations });
     expect(restarted.corruption).toBeNull();
     expect(restarted.listAll()).toHaveLength(MAX_JOBS_PER_WORKSPACE);
     expect(restarted.get(firstJob!.jobId)).toMatchObject({ jobId: firstJob!.jobId, state: "succeeded" });

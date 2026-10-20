@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { createServer, type Server as NetServer } from "node:net";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
@@ -10,13 +11,71 @@ let base: string;
 
 const REDIRECT_URI = "http://127.0.0.1:19999/callback";
 
+// WHATWG Fetch port-blocking set: https://fetch.spec.whatwg.org/#port-blocking
+const FETCH_FORBIDDEN_PORTS = new Set<number>([
+  0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
+  77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
+  123, 135, 137, 139, 143, 179, 389, 427, 465, 512, 513, 514, 515, 526,
+  530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993,
+  995, 1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665,
+  6666, 6667, 6668, 6669, 6697, 10080,
+]);
+const SAFE_PORT_ATTEMPT_LIMIT = 16;
+
+async function bindEphemeralPort(host: string): Promise<{ server: NetServer; port: number }> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: NodeJS.ErrnoException): void => reject(error);
+    server.once("error", onError);
+    server.listen(0, host, () => {
+      server.removeListener("error", onError);
+      resolve();
+    });
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await closePortProbe(server);
+    throw new Error("The ephemeral port probe returned no TCP address.");
+  }
+  return { server, port: address.port };
+}
+
+function closePortProbe(server: NetServer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+}
+
+async function allocateFetchSafePort(host = "127.0.0.1"): Promise<number> {
+  for (let attempt = 1; attempt <= SAFE_PORT_ATTEMPT_LIMIT; attempt += 1) {
+    const probe = await bindEphemeralPort(host);
+    const fetchSafe = !FETCH_FORBIDDEN_PORTS.has(probe.port);
+    await closePortProbe(probe.server);
+    if (fetchSafe) return probe.port;
+  }
+  throw new Error(`Could not allocate a Fetch-safe ephemeral port after ${SAFE_PORT_ATTEMPT_LIMIT} attempts.`);
+}
+
+async function startBridgeWithFetchSafePort(
+  options: Omit<Parameters<typeof startBridge>[0], "port">,
+): Promise<Bridge> {
+  const host = options.host ?? "127.0.0.1";
+  for (let attempt = 1; attempt <= SAFE_PORT_ATTEMPT_LIMIT; attempt += 1) {
+    const port = await allocateFetchSafePort(host);
+    const bridge = await startBridge({ ...options, port });
+    if (!FETCH_FORBIDDEN_PORTS.has(bridge.port)) return bridge;
+    await bridge.close();
+  }
+  throw new Error(`Bridge startup selected a Fetch-forbidden port after ${SAFE_PORT_ATTEMPT_LIMIT} safe-port attempts.`);
+}
+
 beforeEach(async () => {
   isolateStateDir();
   root = makeTmpDir("oauth-ws");
   write(root, "hello.txt", "hello oauth\n");
-  bridge = await startBridge({
+  bridge = await startBridgeWithFetchSafePort({
     workspaceRoot: root,
-    port: 0,
     persistRuntime: false,
     authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
   });
@@ -100,11 +159,17 @@ async function exchangeToken(
 }
 
 describe("discovery metadata", () => {
+  it("allocates only Fetch-safe ephemeral ports", async () => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const port = await allocateFetchSafePort();
+      expect(FETCH_FORBIDDEN_PORTS.has(port)).toBe(false);
+    }
+  });
+
   it("uses the configured public tunnel authority for incremental auth and discovery", async () => {
     const publicUrl = "https://trusted-tunnel.example";
-    const publicBridge = await startBridge({
+    const publicBridge = await startBridgeWithFetchSafePort({
       workspaceRoot: makeTmpDir("oauth-public-ws"),
-      port: 0,
       persistRuntime: false,
       authStoreFile: path.join(makeTmpDir("oauth-public-auth"), "store.json"),
       tunnelProvider: {
@@ -435,9 +500,8 @@ describe("authorization + token flow", () => {
   it("escapes the workspace name in the pairing page", async () => {
     const xssWorkspaceRoot = makeTmpDir("oauth-html");
     write(xssWorkspaceRoot, ".c2c.json", JSON.stringify({ name: "<script>alert('xss')</script>" }));
-    const xssBridge = await startBridge({
+    const xssBridge = await startBridgeWithFetchSafePort({
       workspaceRoot: xssWorkspaceRoot,
-      port: 0,
       persistRuntime: false,
       authStoreFile: path.join(makeTmpDir("auth-html"), "store.json"),
     });

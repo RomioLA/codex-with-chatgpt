@@ -23,11 +23,13 @@ const SAFE_ERROR_CODES = new Set([
 const SAFE_PROTOCOL_CODES = new Set([-32700, -32600, -32601, -32602, -32603, -32000]);
 const REGISTERED_TOOL_NAMES = new Set([
   "workspace_info", "list_directory", "read_file", "read_image", "search_workspace", "git_info", "git_status", "git_diff", "git_compare",
+  "batch_read", "batch_search", "collect_evidence",
   "test_status", "execution_summary", "execution_output", "execution_run", "execution_start", "execution_status", "execution_list",
   "execution_job_output", "execution_cancel", "permission_status", "create_file", "replace_file", "edit_file",
   "create_external_file", "replace_external_file", "edit_external_file", "create_directory", "delete_file", "move_file",
   "read_external_file", "git_branches", "level3_request", "level3_request_status", "level3_start", "git_write",
   "host_context", "process_query", "process_tree", "network_listeners", "network_status", "dns_resolve", "path_inspect",
+  "task_create", "task_status", "task_list", "task_result", "task_output", "task_cancel",
 ]);
 
 function safeErrorDetails(error: unknown): { errorName: string; errorCode?: string; stackFrames: string[] } {
