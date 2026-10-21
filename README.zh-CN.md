@@ -1,172 +1,82 @@
-# C2C Local
+# C2C Local — V1.4
 
-> 面向本地工作区的 ChatGPT ↔ Codex 桥接方案，带明确权限边界。
-> ChatGPT 负责推理和审查；通过 C2C Local，它也可以启动经本机操作者明确批准的 bounded execution recipe。
+> 让 ChatGPT 在用户明确授权下，直接读取本地工作区、调查项目、查看 Git、进行受控文件修改与通用命令执行。  
+> 本仓库是 [RomioLA](https://github.com/RomioLA) 维护的 fork，基于 [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt)。**非 OpenAI 官方产品。**
 
-[English](README.md) | **简体中文**
+[English](README.md) · [Windows 安装](docs/INSTALL.zh-CN.md) · [用户指南](docs/USER_GUIDE.zh-CN.md) · [AI 工具指南](docs/AI_GUIDE.md) · [故障排查](docs/troubleshooting.md)
 
-本仓库是 **RomioLA 维护的 C2C Local fork**，基于 [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt)。在原项目桥接思路上，增加了更完整的本机权限模型、Windows runtime 恢复、受限主机诊断，以及安全的嵌套 Git/worktree 定位能力。
+## 版本状态：请先看这里
 
-## C2C Local 能做什么
+此 README 对应 **V1.4 功能分支 feat/20261018-c2c-v14-native-workflow**。GitHub 默认 main 目前尚未代表本分支的正式功能版本。维护者的 Windows Runtime 已有实机运行验证，但这**不等于公开一键安装包已经发布或面向新机器完成验收**。新用户先按 [源码安装指南](docs/INSTALL.zh-CN.md) 操作；不要从维护者本机的 staged Runtime 目录复制安装。
 
-- 通过 OAuth 保护的 MCP Bridge，把 ChatGPT 接入用户授权的本地 Workspace。
-- 读取文件、图片、源码搜索结果、Git 状态，以及已经记录的执行/测试结果。
-- 在本机权限允许时创建、编辑、替换、移动文件，并提供受限制的删除能力。
-- 在策略允许时读取或修改 Workspace 外的普通文件，但不开放无限制主机文件系统。
-- 通过 `git_info(repository_path)`、`git_status(repository_path)`、`git_diff(repository_path)` 定位嵌套仓库和 Git worktree。
-- 通过 execution 工具启动由本机操作者明确批准的 bounded test/build/lint/typecheck 或具名 package-script recipe。
-- 提供受限、只读的 Windows Host Observation，可查看进程、监听端口、网络、DNS、路径和主机上下文。
-- 包含 Windows Bridge/Tunnel 状态恢复和自动启动相关能力。
-- V1.3 开发版增加结构化 Git Write，以及默认关闭、须本机逐次批准完整命令的 Level 3 PowerShell 7 / CMD / 本地程序执行。
-- 不提供远程提权、无限制 Shell 或任意 Git 参数通道。V1.3 尚未部署到 Production，操作与验收见 [V1.3 阶段报告](docs/v1.3-stage-report.md)。
-- 本轮对抗审查修复增加字面脚本绑定、Native 可撤销启动许可、固定提交 tree/ref CAS 与安全历史归档；剩余 Beta 门禁见 [安全修复报告](docs/v1.3-security-fix-report.md)。当前 CLI 单命令审批不定义未来工作会话和交互式终端的授权模型。
+## C2C 能做什么
 
-执行授权由 C2C 本机 trusted-command policy 管理。package script 只是执行材料；修改 `package.json` 不会自动批准新 recipe。Windows Job Object 只约束进程生命周期，不提供文件系统、网络、权限或不可信项目代码沙箱；经批准的 package script 仍会执行项目代码。
-
-Windows 执行会绑定 repository 与 Git/worktree identity、workspace `package.json` 哈希和已批准 recipe、所选 `node.exe` 的 identity 与 SHA-256，以及明确列出的 package manager 启动材料。npm 包括 `npm-cli.js`、`lib/cli.js`、`lib/cli/validate-engines.js`、`lib/cli/entry.js`、`lib/cli/exit-handler.js`、`lib/npm.js` 和 npm 的 `package.json`。固定版本 pnpm 的启动链包括 `bin/pnpm.cjs`、`bin/pnpm.mjs`、`dist/pnpm.mjs` bundle 和 pnpm 的 `package.json`，这些列出的 runtime 文件均核对 identity 与 SHA-256。workspace manifest 按哈希校验并保持打开以防替换。C2C build 生成同时包含 Native Helper 和固定 Launcher SHA-256 的发行元数据。Launcher 通过文件句柄验证 Helper，然后持有禁止写入和删除的文件句柄，并锁定 Helper 所在的路径目录，在这些锁仍有效时用固定绝对路径调用 `CreateProcessW`。依据 Windows 文件共享规则，这将验证过的 Helper 文件与进程创建时打开的映像绑定。Launcher 属于 C2C distribution 信任根；部署必须保护发行代码目录，防止未授权写入。若攻击者可以同时替换 Launcher 和元数据，元数据不能认证整套发行内容。Helper 会重新打开并锁定列出的 runtime 材料，核对 identity 和哈希，然后以 suspended 状态创建子进程；全部检查通过后才 Resume。固定 pnpm 启动会设置 `verify-deps-before-run=warn`，C2C 不会因此隐式启动独立 `pnpm install`；已批准 recipe 使用 workspace 中现有依赖。npm 后续加载的模块、Node built-ins 和外部模块不会递归冻结；pnpm bundle 按单个文件哈希，但其之后加载的外部模块、Node built-ins 和项目脚本材料不在此绑定内。合同不声称整个 runtime、repository 或项目经过密码学冻结。输出 sanitizer 只过滤已覆盖的格式和 secret pattern，不构成恶意代码的数据外泄防护边界。
-
-## 本机权限模型
-
-C2C Local 的文件能力同时受 OAuth scope 和本机 permission mode 控制：
-
-| 模式 | 主要行为 |
+| 类别 | V1.4 能力 |
 | --- | --- |
-| `readonly` | 持久基线；Workspace 只读。 |
-| `level1` | 持久基线；允许 Workspace 创建/编辑/替换/内部移动，并可读取策略允许的外部文本文件。 |
-| `level2` | 仅当前 Windows 登录会话有效；在 level1 基础上增加受限的 Workspace 单文件删除，以及策略允许的外部创建/编辑/替换；外部删除仍禁止。注销或重启后回到持久基线。 |
+| 工作区/文件 | 读取、搜索、图片查看；按本机权限创建、编辑、替换及部分移动/删除 |
+| Git | 支持工作区内的嵌套仓库及 worktree，固定查询与专用受控 Git Write |
+| 主机观测 | 只读的进程、进程树、端口、网络、DNS、路径检查 |
+| 批量读取 | **batch_read**：最多 16 个已知文件，结果有界并可分页 |
+| 批量搜索 | **batch_search**：最多 8 个查询，共享资源预算 |
+| 收集证据 | **collect_evidence**：指定文件、搜索、Git、既有执行输出 |
+| 通用命令 | **execution_run**：Level2 Full Access 下的 program、PowerShell、CMD |
+| 持久任务 | **task_create/status/list/result/output/cancel**：确定性有限步骤、checkpoint、故障恢复与取消 |
+| 运行维护 | OAuth、Cloudflare Tunnel、Windows 登录自启与故障恢复 |
 
-本机查看或切换权限：
+### 两个重要区别
 
-```text
-c2c permission status -w <workspace>
-c2c permission readonly -w <workspace>
-c2c permission 1 -w <workspace>
-c2c permission 2 -w <workspace>
-```
+1. **V1.4 通用执行首选 execution_run。** 它要求本机有效 Level2 Full Access、相应 OAuth scope（execution.run）和用户授权；**不需要**为了通用命令先使用旧的 execution_start、预注册 trusted-command recipe 或 Level3 逐命令批准。旧路径仍可能用于对应的受限工作流。
+2. **Task 不是自主 Agent。** 创建后的计划固定，不调用 LLM 自行增加步骤。出现 WAITING_FOR_MODEL 或未知副作用时停止，不能自动重放可能已执行的命令。
 
-敏感文件策略、规范化路径边界、OAuth scope 和具体操作检查仍然分别生效。ChatGPT 不能通过 MCP 自行提高本机权限。
-`permission 2` 会把持久基线设为 `level1` 并创建当前 Windows 登录会话 grant；CLI/MCP 状态同时报告 `baselineMode`、`effectiveMode` 和 `sessionElevation.active`，不返回底层 session identity。无法确认 Windows boot、用户 SID、session ID 或 token logon ID 时按基线执行。缺失或损坏的权限状态仍回退 `readonly`；新 workspace 需由本机用户显式运行 `permission 1` 初始化可写基线。
+## 五分钟了解安装路径
 
-## 嵌套 Git 仓库与 worktree
+目前面向新用户的是 **Windows x64 源码构建**，不是一键安装器。准备 Git、**Node.js 22+ / Corepack / pnpm 11**、PowerShell 7、Visual Studio 2022 C++ Build Tools（MSVC x64 + Windows SDK）及 cloudflared。pnpm 11 实际要求 Node >=22；早期 README 的 Node 20+ 要求不充分。
 
-一个 Workspace 中包含多个仓库或 worktree 时，可以明确指定目标：
-
-```text
-git_info(repository_path)
-git_status(repository_path)
-git_diff(repository_path)
-```
-
-`repository_path` 只用于选择 Workspace 内的仓库/worktree。这些工具只开放固定的 info/status/diff 查询，不是任意 Git 命令执行通道。
-
-Git 子进程会针对继承的 `GIT_*`、fsmonitor、external diff/textconv、clean/process filter 等风险做限制；Workspace 和目标仓库的敏感路径规则同时生效。
-
-## Host Observation
-
-获得可选 OAuth scope `system.read` 后，ChatGPT 可以调用以下受限只读诊断：
-
-- `host_context`
-- `process_query`
-- `process_tree`
-- `network_listeners`
-- `network_status`
-- `dns_resolve`
-- `path_inspect`
-
-Host Observation 只用于诊断，不是 Shell；不能启动、终止或任意控制主机进程。
-
-## 快速安装
-
-环境要求：Node.js 20+、Git；公网连接需要 `cloudflared`。
-
-克隆 **C2C Local 本仓库**：
-
-```bash
-git clone https://github.com/RomioLA/codex-with-chatgpt.git
+~~~powershell
+git clone --branch feat/20261018-c2c-v14-native-workflow --single-branch https://github.com/RomioLA/codex-with-chatgpt.git
 cd codex-with-chatgpt
 corepack pnpm install
 corepack pnpm build
-```
+node .\bin\c2c.js setup -w 'C:\Projects'
+~~~
 
-然后把 `skill/` 中的 Codex Skill 安装到当前 Codex home，并运行：
+**把 C:\Projects 替换为自己电脑上真实存在并愿意授权的目录。** 在本机按 CLI 指引完成 Tunnel、ChatGPT 连接器和 OAuth 配对。长期使用推荐 Cloudflare Named Tunnel 以保持连接地址稳定。详情和首次验证、登录自启步骤均在 [完整安装指南](docs/INSTALL.zh-CN.md)。
 
-```text
-c2c setup
-```
+在新 ChatGPT 对话中可说：
 
-如果希望让 Codex 全程代办，可以直接发送：
+> 使用 C2C，先调用 workspace_info 和 permission_status 确认真实连接，再只读调查我授权工作区下的项目。未经我批准不要修改。
 
-```text
-请帮我安装并配置 C2C Local，源码使用
-https://github.com/RomioLA/codex-with-chatgpt。
-先检查 Git、Node.js >= 20 和 cloudflared；克隆或更新仓库；执行
-corepack pnpm install 和 corepack pnpm build；把 skill/SKILL.md 安装到
-当前 Codex home；然后运行 c2c setup。只有登录、验证码、2FA 或配对码必须
-由我操作时再叫我，并且一次只告诉我一个动作。不要切换到 XiaoDuoYa 的上游仓库。
-```
+## 本机权限与安全边界
 
-## 工作关系
+| 本机模式 | 行为 |
+| --- | --- |
+| readonly | 只读 |
+| level1 | 受限工作区文件修改与允许的外部文本读取 |
+| level2 | 当前 Windows 登录会话的更高授权，可能支持通用命令和有限额外文件能力 |
 
-```text
-ChatGPT 网页版
-    |  OAuth 保护的 MCP
-    v
-C2C Local Bridge  ---- Cloudflare Tunnel
-    |
-    | 权限门控的 Workspace / Git / Host Observation / bounded execution
-    v
-本地 Workspace  ---- C2C Native Helper ---- 本机已批准的 recipe
-```
+OAuth scope、权限模式、操作级别的本机策略与用户任务授权**同时生效**。Level2 重启后回到持久基线；权限等级不是对任何命令的永久授权。Host Observation 不等于任意 Shell；执行命令的 cwd **不是操作系统沙箱**。Windows Job Object 只约束进程生命周期，不隔离磁盘、网络或恶意项目脚本。凭据、密钥、.env 等敏感路径受保护。公网 MCP 需要 OAuth，知道网址不等于获授权。
 
-ChatGPT 可以通过 C2C Local 检查、修改已授权文件并启动本机批准的 bounded recipe。V1.3 开发版另提供仓库策略约束的 Git Write，及精确命令摘要绑定、单次使用的 Level 3 本机审批流程。
+连接丢失时先检查状态，必要时执行本机 restore；正常 Named Tunnel 恢复不应第一时间删除连接或重新配对。健康端点 /health 成功不等于完整 OAuth/MCP 工具调用成功。
 
-## 安全边界
+## 文档入口
 
-- 公网 MCP 端点强制 OAuth；知道 URL 本身不能获得访问权。
-- Token 与 Workspace 绑定。
-- 凭据、密钥、SSH、`.env*` 等敏感文件默认拒绝，`.env.example` 允许读取。
-- `.c2cignore` 可以增加项目自己的排除规则。
-- 文件修改必须同时满足 OAuth scope 和本机 permission mode。
-- V1.2 Execution 工具仍只接受本机策略批准的具名 recipe。V1.3 的 `git.write`、`execution.level3` 是独立可选 scopes；Git 策略与 Level 3 逐次审批只由本机 CLI 管理，旧 token 不会自动扩权。
-- 已批准的 package script 仍可调用 Shell，并以本机用户账户权限执行项目代码。Windows Job Object 只约束进程生命周期，不提供文件系统、网络、权限或恶意代码沙箱。
-- Runtime 完整性绑定选中的 Node 可执行文件；npm 的 `npm-cli.js`、`lib/cli.js`、`lib/cli/validate-engines.js`、`lib/cli/entry.js`、`lib/cli/exit-handler.js`、`lib/npm.js` 和 `package.json`；或固定版本 pnpm 的 `bin/pnpm.cjs`、`bin/pnpm.mjs`、`dist/pnpm.mjs` 和 `package.json`。这些列出的 runtime 文件会核对 file identity 与 SHA-256。workspace package manifest 按 SHA-256 检查并保持打开以防替换；已批准 recipe 记录保存在仓库外。这些哈希用于发现之后的变更，不认证发行者，也不能识别选中的 Node/npm/Corepack 安装在发现前就已有的恶意内容；Node 后续加载的全部模块和依赖也没有被冻结。
-- Helper 和固定 Launcher 的 SHA-256 来自 C2C 构建/发行元数据。Launcher 在调用 `CreateProcessW` 期间持有已验证 Helper 文件，并锁定其路径目录，阻止写入、重命名和替换；部署仍须保护 Launcher 及 C2C 发行代码目录。若 Launcher 和期望元数据都能被一起替换，元数据不能认证整套发行内容。
-- 输出 sanitizer 用于输出卫生处理，不是防止恶意代码外传数据的安全边界。
+- **第一次安装：** [Windows 安装指南（中文）](docs/INSTALL.zh-CN.md) / [English](docs/INSTALL.md)
+- **怎么使用：** [用户指南（中文）](docs/USER_GUIDE.zh-CN.md) / [English](docs/USER_GUIDE.md)
+- **让新的 AI 正确选工具：** [AI Guide](docs/AI_GUIDE.md) 与 [当前 C2C Skill](skills/c2c-local/SKILL.md)
+- **问题排查与技术边界：** [Troubleshooting](docs/troubleshooting.md)、[Security](docs/security.md)、[Architecture](docs/architecture.md)、[Protocol](docs/protocol.md)
+- **旧规划/编排模式：** [Legacy Skill](skill/SKILL.md)（仅在明确要求时使用，不作为 V1.4 默认工具规则）
 
-详细资料：[安全](docs/security.md) · [架构](docs/architecture.md) · [协议](docs/protocol.md) · [故障排查](docs/troubleshooting.md) · [本机权限](docs/local-permission-model-requirements.zh-CN.md)
+**注意：** 把说明写到 GitHub 不会自动让 ChatGPT 读取或安装。对于支持 Skill 的编码 Agent，应按其产品说明安装 skills/c2c-local；对于 ChatGPT，必须真实连接 C2C 插件，工具 schema 和当前权限始终优先。
 
 ## 开发
 
-```bash
-pnpm install
-pnpm build
-pnpm test
-pnpm test:watch
-```
+~~~powershell
+corepack pnpm install
+corepack pnpm build
+corepack pnpm typecheck
+corepack pnpm test
+~~~
 
-主要目录：
+当前生产部署、功能分支、CI 和可用安装方式必须分别核验；文档变更本身不构成全平台/新用户安装验收。
 
-```text
-src/bridge/      Bridge、runtime state、管理 API
-src/mcp/         MCP 工具及注册
-src/permission/  本机权限模型
-src/write/       受保护的文件修改原语
-src/auth/        OAuth 2.1 与 token
-src/pairing/     一次性配对码
-src/workspace/   路径策略、搜索、Git
-src/tunnel/      Cloudflare Tunnel
-src/execution/   执行/测试证据
-src/process/     进程生命周期
-src/cli/         c2c CLI
-skill/           Codex Skill
-```
-
-## 上游、状态与许可证
-
-C2C Local 是 RomioLA 维护的独立 fork，来源为 [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt)。保留上游 attribution；安装和 C2C Local 的正常开发默认使用当前仓库。
-
-当前已经实现的主要扩展包括：本机权限模型、Windows production/runtime 恢复、Host Observation V1，以及安全的嵌套 Git 仓库/worktree 定位。
-
-**非官方社区项目，与 OpenAI 无关联，未获其背书。**
-
-[MIT](LICENSE)
+**License:** [MIT](LICENSE)。上游归属保留；非 OpenAI 官方、无官方背书。
