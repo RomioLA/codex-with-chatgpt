@@ -69,7 +69,7 @@ GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从�
 checkout、生产部署或运行状态。该版本的登录链路与验收记录只描述该 baseline。
 当前任务以实际源码版本和结构化结果为准，不凭旧聊天或 baseline 推断 HEAD。
 
-旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 与 [legacy Codex-with-ChatGPT workflow](../../skill/SKILL.md)
+旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 与 [legacy Codex-with-ChatGPT workflow](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/skill/SKILL.md)
 描述显式调用的旧规划/编排流程，不是普通 C2C Local 工具选择或权限规则的 authority。
 不要继承它的“统一 workspace=codex”或“C2C 只用于读取、分析和复核”规则，也不要把两套规则合并。
 只有用户明确要求旧 Codex with ChatGPT workflow 时才使用该 legacy Skill；普通本机任务按本 Skill 选择
