@@ -67,6 +67,8 @@ A healthy /health is **not** proof of authenticated ChatGPT tool access. If disc
 
 Committing a guide to GitHub does **not** automatically teach every ChatGPT chat to use the connector. Install the skill in supported coding-agent environments and connect the real C2C plugin in ChatGPT. Live tool descriptions and current permissions remain authoritative.
 
+**Next-version proposal (not yet implemented):** [V1.5 Capability Delivery & Operational Observability Plan](docs/v1.5-plan.md). Do not confuse this plan with deployed V1.4 functionality.
+
 ## Development
 
 ~~~powershell
