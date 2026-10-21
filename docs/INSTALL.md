@@ -22,6 +22,18 @@ node .\bin\c2c.js --help
 
 Native C++ Helper/Launcher compilation requires MSVC and the Windows SDK; do not skip the native build if it fails. Use the RomioLA fork, not the original upstream.
 
+## Optional: install the current C2C Skill for Codex
+
+A Skill in the source repository is **not automatically installed** for every new Codex chat. To make it available in other Codex projects, run this from the cloned C2C repository root:
+
+~~~powershell
+$skillRoot = Join-Path $HOME '.agents\skills'
+New-Item -ItemType Directory -Path $skillRoot -Force | Out-Null
+Copy-Item -LiteralPath '.\skills\c2c-local' -Destination $skillRoot -Recurse -Force
+~~~
+
+Copy the whole directory, including SKILL.md and references. Codex's documented user-scope Skill location is $HOME\.agents\skills. Restart Codex if the skill is not detected. Do not substitute the legacy skill/SKILL.md. **Installing a Skill does not install or authorize the ChatGPT MCP connector.**
+
 ## Connect and pair
 
 Replace C:\Projects with an **existing workspace directory that you deliberately authorize**:
