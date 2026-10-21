@@ -265,7 +265,7 @@ function packageRootForCli(cliModulePath: string): string {
   return path.resolve(path.dirname(path.resolve(cliModulePath)), "..", "..");
 }
 
-export const TASK_CMD_LAUNCHER_SHA256 = "a16b2367e95bb6814f4e52c45dc4a51dce98725f3a10a12d2cce33bcb0970adb";
+export const TASK_CMD_LAUNCHER_SHA256 = "a21b6c188dfcd98387a5576a2052e1403f788ca47df7c8c404c24210b67c40ce";
 
 function sameWindowsPath(left: string, right: string): boolean {
   return process.platform === "win32"
