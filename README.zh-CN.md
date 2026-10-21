@@ -68,6 +68,8 @@ OAuth scope、权限模式、操作级别的本机策略与用户任务授权**�
 
 **注意：** 把说明写到 GitHub 不会自动让 ChatGPT 读取或安装。对于支持 Skill 的编码 Agent，应按其产品说明安装 skills/c2c-local；对于 ChatGPT，必须真实连接 C2C 插件，工具 schema 和当前权限始终优先。
 
+**后续版本规划（尚未实现）：** [V1.5 能力交付一致性与运维可观测性规划](docs/v1.5-plan.md)。V1.5 不应与已部署的 V1.4 功能混淆。
+
 ## 开发
 
 ~~~powershell
