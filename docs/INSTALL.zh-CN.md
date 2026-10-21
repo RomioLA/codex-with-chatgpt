@@ -36,6 +36,18 @@ node .\bin\c2c.js --help
 
 如果构建提示找不到 cl.exe、vswhere 或 Windows SDK，先安装/修复 Visual Studio C++ Build Tools。此处采用 **RomioLA** fork，不要误用 XiaoDuoYa 上游。
 
+## 可选：让 Codex 新对话识别 V1.4 Skill
+
+**源码仓库内有 Skill 文件，不代表 Codex 已自动安装。** 需要让本机 Codex 在其他项目中也能找到它，可在当前 C2C 仓库源码根目录执行：
+
+~~~powershell
+$skillRoot = Join-Path $HOME '.agents\skills'
+New-Item -ItemType Directory -Path $skillRoot -Force | Out-Null
+Copy-Item -LiteralPath '.\skills\c2c-local' -Destination $skillRoot -Recurse -Force
+~~~
+
+应包含完整的 SKILL.md 及 references 目录。Codex 的用户级 Skill 位置为 $HOME\.agents\skills；如未显示，可重新打开 Codex。不要安装旧的 skill/SKILL.md 代替当前 V1.4 Skill。**此步骤只帮助 Codex 选择工具，不会自动配置 ChatGPT 连接器或授予权限。**
+
 ## 第一次连接
 
 选定一个**已经存在、明确授权**的本地目录。以下 C:\Projects 是示例，请替换成自己的真实目录：
