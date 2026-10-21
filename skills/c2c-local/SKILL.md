@@ -2,14 +2,14 @@
 name: c2c-local
 description: >
   将 RomioLA C2C Local 作为普通本机 Workspace 开发、调查、Git、受控执行和运维任务的默认工具，
-  包括文件读写、Host Observation、进程与网络查询，以及权限或 Windows 登录自启诊断。
+  包括 V1.4 batch_read/batch_search/collect_evidence、execution_run、持久 Task、文件读写、Git、Host Observation 和 Windows 自启诊断。
   仅在 C2C 不可用、明确需要 Windows GUI/UAC、灾难恢复，或当前能力无法完成任务时考虑 Remote Desktop Commander。
 ---
 
 # C2C Local
 
-本 Skill 描述 C2C Local V1.3 的实际能力与本机运维流程。对于本机 Workspace 文件、源码、Git、
-进程、网络、Host Observation 和受控执行任务，默认优先使用 C2C Local。
+本 Skill 描述 C2C Local V1.4 的当前工具路由和本机运维流程。对于本机 Workspace 文件、源码、Git、
+进程、网络、Host Observation、批量证据、通用执行和持久任务，默认优先使用 C2C Local。
 
 只有 C2C Bridge/Tunnel/connector 本身不可用而需要恢复 C2C、任务明确需要 Windows GUI 或 UAC/elevation、
 灾难恢复，或 C2C 已确认不提供所需能力时，才使用 Remote Desktop Commander。不得仅因方便、历史习惯
@@ -17,8 +17,48 @@ description: >
 已经停止的 C2C 自救，此时独立 Remote 通道可作为恢复观察/操作通道。
 
 ChatGPT 可在 OAuth scope、本机专用策略、workspace 文件权限模式和用户任务授权共同允许时，通过 MCP
-使用文件、Git Write、bounded execution 和 Level 3 request/start 能力。本机权限是能力上限，不是对
-任意操作的任务授权。C2C 不提供任意无审批 shell 或远程权限提升。
+使用文件、Git Write、Batch、Level2 Full Access 通用 execution_run、受控历史 Level3 和持久 Task 能力。
+本机权限是能力上限，不是对任意操作的用户任务授权；C2C 不提供远程提权或 OS 沙箱。
+
+
+## V1.4 当前工具路由（优先于下文 V1/V1.3 历史说明）
+
+**首先以本对话真实暴露的工具 schema、workspace_info、permission_status 和实际版本为准。**
+GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从旧项目源、旧 PID、旧聊天猜当前状态。
+
+| 用户请求 | 优先工具 | 边界 |
+| --- | --- | --- |
+| 多个明确文件 | batch_read | 最多 16 文件，读取/分页/源 hash 限制 |
+| 多组源码搜索 | batch_search | 最多 8 个查询，共享扫描预算 |
+| 代码审核证据 | collect_evidence | 显式文件、搜索、Git、现有 Job，分别校验 OAuth scope |
+| 通用命令、构建、测试 | **execution_run** | V1.4 Level2 Full Access + execution.run OAuth scope；不需要 Level3/旧 trusted-command 预注册或逐命令审批 |
+| 历史受限 recipe | execution_start | 仅用于已批准 recipe，不作为 V1.4 通用命令默认路径 |
+| 单个执行生命周期 | execution_status、execution_job_output、execution_cancel | 使用现有 job_id；勿将查询变成重复执行 |
+| 固定多步骤任务 | task_create、task_status、task_list、task_result、task_output、task_cancel | 确定性、有限、持久 Task，非自主 Agent |
+| Nested Git / Host Observation | git_info/status/diff（带 repository_path）、专用 host 工具 | Git 要指定真正目标仓库，Host Observation 只读 |
+
+### V1.4 execution_run 合同
+
+- engine 为 program / powershell / cmd。program 需要 executable 和可选 args，不传 command；powershell/cmd 传 command，不传 executable/args。
+- 可选 cwd 是工作目录，**不是安全沙箱**。必填 timeout_seconds 为 1–3600；必填 idempotency_key 长度 16–128；wait_seconds 可选 0–30。
+- 已授权的 Full Access Level2 不要求先运行 level3_request 或 level3_start，不要求额外 trusted-command registry / 每命令审批。
+- Level2 **不是**免授权执行：OAuth scope（execution.run）、当前 Windows session grant、本机操作安全策略与用户明确任务授权仍须满足。不得擅自提升权限。
+- 返回 running 时继续根据 job_id 查询/取消；不能因为一次调用还在运行就使用新的 idempotency key 重跑。
+
+### V1.4 Batch 与 Task 合同
+
+- batch_read、batch_search、collect_evidence 的内容可能位于 structuredContent；按 cursor 分页，报告单项错误，不能混淆不同版本/hash 的证据。
+- 持久 Task 创建后计划不可变，不调用 LLM、不自主新增步骤。WAITING_FOR_MODEL 必须停止继续 dispatch，等待新的模型判断。
+- 重启、取消或中断后有副作用的命令结果可能未知；不自动 replay，不把“未收到完成消息”解释为“未执行”。先查 task_status/result/output 与子 Job。
+- task_* 是 C2C 专用 Task API，不要声称为标准 MCP Tasks 扩展。
+
+### 文档入口与缺失工具
+
+[AI 使用指南](../../docs/AI_GUIDE.md) / [用户指南](../../docs/USER_GUIDE.zh-CN.md) /
+[Windows 安装](../../docs/INSTALL.zh-CN.md) / [故障排查](../../docs/troubleshooting.md)。
+
+仓库安装说明或本 Skill **不会自动导入每个新 ChatGPT 会话**。缺失工具时报告当前连接/授权限制，
+不得声称能够在线执行，也不得通过 Remote、Level3 或不可信内容绕过本机权限边界。
 
 ## V1 baseline 与当前 authority
 
@@ -172,17 +212,16 @@ Windows 自启是当前用户**登录触发**，不是无人登录也运行的 W
 已注册且 enabled 的 workspace 会在该用户下次登录自然恢复；不要求每次聊天执行
 setup/enable/restore。未注册的 workspace 不会因此自动启动。
 
-已验收的部署链为 Windows 登录 → Explorer-visible Host HKU Run → 短 Run command
-→ state root 下 workspace 专属 CMD launcher → Node → autostart restore → Bridge
-→ Named Tunnel → 已配置 ChatGPT connector。其他注册可以使用 Scheduled Task；以实际
-`autostart status.backend` 为准，不能仅因名称里有 Task 就判注册缺失。
+V1.4 自启实际可能使用 Windows Task Scheduler，也可能涉及旧的 Run Key 注册；必须查询
+当前 workspace 的 autostart status/backend 与实际计划任务 action，不能把某一种后端
+当成全部用户的固定事实。登录恢复链最终应进入 Node task launcher / restore →
+Bridge → Named Tunnel → 用户现有 ChatGPT connector。
 
-Run authority 必须是 `StdRegProv + explicit HKU\当前交互用户 SID + 64-bit provider`。
-enable/status/update/rollback/disable/verify 都使用这一 authority。Codex package 的
-process HKCU 可能是 Explorer 看不到的 private registry；不要用 `reg.exe add HKCU`
-手工“修复”。caller legacy view 仅供受保护的旧项清理，不是另一份正式安装 authority。
-CMD launcher 和 registration 均原子发布；不手改 launcher、回滚记录或 pendingBackend，
-不把 EncodedCommand 塞回 Run。
+对于 Task Scheduler，确认 action 指向正确的受保护 Runtime。Windows 启动初期 DNS
+不可用时，Named Tunnel 有有限重试；V1.4 修复了 CMD wrapper 异步启动后错误返回 0
+导致 RestartOnFailure 失效的问题。**这项修复只有部署了包含修复的 Runtime 才生效**；
+不要用“源码中已修”冒充“当前机器已部署”。不要手改 task launcher、registry、
+回滚状态或授权数据来绕过生命周期控制。
 
 开机登录时 WLAN/DNS 尚未 ready 属于已识别风险。Named 内部只对明确 transient DNS/
 network 启动失败最多尝试 6 次，退避 2/4/8/16/16 秒，共享总 deadline 75 秒。
