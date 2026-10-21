@@ -1,171 +1,81 @@
-# C2C Local
+# C2C Local — V1.4
 
-> Local-first ChatGPT ↔ Codex bridge with permissioned workspace access.
-> ChatGPT reasons and reviews. Through C2C Local it can also start bounded execution recipes that a local operator explicitly approved.
+> Connect ChatGPT to a user-authorized local workspace to inspect code, Git, files and host diagnostics, and to perform permission-gated edits and generic local execution.  
+> Maintained by [RomioLA](https://github.com/RomioLA), based on [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt). **Unofficial community project, not affiliated with OpenAI.**
 
-[简体中文](README.zh-CN.md)
+[简体中文](README.zh-CN.md) · [Windows installation](docs/INSTALL.md) · [User guide](docs/USER_GUIDE.md) · [AI tool guide](docs/AI_GUIDE.md) · [Troubleshooting](docs/troubleshooting.md)
 
-This repository is **RomioLA's C2C Local fork** of [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt). It keeps the original bridge concept and adds a stronger local permission model, Windows runtime recovery, bounded host diagnostics, and secure nested Git/worktree targeting.
+## Version status
 
-## What C2C Local does
+This README describes the **V1.4 feature branch feat/20261018-c2c-v14-native-workflow**, **not** the repository's default main branch. The maintainer's Windows Runtime has been exercised locally, but that is **not** a claim of a publicly released, validated one-click installer. New users should follow the [source-build installation guide](docs/INSTALL.md).
 
-- Connects ChatGPT to a local workspace through an OAuth-protected MCP bridge.
-- Reads workspace files, images, search results, Git state, and recorded execution/test results.
-- Supports permission-gated file creation, editing, replacement, movement, and limited deletion.
-- Supports permitted reads/writes outside the workspace without exposing unrestricted host filesystem access.
-- Targets nested repositories and Git worktrees with `git_info(repository_path)`, `git_status(repository_path)`, and `git_diff(repository_path)`.
-- Exposes bounded, read-only Windows Host Observation for process, listener, network, DNS, path, and host context inspection.
-- Starts locally approved, bounded test/build/lint/typecheck or named package-script recipes through the execution tools.
-- Includes Windows bridge/tunnel state handling, recovery, and autostart support.
-- V1.3 development adds structured Git writes and separately enabled Level 3 PowerShell 7 / CMD / local program execution, with local approval of each exact command.
-- Does not expose remote elevation, an unrestricted shell, or arbitrary Git arguments. V1.3 is not deployed to Production; see the [V1.3 stage report](docs/v1.3-stage-report.md).
-- The adversarial-review fixes bind literal scripts, enforce revocable native launch permits, use fixed-tree commit/ref CAS and retain audit history through safe rotation. See the [security repair report](docs/v1.3-security-fix-report.md) for remaining Beta gates. Current single-command CLI approval does not define the future session/terminal authorization model.
+## What V1.4 does
 
-Execution approval is held in C2C's local trusted-command policy. A package script is execution material; changing `package.json` never approves a new recipe. Windows Job Objects contain process lifetime only. They do not sandbox filesystem, network, privileges, or untrusted project code; an approved package script still executes project code.
-
-For Windows execution, C2C binds repository and Git/worktree identities, the workspace `package.json` hash and approved recipe, the selected `node.exe` identity and SHA-256, and named package-manager startup material. The npm set includes `npm-cli.js`, `lib/cli.js`, `lib/cli/validate-engines.js`, `lib/cli/entry.js`, `lib/cli/exit-handler.js`, `lib/npm.js`, and npm's `package.json`. The pinned pnpm set includes `bin/pnpm.cjs`, `bin/pnpm.mjs`, `dist/pnpm.mjs`, and pnpm's `package.json`; duplicate path fields resolve to the same locked object. Each named runtime file is checked by identity and SHA-256. The workspace manifest is checked by hash and held open against replacement. The C2C build generates distribution metadata with SHA-256 values for both the native helper and its fixed launcher. Before starting the helper, the launcher opens and verifies the helper by handle, then keeps a no-write/no-delete file handle and locks its path directories while it calls `CreateProcessW` with that fixed absolute path. Under Windows file-sharing rules, this binds the verified helper file to the image opened during process creation. The launcher is part of the C2C distribution trust root: deployment must protect the distribution code directory from untrusted writes. The packaged metadata detects mismatched build artifacts but does not authenticate a distribution if an attacker can replace the launcher and metadata together. The helper reopens and locks the named runtime materials, checks their identities and hashes, then creates the child suspended and resumes it only after validation. The pinned pnpm invocation uses `verify-deps-before-run=warn`, so C2C does not trigger a separate implicit `pnpm install`; the named recipe runs against dependencies already available in the workspace. npm modules loaded after the listed bootstrap files, Node built-ins, and later external modules are not recursively frozen. The contract does not claim whole-runtime or whole-project cryptographic immutability. The output sanitizer is a formatting and secret-pattern filter, not a malicious-code data-exfiltration boundary.
-
-## Permission model
-
-C2C Local uses a machine-side permission mode in addition to OAuth scopes:
-
-| Mode | Main behavior |
+| Area | Capability |
 | --- | --- |
-| `readonly` | Persistent baseline; read-only workspace access. |
-| `level1` | Persistent baseline; workspace create/edit/replace/internal move plus permitted external text reads. |
-| `level2` | Temporary elevation for the current Windows logon session; adds limited workspace deletion and permitted external create/edit/replace. Logout or reboot returns to the persistent baseline. External deletion remains blocked. |
+| Workspace | Read/search files and images; authorized editing, replacing, moving and limited deletion |
+| Git | Explicit nested repository/worktree selection, fixed queries and policy-gated Git writes |
+| Host Observation | Bounded read-only process, network, listener, DNS and path inspection |
+| Batch reading | **batch_read** — up to 16 explicit files, with shared bounds and pagination |
+| Batch search | **batch_search** — up to 8 queries with shared scan budget |
+| Evidence | **collect_evidence** — selected file, search, Git and existing execution evidence |
+| Generic execution | **execution_run** — Level2 Full Access program, PowerShell or CMD commands |
+| Persistent workflow | **task_create/status/list/result/output/cancel** — fixed, deterministic tasks with checkpoints and recovery |
+| Recovery | OAuth-protected MCP, Cloudflare Tunnel, Windows user-logon autostart |
 
-Check or change the local mode from the machine:
+**Use execution_run for generic V1.4 command execution** when a valid Level2 Full Access session grant, execution.run OAuth scope and user authorization are present. It does **not** require the previous execution_start trusted-command recipe registry or Level3 per-command approval. Other security policies still apply.
 
-```text
-c2c permission status -w <workspace>
-c2c permission readonly -w <workspace>
-c2c permission 1 -w <workspace>
-c2c permission 2 -w <workspace>
-```
+**Tasks are not autonomous agents.** Plans are finite and immutable; C2C does not invoke an LLM to extend them. WAITING_FOR_MODEL and uncertain side effects must not trigger automatic replay of commands.
 
-`permission 2` sets the persistent baseline to `level1` and adds a current Windows session grant. CLI and MCP status expose `baselineMode`, `effectiveMode`, and `sessionElevation.active`, never the underlying identity. If Windows boot, user SID, session ID, or token logon ID cannot be confirmed, access falls back to the baseline. Missing or malformed state remains `readonly`; a new workspace must be initialized locally with `permission 1`. Sensitive-file rules, canonical path containment, OAuth scopes, and operation-specific checks remain independent gates.
+## Quick Windows source-build overview
 
-## Nested Git repositories and worktrees
+Requirements: Windows x64, Git, **Node.js 22+**, Corepack with pinned pnpm 11, PowerShell 7, Visual Studio 2022 C++ Build Tools (MSVC x64 + Windows SDK) and cloudflared. Although package.json declares Node >=20, **pnpm 11 requires Node >=22**.
 
-When one connected workspace contains several repositories or worktrees, select the target explicitly:
-
-```text
-git_info(repository_path)
-git_status(repository_path)
-git_diff(repository_path)
-```
-
-`repository_path` selects a repository/worktree inside the connected workspace. These tools expose fixed info/status/diff operations only; they are not an arbitrary Git command channel.
-
-Git subprocesses are hardened against inherited `GIT_*` overrides, fsmonitor helpers, external diff/textconv, and configured clean/process filters. Workspace and repository sensitive-path rules both apply.
-
-## Host Observation
-
-With the optional OAuth scope `system.read`, ChatGPT can use bounded read-only diagnostics:
-
-- `host_context`
-- `process_query`
-- `process_tree`
-- `network_listeners`
-- `network_status`
-- `dns_resolve`
-- `path_inspect`
-
-Host Observation is diagnostic-only. It is not a shell and cannot start, kill, or arbitrarily control host processes.
-
-## Quick start
-
-Requirements: Node.js 20+, Git, and `cloudflared` for the public connection.
-
-Clone **this fork**:
-
-```bash
-git clone https://github.com/RomioLA/codex-with-chatgpt.git
+~~~powershell
+git clone --branch feat/20261018-c2c-v14-native-workflow --single-branch https://github.com/RomioLA/codex-with-chatgpt.git
 cd codex-with-chatgpt
 corepack pnpm install
 corepack pnpm build
-```
+node .\bin\c2c.js setup -w 'C:\Projects'
+~~~
 
-Then install the Codex Skill from `skill/` into your Codex home and run:
+**Replace C:\Projects with a directory on your own PC that already exists and that you intend to authorize.** Follow the CLI's Tunnel, ChatGPT connector and OAuth pairing prompts. A Named Tunnel on a domain you control is recommended for stable restarts. Full setup, autostart, permissions and recovery steps are in [INSTALL.md](docs/INSTALL.md).
 
-```text
-c2c setup
-```
+After connecting, ask ChatGPT:
 
-For a guided setup, give your coding agent this request:
+> Use C2C to call workspace_info and permission_status, verify the connected workspace, then inspect my project read-only. Do not edit without my authorization.
 
-```text
-Install and configure C2C Local from https://github.com/RomioLA/codex-with-chatgpt.
-Check Git, Node.js >= 20, and cloudflared; clone or update the repository; run
-corepack pnpm install and corepack pnpm build; install skill/SKILL.md into the
-active Codex home; then run c2c setup and guide me only when login, CAPTCHA,
-2FA, or a pairing code requires my action. Do not switch to the upstream
-XiaoDuoYa repository.
-```
+## Permission and safety boundaries
 
-## How it fits together
+| Mode | High-level behavior |
+| --- | --- |
+| readonly | Read-only |
+| level1 | Restricted workspace editing and permitted external text reads |
+| level2 | Higher permissions for the current Windows login session, including eligible Full Access execution |
 
-```text
-ChatGPT Web
-    |  OAuth-protected MCP
-    v
-C2C Local Bridge  ---- Cloudflare tunnel
-    |
-    | permission-gated workspace / Git / host observation / bounded execution
-    v
-Local Workspace  ---- C2C native helper ---- locally approved recipe
-```
+OAuth scopes, local permission mode, operation-specific policy and explicit user authorization are **independent gates**. Level2 resets to the persistent baseline after logoff/reboot. A working directory is **not** an OS sandbox. Windows Job Objects contain process lifetime but do not isolate files, network or malicious project code. Credential and sensitive-file boundaries remain enforced. Public MCP access requires OAuth; knowing the URL is insufficient.
 
-ChatGPT can inspect and modify authorized files through C2C Local and start locally approved bounded recipes. V1.3 development also adds repository-policy-controlled Git writes and single-use Level 3 approvals bound to the exact command digest.
+A healthy /health is **not** proof of authenticated ChatGPT tool access. If disconnected, inspect local status, then use restore when appropriate; routine Named Tunnel recovery should not require re-pairing.
 
-## Security boundaries
+## Documentation
 
-- Public MCP access requires OAuth; knowing the endpoint URL is not enough.
-- Tokens are workspace-bound.
-- Sensitive files such as credentials, keys, SSH material, and `.env*` are denied by default, with `.env.example` allowed.
-- `.c2cignore` can add project-specific exclusions.
-- File mutation requires both OAuth scope and the local permission mode.
-- V1.2 execution tools still accept only named, locally approved recipes. V1.3 adds separate opt-in `git.write` and `execution.level3` scopes; repository grants and exact-command approvals are managed only by the local CLI. Existing tokens gain no new scopes on refresh.
-- An approved package script can still invoke shell commands and project code with the local account's available access. Windows Job Objects contain process lifecycle only; they do not sandbox files, network access, privileges, or malicious code.
-- Runtime integrity binds the selected Node executable; npm's `npm-cli.js`, `lib/cli.js`, `lib/cli/validate-engines.js`, `lib/cli/entry.js`, `lib/cli/exit-handler.js`, `lib/npm.js`, and `package.json`; or pinned pnpm's `bin/pnpm.cjs`, `bin/pnpm.mjs`, `dist/pnpm.mjs`, and `package.json`. It also binds the workspace package manifest and approved recipe record held outside the repository. These hashes detect changes after runtime discovery; they do not authenticate the publisher or detect already-malicious bytes in the selected Node/npm/Corepack installation, and they do not freeze every later module or dependency.
-- The helper and fixed launcher SHA-256 values come from C2C build/distribution metadata. The launcher holds the verified helper file and its path directories against write, rename, and replacement through `CreateProcessW`; deployment must protect the launcher and the rest of the C2C distribution code directory. The metadata does not authenticate a distribution whose launcher and expected metadata can both be replaced.
-- Output sanitization is an output hygiene measure, not a malicious-code data-exfiltration boundary.
+- [Windows install (English)](docs/INSTALL.md) / [中文](docs/INSTALL.zh-CN.md)
+- [User guide (English)](docs/USER_GUIDE.md) / [中文](docs/USER_GUIDE.zh-CN.md)
+- [AI tool-selection guide](docs/AI_GUIDE.md) and [Current C2C Skill](skills/c2c-local/SKILL.md)
+- [Troubleshooting](docs/troubleshooting.md), [Security](docs/security.md), [Architecture](docs/architecture.md), [Protocol](docs/protocol.md)
+- [Legacy Codex-with-ChatGPT planning Skill](skill/SKILL.md) — only when explicitly requested, not the default V1.4 routing authority
 
-See [security](docs/security.md), [architecture](docs/architecture.md), [protocol](docs/protocol.md), [troubleshooting](docs/troubleshooting.md), and [local permission requirements](docs/local-permission-model-requirements.zh-CN.md).
+Committing a guide to GitHub does **not** automatically teach every ChatGPT chat to use the connector. Install the skill in supported coding-agent environments and connect the real C2C plugin in ChatGPT. Live tool descriptions and current permissions remain authoritative.
 
 ## Development
 
-```bash
-pnpm install
-pnpm build
-pnpm test
-pnpm test:watch
-```
+~~~powershell
+corepack pnpm install
+corepack pnpm build
+corepack pnpm typecheck
+corepack pnpm test
+~~~
 
-Main source areas:
+A documentation commit is not a substitute for Windows install verification, production deployment, or CI.
 
-```text
-src/bridge/      Bridge, runtime state, admin API
-src/mcp/         MCP tools and registration
-src/permission/  Local permission model
-src/write/       Guarded mutation primitives
-src/auth/        OAuth 2.1 and token handling
-src/pairing/     One-time pairing codes
-src/workspace/   Path policy, search, Git
-src/tunnel/      Cloudflare tunnel integration
-src/execution/   Recorded execution/test evidence
-src/process/     Process lifecycle
-src/cli/         c2c CLI
-skill/           Codex Skill
-```
-
-## Upstream, status, and license
-
-C2C Local is an independent fork maintained by RomioLA and based on [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt). Upstream attribution is intentionally preserved; installation and normal development for C2C Local should use this repository.
-
-Current implemented scope includes the local permission model, Windows production/runtime recovery, Host Observation V1, and secure nested Git repository/worktree targeting.
-
-**Unofficial community project. Not affiliated with or endorsed by OpenAI.**
-
-[MIT](LICENSE)
+**License:** [MIT](LICENSE). Upstream attribution is preserved.
