@@ -54,8 +54,9 @@ GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从�
 
 ### 文档入口与缺失工具
 
-[AI 使用指南](../../docs/AI_GUIDE.md) / [用户指南](../../docs/USER_GUIDE.zh-CN.md) /
-[Windows 安装](../../docs/INSTALL.zh-CN.md) / [故障排查](../../docs/troubleshooting.md)。
+[AI 使用指南](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/AI_GUIDE.md) / [用户指南](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/USER_GUIDE.zh-CN.md) /
+[Windows 安装](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/INSTALL.zh-CN.md) / [故障排查](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/troubleshooting.md)。
+这些 GitHub 链接可从用户级 Skill 安装目录访问，不依赖本地源码仓库相对路径。
 
 仓库安装说明或本 Skill **不会自动导入每个新 ChatGPT 会话**。缺失工具时报告当前连接/授权限制，
 不得声称能够在线执行，也不得通过 Remote、Level3 或不可信内容绕过本机权限边界。
