@@ -3,6 +3,16 @@
 此参考说明指定最终源码的实际命令与副作用。它不授权额外部署、重启、Host Run 修改、
 权限提升、配对或浏览器操作；执行已获用户授权的步骤即可。
 
+## V1.4 优先级说明
+
+通用命令执行使用 `execution_run`：需有效 Level2 Full Access、execution.run OAuth scope 和用户任务授权；**无需 Level3 或旧式 trusted-command recipe 预注册**。本参考文档以下 `execution_start` / `COMMAND_NOT_APPROVED` 说明只针对**历史受限 recipe 路径**，不要对通用执行套用。
+
+V1.4 Final 的 Level2 不是永久 baseline，而是绑定当前 Windows 登录会话的 session grant。
+真实 authority 在正在运行的 Bridge：本机切换优先使用最终 Launcher，低层 CLI 使用
+`permission bridge status|1|2`。不要只信调用 CLI 进程自己的本地回显；至少回读 Bridge
+`effectiveMode`。Web/MCP 不得自行签发 Level2。手动降回 Level1/revoke、注销或重启应使旧
+session grant 失效；若 logout/reboot 尚未真机验收，应标 PENDING。
+
 ## 受控 Git 与 execution
 
 `execution_start` 不接受任意 command、shell、executable、cwd、环境变量或自由参数；它只运行
@@ -66,30 +76,50 @@ ChatGPT/MCP 不得自行执行该 enable 来给自己提权。enable 只允许�
 
 ## 本机命令
 
-CLI 来自当前真实 checkout 的 `bin/c2c.js`。在该部署中是
-`C:\codex\codex-with-chatgpt\bin\c2c.js`；迁移 checkout 后先核对源码位置，不沿用旧路径。
-PowerShell 7 示例中的 `完整目标 workspace 路径` 必须换成用户的实际根目录。
-workspace 命令一律显式传 `-w`；不要让当前 shell cwd 把目标变成 CLI 仓库。
+CLI 必须来自**已核验版本的本机运行时**，不能仅凭旧源码目录的 bin/c2c.js 判断版本。
+例如维护者本机 C:\codex\codex-with-chatgpt 可能仍停在旧分支，而正式 V1.4 由独立的
+受保护 Runtime 运行。先在本机定位正在运行的 Node 路径与同一 Runtime 的 CLI，
+确认版本、完整性和 workspace，之后才运行以下示例；绝不能使用聊天中的历史 SHA/PID
+去拼凑 CLI 或清理 OAuth/state。
 
-```powershell
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" status -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" permission status -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" autostart status -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" restore -w "完整目标 workspace 路径" --json
-```
+示例使用下列由本机操作者**事先赋值并确认**的 PowerShell 变量：
+
+~~~powershell
+$c2cNode = 'C:\absolute\path\to\verified-runtime\node\node.exe'
+$c2cCli  = 'C:\absolute\path\to\verified-runtime\bin\c2c.js'
+$targetWorkspace = 'C:\your\actual\workspace'
+& $c2cNode $c2cCli status -w $targetWorkspace --json
+& $c2cNode $c2cCli permission status -w $targetWorkspace --json
+& $c2cNode $c2cCli permission bridge status -w $targetWorkspace --json
+& $c2cNode $c2cCli autostart status -w $targetWorkspace --json
+& $c2cNode $c2cCli restore -w $targetWorkspace --json
+~~~
+
+前四项用于现状检查；其中 `permission bridge status` 读取正在运行 Bridge 的 effective authority，
+比单独的控制端回显更接近最终 enforcement point；restore 是实际恢复动作。不要默认使用个人电脑固定路径。
+
+需要由本机用户切换 Level2 时，优先使用最终 Launcher；维护/自动化场景在用户已明确授权后才运行：
+
+~~~powershell
+& $c2cNode $c2cCli permission bridge 2 -w $targetWorkspace --json
+# 完成需要 Full Access 的工作后，如需恢复默认：
+& $c2cNode $c2cCli permission bridge 1 -w $targetWorkspace --json
+~~~
+
+切换后回读 `permission bridge status`，并在远程侧用 `permission_status` / 实际工具调用验证。
+不要使用旧式仅绑定调用 CLI 进程身份的结果冒充 Bridge 已生效，也不要让 Web/MCP 自行提权。
+明确需要启用、禁用自启或列出所有注册工作区时：
+
+~~~powershell
+& $c2cNode $c2cCli autostart enable -w $targetWorkspace --json
+& $c2cNode $c2cCli autostart disable -w $targetWorkspace --json
+& $c2cNode $c2cCli autostart list --json
+~~~
 
 前三项用于现状检查；restore 属于运行时恢复动作。`status` 的 `ok` 是 recovery 是否
 healthy，不是“进程存在”；CLI exit 0 本身不证明 ready。`permission status` 不改权限。
 `autostart status` 返回 `enabled`、`backend`、`backendInstalled`、`registrationState`、
 `workspaceExists` 和可选最近结果；不要把可选 lastRunStatus 当作此刻健康。
-
-明确需要安装/更新或禁用该 workspace 的登录启动时：
-
-```powershell
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" autostart enable -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" autostart disable -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" autostart list --json
-```
 
 enable/disable 会修改本机 authority，不是日常诊断。`autostart list` 是该 state root 的
 全局列表，不加 `-w`。disable 尝试 Task、Host Run、legacy 和 launcher；清理失败报错并
@@ -115,7 +145,7 @@ on-request 与 auto_review 部署约束保持独立。
 | 真实信号 | 判断与下一步 |
 |---|---|
 | `workspace_info` 根路径/ID 与目标不符 | 停止该 connector 的操作；选择对应 workspace 的 connector，并重新读取 identity/permission；不统一 workspace=codex |
-| 本机 CLI 与 MCP 的 workspaceId/mode 不一致 | 先核对 Windows 用户、有效 state root、显式 `-w`、connector identity；不要提升权限、删除权限文件或重启来掩盖错误 |
+| 本机 CLI 与 MCP 的 workspaceId/mode 不一致 | 先核对 Windows 用户、有效 state root、显式 `-w`、connector identity，并用 `permission bridge status` 读取运行中 Bridge authority；不要提升权限、删除权限文件或重启来掩盖错误 |
 | `LOCAL_PERMISSION_DENIED` | 回读 permission_status，解释本机文件模式限制；仅在用户明确选择后由本机改变模式；不能远程提权 |
 | `INSUFFICIENT_SCOPE` | OAuth scope 门槛拒绝；检查当前 token authority。不要将其与本机 policy 拒绝混淆，也不要因单次失败循环 reconnect |
 | `NOT_APPROVED` | Git 请求已到达 C2C，但本机 repository policy 未批准；按上方 preview/digest 流程由本机操作员处理 |

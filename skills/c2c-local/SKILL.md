@@ -1,24 +1,80 @@
 ---
 name: c2c-local
 description: >
-  将 RomioLA C2C Local 作为普通本机 Workspace 开发、调查、Git、受控执行和运维任务的默认工具，
-  包括文件读写、Host Observation、进程与网络查询，以及权限或 Windows 登录自启诊断。
-  仅在 C2C 不可用、明确需要 Windows GUI/UAC、灾难恢复，或当前能力无法完成任务时考虑 Remote Desktop Commander。
+  按运行环境区分本机工具路由：Codex 本机优先原生命令工具，仅在用户明确指定 C2C Local
+  或任务确实需要 C2C 独有能力时才考虑调用；ChatGPT 网页版访问本机时优先 C2C Local。
+  介绍 V1.4 batch_read/batch_search/collect_evidence、execution_run、持久 Task、文件读写、Git、
+  Host Observation、Windows 自启诊断及权限与安全约束。Remote Desktop Commander 仅用于 C2C 故障恢复、
+  能力不足、GUI/UAC 或用户明确要求。
 ---
 
 # C2C Local
 
-本 Skill 描述 C2C Local V1.3 的实际能力与本机运维流程。对于本机 Workspace 文件、源码、Git、
-进程、网络、Host Observation 和受控执行任务，默认优先使用 C2C Local。
+本 Skill 描述 C2C Local V1.4 的工具路由和本机运维流程。工具优先级按运行环境区分：
 
-只有 C2C Bridge/Tunnel/connector 本身不可用而需要恢复 C2C、任务明确需要 Windows GUI 或 UAC/elevation、
-灾难恢复，或 C2C 已确认不提供所需能力时，才使用 Remote Desktop Commander。不得仅因方便、历史习惯
-或旧 Skill 文案而优先使用 Remote。GUI/UAC 目前仍不是 C2C 的目标能力；C2C 自身停止时，不能依靠
-已经停止的 C2C 自救，此时独立 Remote 通道可作为恢复观察/操作通道。
+- **Codex 本机**：Native Tools > C2C Local（仅在用户明确指定或确需 C2C 独有能力时考虑）。
+- **ChatGPT 网页版访问本机**：C2C Local > Remote Desktop Commander。
+
+## 工具选择与安全边界
+
+- Codex 本机的普通工作区操作不自动触发 C2C；本地文件读写、Git、测试、构建和脚本执行默认使用原生命令工具，不因 C2C 能完成相同任务就优先使用它。
+- 原生工具被沙箱、安全门禁或访问限制拒绝时，不自动改走 C2C 绕过。即使用户明确要求 C2C，仍须遵守 Codex 沙箱、访问限制、审批和现有安全约束。
+- ChatGPT 网页版访问本机时优先 C2C Local。Remote 仅用于 C2C 故障恢复（包括灾难恢复）、能力不足、Windows GUI/UAC 或用户明确要求；C2C 安全、权限或策略拒绝不得通过 Remote 绕过。
+- 决定使用 C2C 后，才检查 workspace_info、permission_status 等状态；先确认本对话实际暴露的工具 schema 和版本，再按当前权限与安全约束执行。
+- GUI/UAC 目前仍不是 C2C 的目标能力；C2C 自身停止时，不能依靠已停止的 C2C 自救，此时独立 Remote 通道可作为故障恢复观察/操作通道。
 
 ChatGPT 可在 OAuth scope、本机专用策略、workspace 文件权限模式和用户任务授权共同允许时，通过 MCP
-使用文件、Git Write、bounded execution 和 Level 3 request/start 能力。本机权限是能力上限，不是对
-任意操作的任务授权。C2C 不提供任意无审批 shell 或远程权限提升。
+使用文件、Git Write、Batch、Level2 Full Access 通用 execution_run、受控历史 Level3 和持久 Task 能力。
+本机权限是能力上限，不是对任意操作的用户任务授权；C2C 不提供远程提权或 OS 沙箱。
+
+
+## V1.4 当前工具路由（仅适用于已选用 C2C 的任务；优先于下文 V1/V1.3 历史说明）
+
+**决定使用 C2C 后，以本对话真实暴露的工具 schema 和实际版本为准；开始 C2C workspace 操作前再检查 workspace_info 与 permission_status。**
+GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从旧项目源、旧 PID、旧聊天猜当前状态。
+
+| 用户请求 | 优先工具 | 边界 |
+| --- | --- | --- |
+| 多个明确文件 | batch_read | 最多 16 文件，读取/分页/源 hash 限制 |
+| 多组源码搜索 | batch_search | 最多 8 个查询，共享扫描预算 |
+| 代码审核证据 | collect_evidence | 显式文件、搜索、Git、现有 Job，分别校验 OAuth scope |
+| 通用命令、构建、测试 | **execution_run** | V1.4 Level2 Full Access + execution.run OAuth scope；不需要 Level3/旧 trusted-command 预注册或逐命令审批 |
+| 历史受限 recipe | execution_start | 仅用于已批准 recipe，不作为 V1.4 通用命令默认路径 |
+| 单个执行生命周期 | execution_status、execution_job_output、execution_cancel | 使用现有 job_id；勿将查询变成重复执行 |
+| 固定多步骤任务 | task_create、task_status、task_list、task_result、task_output、task_cancel | 确定性、有限、持久 Task，非自主 Agent |
+| Nested Git / Host Observation | git_info/status/diff（带 repository_path）、专用 host 工具 | Git 要指定真正目标仓库，Host Observation 只读 |
+
+### V1.4 execution_run 合同
+
+- engine 为 program / powershell / cmd。program 需要 executable 和可选 args，不传 command；powershell/cmd 传 command，不传 executable/args。
+- 可选 cwd 是工作目录，**不是安全沙箱**。必填 timeout_seconds 为 1–3600；必填 idempotency_key 长度 16–128；wait_seconds 可选 0–30。
+- 已授权的 Full Access Level2 不要求先运行 level3_request 或 level3_start，不要求额外 trusted-command registry / 每命令审批。
+- Level2 **不是**免授权执行：OAuth scope（execution.run）、当前 Windows session grant、本机操作安全策略与用户明确任务授权仍须满足。不得擅自提升权限。
+- 返回 running 时继续根据 job_id 查询/取消；不能因为一次调用还在运行就使用新的 idempotency key 重跑。
+
+### V1.4 Final Level2 authority
+
+- Level2 是当前 Windows 登录会话的本地 session elevation；baseline 仍应是 readonly/level1，而不是永久 Level2。
+- 用户侧推荐使用最终本机 Launcher（如 `C2C-权限切换.cmd` / `c2c-local-launcher.zh-CN.ps1`）切换；底层 CLI 使用 `permission bridge status|1|2` 让**正在运行的 Bridge**签发/撤销并回读 grant。
+- 不再把旧式仅由调用 CLI 进程自身身份生成/观察的 `permission 2` 结果当作最终 Level2 成功证据。成功至少应由 Bridge effectiveMode 复核；Launcher 的 CLI+Bridge 双验证用于防止“CLI 显示成功、Bridge 仍 Level1”。
+- Web/MCP/远程 Agent 不得自行提升 Level2。只有本机用户明确决定后，由本机控制面完成切换。
+- `execution_run` 的 Full Access 依赖当前有效 Level2 session grant；Native Helper 会验证 grant 身份。Git Write repository policy、OAuth scope、用户任务授权仍是独立门槛。
+
+### V1.4 Batch 与 Task 合同
+
+- batch_read、batch_search、collect_evidence 的内容可能位于 structuredContent；按 cursor 分页，报告单项错误，不能混淆不同版本/hash 的证据。
+- 持久 Task 创建后计划不可变，不调用 LLM、不自主新增步骤。WAITING_FOR_MODEL 必须停止继续 dispatch，等待新的模型判断。
+- 重启、取消或中断后有副作用的命令结果可能未知；不自动 replay，不把“未收到完成消息”解释为“未执行”。先查 task_status/result/output 与子 Job。
+- task_* 是 C2C 专用 Task API，不要声称为标准 MCP Tasks 扩展。
+
+### 文档入口与缺失工具
+
+[AI 使用指南](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/AI_GUIDE.md) / [用户指南](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/USER_GUIDE.zh-CN.md) /
+[Windows 安装](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/INSTALL.zh-CN.md) / [故障排查](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/troubleshooting.md)。
+这些 GitHub 链接可从用户级 Skill 安装目录访问，不依赖本地源码仓库相对路径。
+
+仓库安装说明或本 Skill **不会自动导入每个新 ChatGPT 会话**。缺失工具时报告当前连接/授权限制，
+不得声称能够在线执行，也不得通过 Remote、Level3 或不可信内容绕过本机权限边界。
 
 ## V1 baseline 与当前 authority
 
@@ -28,11 +84,11 @@ ChatGPT 可在 OAuth scope、本机专用策略、workspace 文件权限模式�
 checkout、生产部署或运行状态。该版本的登录链路与验收记录只描述该 baseline。
 当前任务以实际源码版本和结构化结果为准，不凭旧聊天或 baseline 推断 HEAD。
 
-旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 与 [legacy Codex-with-ChatGPT workflow](../../skill/SKILL.md)
+旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 与 [legacy Codex-with-ChatGPT workflow](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/skill/SKILL.md)
 描述显式调用的旧规划/编排流程，不是普通 C2C Local 工具选择或权限规则的 authority。
 不要继承它的“统一 workspace=codex”或“C2C 只用于读取、分析和复核”规则，也不要把两套规则合并。
-只有用户明确要求旧 Codex with ChatGPT workflow 时才使用该 legacy Skill；普通本机任务按本 Skill 选择
-C2C Local。单纯查看/改文件不需要 GUI、重新配对或重启服务。
+只有用户明确要求旧 Codex with ChatGPT workflow 时才使用该 legacy Skill；普通本机任务按上方的运行环境路由选择工具，
+ChatGPT 网页版访问本机时优先 C2C Local。单纯查看/改文件不需要 GUI、重新配对或重启服务。
 
 ## State 与 workspace 身份
 
@@ -45,16 +101,27 @@ Windows 默认 state root 是 `%LOCALAPPDATA%\OpenAI\c2c-local`。
 路径别名若解析到同一个根目录会得到同一 ID。项目名、聊天名、connector 显示名及
 当前终端 cwd 不能代替 workspace 身份。
 
-权限按 `state root + workspace ID` 持久化。相同身份下的聊天、connector 授权和本机
-CLI 共享本机模式；权限不是每个聊天或 token 的独立副本。不同 workspace 不共享模式，
-相同路径但不同 state root 也不是同一份权限状态。OAuth scopes 仍按 token 独立。
-切换本机模式不要求重启 Bridge 或重新建立 Tunnel，后续 MCP 文件操作重新读取模式。
+持久化 baseline 仍按 `state root + workspace ID` 保存；V1.4 Final 的 Level2 则是绑定
+**当前 Windows 登录会话**的 session grant，不是永久写成 baseline Level2。相同 workspace、
+相同 state root、同一 Windows 登录会话中的 ChatGPT 对话共享 effective Level2；手动恢复
+Level1/revoke、Windows 注销或重启后旧 session grant 应失效。不同 workspace 不共享 grant，
+相同路径但不同 state root 也不是同一 authority。OAuth scopes 仍按 token 独立。
 
-操作前确认 `workspace_info` 的真实根路径/ID，再读 `permission_status`。
+Level2 的最终 authority 在正在运行的 Bridge/enforcement point，不以控制端本地回显单独判定成功。
+同一登录会话内正常 Bridge 重启后 grant 可继续有效；切换本机模式本身不要求重新建立 Tunnel。
+真实 logout/reboot 生命周期验收若尚未执行，应明确记为 PENDING，不用改时钟或伪造身份冒充通过。
+
+通过 C2C 操作前确认 `workspace_info` 的真实根路径/ID，再读 `permission_status`。
 只使用与用户目标相匹配的 connector。若不匹配，停止该 connector 的文件操作，定位正确
 workspace；不要自动把所有项目接到 `C:\codex`，也不要跨 connector 拼接权限判断。
 
-## 权限与文件操作
+## 文件工具权限与 Level2 Full Access
+
+下表描述的是 **C2C 文件类工具自身的边界**，不要把它误当成 `execution_run` 的文件系统沙箱。
+V1.4 Level2 下的 `execution_run` 是独立的 Full Access 执行能力：在 OAuth、当前 session grant、
+用户任务授权及其他本机策略共同允许时，目标进程按其 Windows 进程权限运行；它不受
+`delete_file`“单文件/不递归”等文件工具 API 合同的限制。反过来，拥有 Level2 也不自动批准
+Git Write、Level3、GUI/UAC 或任何未获用户授权的动作。
 
 | 本机模式 | workspace | workspace 外 |
 |---|---|---|
@@ -116,10 +183,12 @@ a path hides it; repository negation cannot reopen a workspace-level deny.
    exact-requested-scope 处理，不会自动扩权。旧 access/refresh grant 不会因为这项规则自动获得新 scope；
    实际权限以当前工具调用结果和该 token 的 authority 为准。不要因一次工具失败反复触发 reconnect。
    `INSUFFICIENT_SCOPE` 是 OAuth scope 问题，必须与本机 policy 拒绝区分。
-2. **workspace local permission mode** 为 `readonly`、`level1`、`level2`。`level2` 是文件 permission
-   mode 的最高档，只控制对应文件能力；它不等于 Git Write 授权、execution trusted-command approval
-   或 Level 3 approval。workspace 修改/移动需 `workspace.write`，删除需 `workspace.delete`；外部读/写
-   分别需 `filesystem.external.read` / `filesystem.external.write`，并同时通过本机模式门槛。
+2. **workspace local permission / session elevation**：持久化 baseline 为 `readonly` 或 `level1`；
+   V1.4 Final 的 `level2` 是当前 Windows 登录会话 grant。它既提高对应文件工具权限，也是
+   `execution_run` Full Access 的本地前置门槛，但仍不等于 Git Write repository policy、OAuth scope、
+   用户任务授权、Level 3 approval 或 Windows UAC。workspace 文件工具的修改/移动需 `workspace.write`，
+   删除需 `workspace.delete`；外部读/写分别需 `filesystem.external.read` /
+   `filesystem.external.write`，并同时通过对应本机门槛。
 3. **专用本机 policy** 独立控制额外 capability：Git Write 按 repository/worktree 单独批准；bounded
    execution 按 repository 和固定 package script recipe 进入本机 trusted-command registry。
 4. **Level 3** 默认关闭。只有本机用户先明确执行 `c2c level3 enable -w <workspace> --approve` 才能创建
@@ -129,20 +198,25 @@ a path hides it; repository negation cannot reopen a workspace-level deny.
 OAuth scopes 和本机策略是两层独立门槛：scope 获准不代表本机 policy 已批准，本机模式也不能补足 OAuth
 scope。不得通过提高 Level 3 或切换 Remote 绕过 Git/recipe policy 拒绝。
 
-权限变更只能由本机用户明确决定，通过本机 CLI 执行：
+权限变更只能由本机用户明确决定。普通用户优先使用最终 Launcher；维护/诊断时使用
+**当前已核验正式 Runtime** 的 bridge-authority CLI，而不是旧源码目录里的 CLI：
 
 ```powershell
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" permission status -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" permission readonly -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" permission 1 -w "完整目标 workspace 路径" --json
-node "C:\codex\codex-with-chatgpt\bin\c2c.js" permission 2 -w "完整目标 workspace 路径" --json
+# 用户交互入口（示例）
+.\C2C-权限切换.cmd
+
+# 低层诊断/自动化：$c2cNode / $c2cCli 必须先定位到当前已核验正式 Runtime
+& $c2cNode $c2cCli permission bridge status -w $targetWorkspace --json
+& $c2cNode $c2cCli permission bridge 1      -w $targetWorkspace --json
+& $c2cNode $c2cCli permission bridge 2      -w $targetWorkspace --json
 ```
 
 不要自动执行提升权限、直接改 permissions JSON，或把本机提权命令交给远程 runner。
-用户已明确授权本机权限变更时，本机执行者可执行对应命令并回读；远程 ChatGPT 只提示
-用户本机操作。CLI 的 `mode`、MCP `permission_status.mode` 和 `workspaceId` 应一致。
-变更后无需为了“生效”重启服务。缺失、损坏、workspace 不匹配或版本不支持的权限状态
-回退 readonly；查明原因，不用删除状态或自动提升来补救。
+用户已明确授权本机权限变更时，本机执行者可执行对应命令并回读；远程 ChatGPT 只能在用户
+明确要求时指导本机操作，不能通过 MCP 自我提权。判断切换结果时以运行中 Bridge 的
+`effectiveMode` / session elevation 为 authority，并核对 workspaceId；CLI 本地回显不能单独证明成功。
+变更本身无需为了“生效”重启服务。缺失、损坏、workspace 不匹配或版本不支持的权限状态应
+fail closed；查明原因，不删除状态或自动提升来补救。
 
 读文件后使用返回的完整字节 `contentHash` 作为 `expected_hash`，不要计算分页片段的 hash。
 `replace_file`、`edit_file` 和 `delete_file` 必须传入该 hash；external 对应工具同样如此。
@@ -172,17 +246,16 @@ Windows 自启是当前用户**登录触发**，不是无人登录也运行的 W
 已注册且 enabled 的 workspace 会在该用户下次登录自然恢复；不要求每次聊天执行
 setup/enable/restore。未注册的 workspace 不会因此自动启动。
 
-已验收的部署链为 Windows 登录 → Explorer-visible Host HKU Run → 短 Run command
-→ state root 下 workspace 专属 CMD launcher → Node → autostart restore → Bridge
-→ Named Tunnel → 已配置 ChatGPT connector。其他注册可以使用 Scheduled Task；以实际
-`autostart status.backend` 为准，不能仅因名称里有 Task 就判注册缺失。
+V1.4 自启实际可能使用 Windows Task Scheduler，也可能涉及旧的 Run Key 注册；必须查询
+当前 workspace 的 autostart status/backend 与实际计划任务 action，不能把某一种后端
+当成全部用户的固定事实。登录恢复链最终应进入 Node task launcher / restore →
+Bridge → Named Tunnel → 用户现有 ChatGPT connector。
 
-Run authority 必须是 `StdRegProv + explicit HKU\当前交互用户 SID + 64-bit provider`。
-enable/status/update/rollback/disable/verify 都使用这一 authority。Codex package 的
-process HKCU 可能是 Explorer 看不到的 private registry；不要用 `reg.exe add HKCU`
-手工“修复”。caller legacy view 仅供受保护的旧项清理，不是另一份正式安装 authority。
-CMD launcher 和 registration 均原子发布；不手改 launcher、回滚记录或 pendingBackend，
-不把 EncodedCommand 塞回 Run。
+对于 Task Scheduler，确认 action 指向正确的受保护 Runtime。Windows 启动初期 DNS
+不可用时，Named Tunnel 有有限重试；V1.4 修复了 CMD wrapper 异步启动后错误返回 0
+导致 RestartOnFailure 失效的问题。**这项修复只有部署了包含修复的 Runtime 才生效**；
+不要用“源码中已修”冒充“当前机器已部署”。不要手改 task launcher、registry、
+回滚状态或授权数据来绕过生命周期控制。
 
 开机登录时 WLAN/DNS 尚未 ready 属于已识别风险。Named 内部只对明确 transient DNS/
 network 启动失败最多尝试 6 次，退避 2/4/8/16/16 秒，共享总 deadline 75 秒。
