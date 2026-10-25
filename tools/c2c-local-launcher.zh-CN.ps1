@@ -102,7 +102,7 @@ function Get-C2CStateRoot {
     if ([string]::IsNullOrWhiteSpace($local)) {
         throw '无法确定当前用户的 LOCALAPPDATA 目录。'
     }
-    return [IO.Path]::GetFullPath((Join-Path (Join-Path (Join-Path $local 'OpenAI') 'c2c-local'))).TrimEnd('\')
+    return [IO.Path]::GetFullPath((Join-Path (Join-Path $local 'OpenAI') 'c2c-local')).TrimEnd('\')
 }
 
 function Get-C2CRuntimeStatePath {
