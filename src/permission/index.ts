@@ -13,11 +13,14 @@ export type {
   PermissionOperation,
 } from "./policy.js";
 export {
+  applyPermission,
   ensurePermissionMigrated,
   readPermission,
   readPermissionStatus,
   readCurrentSessionGrant,
+  PermissionControlError,
   setPermission,
+  type AppliedPermission,
   type CurrentSessionGrant,
   type PermissionStatus,
 } from "./store.js";

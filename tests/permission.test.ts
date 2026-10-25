@@ -248,7 +248,7 @@ describe("permission state", () => {
     });
   });
 
-  it("migrates legacy level2 only on local startup/CLI and preserves just this session", () => {
+  it("migrates legacy level2 to the level1 baseline without minting a session grant", () => {
     usedWorkspaceIds.add(WORKSPACE_A);
     fs.mkdirSync(path.dirname(stateFile(WORKSPACE_A)), { recursive: true });
     fs.writeFileSync(stateFile(WORKSPACE_A), JSON.stringify({
@@ -258,11 +258,20 @@ describe("permission state", () => {
     expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level1");
     expect((JSON.parse(fs.readFileSync(stateFile(WORKSPACE_A), "utf8")) as { version: number }).version).toBe(1);
 
+    // A resolvable local identity must NOT turn the legacy bit into a grant: every
+    // new Windows logon session has to re-enable Level 2 manually.
+    expect(sessionIdentity.fingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(ensurePermissionMigrated(WORKSPACE_A)).toMatchObject({
-      baselineMode: "level1", effectiveMode: "level2", sessionElevation: { active: true },
+      baselineMode: "level1", effectiveMode: "level1", sessionElevation: { active: false },
     });
-    expect((JSON.parse(fs.readFileSync(stateFile(WORKSPACE_A), "utf8")) as { version: number }).version).toBe(2);
+    const migrated = JSON.parse(fs.readFileSync(stateFile(WORKSPACE_A), "utf8")) as {
+      version: number; baselineMode: string; sessionGrant?: unknown;
+    };
+    expect(migrated.version).toBe(2);
+    expect(migrated.baselineMode).toBe("level1");
+    expect(migrated.sessionGrant).toBeUndefined();
 
+    expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level1");
     sessionIdentity.fingerprint = "b".repeat(64);
     expect(readPermissionStatus(WORKSPACE_A).effectiveMode).toBe("level1");
   });

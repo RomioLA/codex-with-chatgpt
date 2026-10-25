@@ -71,11 +71,13 @@ import { EXECUTION_KINDS, type ExecutionKind, type PackageManager } from "../exe
 import { registerV13Cli } from "./v13.js";
 import { importMediaAsset } from "../media/import.js";
 import {
+  applyPermission,
   ensurePermissionMigrated,
   isPermissionMode,
   readPermission,
   readPermissionStatus,
   setPermission,
+  type PermissionBaselineMode,
   type PermissionMode,
   type PermissionStatus,
 } from "../permission/index.js";
@@ -781,9 +783,9 @@ permissionCmd
         }
         // This is a user-local control-plane mutation. Any future remote process runner
         // must not be able to invoke this elevation path on the user's behalf.
-        setPermission(workspace.id, requestedMode);
-        permissionStatus = readPermissionStatus(workspace.id);
-        elevationUnavailable = requestedMode === "level2" && !permissionStatus.sessionElevation.active;
+        const applied = applyPermission(workspace.id, requestedMode);
+        permissionStatus = applied.status;
+        elevationUnavailable = requestedMode === "level2" && permissionStatus.effectiveMode !== "level2";
       }
       const payload = {
         ok: !elevationUnavailable,
@@ -793,7 +795,11 @@ permissionCmd
         baselineMode: permissionStatus.baselineMode,
         effectiveMode: permissionStatus.effectiveMode,
         sessionElevation: permissionStatus.sessionElevation,
-        ...(elevationUnavailable ? { error: "无法确认当前 Windows 登录会话身份，Level 2 未启用；基线已设为 Level 1。" } : {}),
+        source: "local" as const,
+        ...(elevationUnavailable ? {
+          error: "无法确认当前 Windows 登录会话身份，Level 2 未启用；基线已设为 Level 1。",
+          code: "SESSION_IDENTITY_UNVERIFIED",
+        } : {}),
         ...(level2Requested ? {
           message: elevationUnavailable
             ? "无法确认当前 Windows 登录会话身份，Level 2 未启用；基线已设为 Level 1。"
@@ -810,6 +816,230 @@ permissionCmd
         }
       } else check(`Permission baseline: ${permissionStatus.baselineMode}（${workspace.name}）`);
       if (elevationUnavailable) process.exitCode = 1;
+    } catch (error) {
+      const control = error as { code?: unknown; message?: unknown };
+      const controlCode = typeof control?.code === "string" ? control.code : "";
+      const isControlFailure = controlCode.startsWith("PERMISSION_") ||
+        controlCode === "SESSION_IDENTITY_UNVERIFIED" ||
+        controlCode === "LEVEL2_NOT_EFFECTIVE";
+      if (opts.json && isControlFailure) {
+        // Fail closed with a stable machine code, never a success-looking payload.
+        say(JSON.stringify({
+          ok: false,
+          code: controlCode,
+          error: typeof control.message === "string" ? control.message : "Permission change was not confirmed.",
+          source: "local",
+        }));
+        process.exitCode = 1;
+        return;
+      }
+      handleCliError(error, opts.json);
+    }
+  });
+
+interface BridgePermissionResponse {
+  workspaceId: string;
+  pid: number;
+  port: number;
+  startedAt: string;
+  baselineMode: PermissionBaselineMode;
+  effectiveMode: PermissionMode;
+  sessionElevation: { active: boolean; expiresOn: "logout-or-reboot" | null };
+}
+
+interface BridgeAdminInfo {
+  service?: unknown;
+  workspaceId?: unknown;
+  workspaceRoot?: unknown;
+  pid?: unknown;
+  port?: unknown;
+  startedAt?: unknown;
+}
+
+type BridgePermissionOutcome =
+  | { ok: true; payload: Record<string, unknown> }
+  | { ok: false; error: "BRIDGE_UNAVAILABLE" | "BRIDGE_IDENTITY_MISMATCH"; detail: string };
+
+/**
+ * Compare the persisted runtime identity with what the live Bridge reports about
+ * itself. Any difference means the runtime file and the listener disagree, so the
+ * admin token cannot be trusted for this port.
+ */
+function bridgeIdentityMismatch(runtime: RuntimeState, info: BridgeAdminInfo): string | null {
+  if (info.workspaceId !== runtime.workspaceId) return "admin_info_workspace_mismatch";
+  if (info.pid !== runtime.pid) return "admin_info_pid_mismatch";
+  if (info.port !== runtime.port) return "admin_info_port_mismatch";
+  if (info.startedAt !== runtime.startedAt) return "admin_info_started_at_mismatch";
+  const sameRoot = typeof info.workspaceRoot === "string" &&
+    (process.platform === "win32"
+      ? path.resolve(info.workspaceRoot).toLowerCase() === path.resolve(runtime.workspaceRoot).toLowerCase()
+      : path.resolve(info.workspaceRoot) === path.resolve(runtime.workspaceRoot));
+  if (!sameRoot) return "admin_info_workspace_root_mismatch";
+  return null;
+}
+
+/**
+ * Drive the LIVE Bridge's own grant authority over POST /admin/permission.
+ * The Bridge resolves and verifies its own Windows session identity, so this path
+ * never depends on this (short-lived CLI) process being able to read the identity.
+ */
+async function applyPermissionThroughBridge(
+  workspaceId: string,
+  mode: "level1" | "level2" | "readonly"
+): Promise<BridgePermissionOutcome> {
+  const observation = await findBridgeObservation(workspaceId);
+  if (observation.state !== "healthy" || !observation.runtime) {
+    return {
+      ok: false,
+      error: "BRIDGE_UNAVAILABLE",
+      detail: observation.state === "healthy" ? "runtime_missing" : observation.reason,
+    };
+  }
+  const runtime = observation.runtime;
+  if (runtime.workspaceId !== workspaceId) {
+    return { ok: false, error: "BRIDGE_IDENTITY_MISMATCH", detail: "runtime_workspace_mismatch" };
+  }
+
+  let info: BridgeAdminInfo;
+  try {
+    info = await adminFetch<BridgeAdminInfo>(runtime, "GET", "/admin/info", 10_000);
+  } catch (error) {
+    const status = (error as Error & { httpStatus?: number }).httpStatus;
+    if (status === 401 || status === 403 || status === 404) {
+      return { ok: false, error: "BRIDGE_IDENTITY_MISMATCH", detail: `admin_info_${status}` };
+    }
+    return { ok: false, error: "BRIDGE_UNAVAILABLE", detail: "admin_info_unreachable" };
+  }
+  const mismatch = bridgeIdentityMismatch(runtime, info);
+  if (mismatch) return { ok: false, error: "BRIDGE_IDENTITY_MISMATCH", detail: mismatch };
+
+  let applied: BridgePermissionResponse;
+  try {
+    applied = await adminFetch<BridgePermissionResponse>(
+      runtime,
+      "POST",
+      "/admin/permission",
+      20_000,
+      { mode: mode === "level2" ? "2" : mode === "level1" ? "1" : "readonly" }
+    );
+  } catch (error) {
+    const refusal = error as Error & { code?: string; httpStatus?: number };
+    if (refusal.httpStatus === 401 || refusal.httpStatus === 403 || refusal.httpStatus === 404) {
+      return { ok: false, error: "BRIDGE_IDENTITY_MISMATCH", detail: `admin_permission_${refusal.httpStatus}` };
+    }
+    // A refusal by the Bridge is a real, reportable outcome, not an outage.
+    return { ok: false, error: "BRIDGE_UNAVAILABLE", detail: String(refusal.code ?? `admin_permission_${refusal.httpStatus ?? "failed"}`) };
+  }
+  return {
+    ok: true,
+    payload: {
+      ok: true,
+      workspaceId: applied.workspaceId,
+      pid: applied.pid,
+      port: applied.port,
+      startedAt: applied.startedAt,
+      baselineMode: applied.baselineMode,
+      effectiveMode: applied.effectiveMode,
+      sessionElevation: applied.sessionElevation,
+      source: "bridge" as const,
+    },
+  };
+}
+
+permissionCmd
+  .command("bridge")
+  .description("Apply a permission mode through the running Bridge's own session authority")
+  .argument("<mode>", "1, 2, level1, level2, readonly, or status")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (rawMode: string, opts: { workspace?: string; json: boolean }) => {
+    // Commander routes options shared with the parent `permission` command to the
+    // parent, so accept either location for `permission bridge <mode> -w <p> --json`.
+    const parentOpts = permissionCmd.opts() as { workspace?: string; json?: boolean };
+    const workspaceOption = opts.workspace ?? parentOpts.workspace;
+    const jsonOutput = opts.json === true || parentOpts.json === true;
+    try {
+      const workspace = new Workspace(resolveWorkspace(workspaceOption));
+      const mode = rawMode.trim().toLowerCase();
+      if (mode === "status") {
+        const observation = await findBridgeObservation(workspace.id);
+        if (observation.state !== "healthy" || !observation.runtime) {
+          say(JSON.stringify({
+            ok: false,
+            error: "BRIDGE_UNAVAILABLE",
+            detail: observation.state === "healthy" ? "runtime_missing" : observation.reason,
+            source: "bridge",
+          }));
+          process.exitCode = 1;
+          return;
+        }
+        const runtime = observation.runtime;
+        let info: BridgeAdminInfo;
+        try { info = await adminFetch<BridgeAdminInfo>(runtime, "GET", "/admin/info", 10_000); }
+        catch (error) {
+          const status = (error as Error & { httpStatus?: number }).httpStatus;
+          say(JSON.stringify({
+            ok: false,
+            error: status === 404 || status === 401 || status === 403 ? "BRIDGE_IDENTITY_MISMATCH" : "BRIDGE_UNAVAILABLE",
+            detail: "admin_info_unreachable",
+            source: "bridge",
+          }));
+          process.exitCode = 1;
+          return;
+        }
+        const mismatch = bridgeIdentityMismatch(runtime, info);
+        if (mismatch) {
+          say(JSON.stringify({ ok: false, error: "BRIDGE_IDENTITY_MISMATCH", detail: mismatch, source: "bridge" }));
+          process.exitCode = 1;
+          return;
+        }
+        const status = await adminFetch<BridgePermissionResponse>(runtime, "GET", "/admin/permission", 10_000);
+        say(JSON.stringify({
+          ok: true,
+          workspaceId: status.workspaceId,
+          pid: status.pid,
+          port: status.port,
+          startedAt: status.startedAt,
+          baselineMode: status.baselineMode,
+          effectiveMode: status.effectiveMode,
+          sessionElevation: status.sessionElevation,
+          source: "bridge",
+        }));
+        return;
+      }
+      const requestedMode: PermissionMode | null =
+        mode === "1" || mode === "level1" ? "level1"
+          : mode === "2" || mode === "level2" ? "level2"
+            : mode === "readonly" ? "readonly" : null;
+      if (!requestedMode) {
+        throw new Error(`Invalid bridge permission mode: ${rawMode}. Use 1, 2, readonly, or status.`);
+      }
+      const outcome = await applyPermissionThroughBridge(workspace.id, requestedMode);
+      if (!outcome.ok) {
+        say(JSON.stringify({ ok: false, error: outcome.error, detail: outcome.detail, source: "bridge" }));
+        process.exitCode = 1;
+        return;
+      }
+      const payload = outcome.payload;
+      // Never report success unless the Bridge's own readback confirms the mode.
+      if (requestedMode === "level2" && payload.effectiveMode !== "level2") {
+        say(JSON.stringify({
+          ...payload,
+          ok: false,
+          code: "LEVEL2_NOT_EFFECTIVE",
+          error: "The Bridge did not report Level 2 after the change.",
+        }));
+        process.exitCode = 1;
+        return;
+      }
+      if (jsonOutput) {
+        say(JSON.stringify(payload));
+        return;
+      }
+      say(`权限基线：${String(payload.baselineMode)}；当前有效权限：${String(payload.effectiveMode)}（来源：运行中的 Bridge）`);
+      if (requestedMode === "level2") {
+        say("Level 2 已为当前 Windows 登录会话启用。注销或重启后将自动恢复为 Level 1。");
+      }
     } catch (error) {
       handleCliError(error, opts.json);
     }

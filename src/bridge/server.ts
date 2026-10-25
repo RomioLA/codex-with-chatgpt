@@ -18,7 +18,7 @@ import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { probeBridge, writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 import { acquireBridgeInstanceLock, type BridgeInstanceLock } from "./instance-lock.js";
-import { ensurePermissionMigrated, readPermission } from "../permission/index.js";
+import { applyPermission, ensurePermissionMigrated, PermissionControlError, readPermission, readPermissionStatus, type PermissionMode } from "../permission/index.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../execution/supervisor.js";
 import { TaskStore } from "../tasks/task-store.js";
 import { TaskSupervisor } from "../tasks/task-supervisor.js";
@@ -111,6 +111,45 @@ function listen(
   });
 }
 
+/**
+ * Parse the Level2 control-plane body. Only `mode` (1|2) or `baseline`
+ * (level1|readonly) is accepted; the baseline channel can never elevate.
+ */
+function parsePermissionRequest(
+  raw: unknown
+): { mode: PermissionMode } | { error: string; message: string } {
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return { error: "PERMISSION_REQUEST_INVALID", message: "A JSON body with mode or baseline is required." };
+  }
+  let body: unknown;
+  try { body = JSON.parse(raw); }
+  catch { return { error: "PERMISSION_REQUEST_INVALID", message: "Request body is not valid JSON." }; }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { error: "PERMISSION_REQUEST_INVALID", message: "Request body must be a JSON object." };
+  }
+  const record = body as Record<string, unknown>;
+  const extra = Object.keys(record).filter((key) => key !== "mode" && key !== "baseline");
+  if (extra.length > 0) {
+    return { error: "PERMISSION_REQUEST_INVALID", message: "Unsupported request field." };
+  }
+  const hasMode = Object.prototype.hasOwnProperty.call(record, "mode");
+  const hasBaseline = Object.prototype.hasOwnProperty.call(record, "baseline");
+  if (hasMode === hasBaseline) {
+    return { error: "PERMISSION_REQUEST_INVALID", message: "Provide exactly one of mode or baseline." };
+  }
+  if (hasMode) {
+    // "1" / "2" are the launcher-facing shorthands; long names are accepted too.
+    const value = record.mode;
+    if (value === "1" || value === "level1") return { mode: "level1" };
+    if (value === "2" || value === "level2") return { mode: "level2" };
+    return { error: "PERMISSION_REQUEST_INVALID", message: "mode must be \"1\" or \"2\"." };
+  }
+  const baseline: unknown = record.baseline;
+  if (baseline === "level1") return { mode: "level1" };
+  if (baseline === "readonly") return { mode: "readonly" };
+  return { error: "PERMISSION_REQUEST_INVALID", message: "baseline must be \"level1\" or \"readonly\"." };
+}
+
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
@@ -119,8 +158,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
   }
-  // Upgrade the old persisted mode before any MCP request can observe it. This
-  // local startup migration may grant Level 2 only to the current Windows logon.
+  // Upgrade the old persisted state shape before any MCP request can observe it.
+  // This local startup migration NEVER grants Level 2: a legacy v1 `mode=level2`
+  // record is reduced to a level1 baseline, because Level 2 must be re-enabled by
+  // the user in each Windows logon session.
   ensurePermissionMigrated(workspace.id);
 
   const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
@@ -277,6 +318,71 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     pairing.invalidateAll();
     logger.info(`Revoked all tokens (${count})`);
     res.json({ revoked: count });
+  });
+
+  // ---- Level2 local permission control plane (loopback + admin token only) --
+  //
+  // This is the Bridge's own Level 2 grant authority and the ONLY supported way
+  // to elevate while a Bridge is running: the grant is written with this
+  // process's Windows logon identity, so a grant created by any other process
+  // cannot be honoured here.
+  //
+  // It is deliberately NOT registered on /mcp. An OAuth client can never reach
+  // it, and it is invisible to remote callers because adminGuard answers 404 for
+  // anything that is not a loopback request carrying the runtime admin token.
+  //
+  //   POST /admin/permission   {"mode":"1"|"2"} | {"baseline":"level1"|"readonly"}
+  //   200: {workspaceId,pid,port,startedAt,baselineMode,effectiveMode,sessionElevation}
+  //   non-200: {error,code,message}; 409 busy/unverified/not-effective/inconsistent,
+  //   500 malformed/unwritable. Never a success body for an unconfirmed grant.
+  app.post("/admin/permission", adminGuard, express.text({ type: () => true, limit: "1kb" }), (req, res) => {
+    const requested = parsePermissionRequest(req.body);
+    if ("error" in requested) {
+      res.status(409).json({ error: requested.error, code: requested.error, message: requested.message });
+      return;
+    }
+    let applied;
+    try {
+      applied = applyPermission(workspace.id, requested.mode);
+    } catch (error) {
+      if (error instanceof PermissionControlError) {
+        logger.warn(`Permission control refused (${error.code})`);
+        res.status(error.status).json({ error: error.code, code: error.code, message: error.message });
+        return;
+      }
+      // Defensive: never leak an internal error message or a partial success.
+      logger.error("Permission control failed");
+      res.status(500).json({
+        error: "PERMISSION_CONTROL_FAILED",
+        code: "PERMISSION_CONTROL_FAILED",
+        message: "Permission state could not be changed; treat the change as unconfirmed.",
+      });
+      return;
+    }
+    logger.info(`Permission control applied effectiveMode=${applied.effectiveMode} baseline=${applied.baselineMode}`);
+    res.json({
+      workspaceId: workspace.id,
+      pid: process.pid,
+      port,
+      startedAt,
+      baselineMode: applied.baselineMode,
+      effectiveMode: applied.effectiveMode,
+      sessionElevation: applied.sessionElevation,
+    });
+  });
+
+  // Read-only mirror used by callers that only need to verify the live authority.
+  app.get("/admin/permission", adminGuard, (_req, res) => {
+    const status = readPermissionStatus(workspace.id);
+    res.json({
+      workspaceId: workspace.id,
+      pid: process.pid,
+      port,
+      startedAt,
+      baselineMode: status.baselineMode,
+      effectiveMode: status.effectiveMode,
+      sessionElevation: status.sessionElevation,
+    });
   });
 
   app.post("/admin/shutdown", adminGuard, (_req, res) => {

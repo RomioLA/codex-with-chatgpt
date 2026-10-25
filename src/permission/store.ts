@@ -329,7 +329,8 @@ function readAuthorizationEpochFile(workspaceId: string): number | null {
 }
 
 /**
- * Monotonic workspace authorization version used by persistent Tasks.
+ * Monotonic workspace authorization version. Every Level1/Level2 transition bumps
+ * it so any consumer that binds an authorization generation observes a change.
  * A malformed or busy permission record is unverifiable and therefore null.
  */
 export function readAuthorizationEpoch(workspaceId: string): number | null {
@@ -368,6 +369,10 @@ export function incrementAuthorizationEpoch(workspaceId: string): number {
 /**
  * Local startup/CLI migration only. MCP status reads never call this function,
  * so a remote read cannot create a Level 2 session grant from legacy state.
+ *
+ * Migration never elevates. It only upgrades the persisted *shape* (v1 -> v2) and
+ * always lands on a non-elevated baseline, so a legacy v1 `mode=level2` record
+ * cannot carry Level 2 across into a new Windows logon session.
  */
 export function ensurePermissionMigrated(workspaceId: string): PermissionStatus {
   if (!isWorkspaceId(workspaceId)) return makeStatus("readonly", false);
@@ -402,15 +407,19 @@ export function ensurePermissionMigrated(workspaceId: string): PermissionStatus 
       if (!isLegacyState(value, workspaceId)) return makeStatus("readonly", false);
 
       const baselineMode = baselineForLegacyState(value);
-      const fingerprint = value.mode === "level2" ? getCurrentSessionIdentityFingerprint() : null;
-      const migrated = buildState(workspaceId, baselineMode, fingerprint ?? undefined);
+      // Legacy v1 mode=level2 predates session binding, so it cannot prove that the
+      // local user elevated Level 2 in *this* Windows logon session. Migrating it
+      // into a session grant would silently satisfy the "each new logon session
+      // must re-enable Level 2 manually" requirement, so the legacy bit is dropped:
+      // the state is rewritten as a plain baseline and no sessionGrant is created.
+      const migrated = buildState(workspaceId, baselineMode);
       try {
         writePermissionState(file, migrated);
       } catch {
-        // The legacy level2 bit is never honored unless its session grant was persisted.
+        // Even if the rewrite fails, nothing is elevated.
         return makeStatus(baselineMode, false);
       }
-      return makeStatus(baselineMode, Boolean(fingerprint && migrated.sessionGrant));
+      return makeStatus(baselineMode, false);
     });
   } catch {
     // Busy, unreadable, or otherwise unverifiable state stays at its baseline.
@@ -436,4 +445,142 @@ export function setPermission(workspaceId: string, mode: PermissionMode): Permis
     writePermissionState(permissionFile(workspaceId), state);
     return statusForCurrentState(state).effectiveMode;
   });
+}
+
+/**
+ * An explicitly named control-plane failure. `code` is a stable machine token a
+ * local caller can report; `status` is the HTTP status the Bridge should use.
+ * No message ever contains identity values, SIDs, LUIDs, or file contents.
+ */
+export class PermissionControlError extends Error {
+  readonly code: string;
+  readonly status: number;
+  constructor(code: string, message: string, status = 409) {
+    super(message);
+    this.name = "PermissionControlError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+export interface AppliedPermission {
+  /** Mode requested by the caller, before any session binding is checked. */
+  requestedMode: PermissionMode;
+  /** Mirrors `status.effectiveMode` for convenience. */
+  effectiveMode: PermissionMode;
+  baselineMode: PermissionBaselineMode;
+  sessionElevation: PermissionStatus["sessionElevation"];
+  status: PermissionStatus;
+}
+
+/** Map store errors onto stable machine codes without leaking internals. */
+function toControlError(error: unknown): PermissionControlError {
+  if (error instanceof PermissionControlError) return error;
+  if (error instanceof PermissionStateBusyError) {
+    return new PermissionControlError(
+      "PERMISSION_STATE_BUSY",
+      "Permission state is being updated by another C2C process; nothing was changed.",
+      409
+    );
+  }
+  if (error instanceof Error && error.message === "AUTHORIZATION_EPOCH_UNAVAILABLE") {
+    return new PermissionControlError(
+      "PERMISSION_STATE_MALFORMED",
+      "Stored permission state is malformed or unreadable; refusing to change it.",
+      500
+    );
+  }
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "EACCES" || code === "EPERM") {
+    return new PermissionControlError(
+      "PERMISSION_STATE_UNWRITABLE",
+      "Permission state could not be written; nothing was changed.",
+      500
+    );
+  }
+  return new PermissionControlError(
+    "PERMISSION_STATE_UNAVAILABLE",
+    "Permission state could not be updated; nothing was confirmed.",
+    500
+  );
+}
+
+/**
+ * Grant or revoke the current-session Level 2 authority, reporting only the state
+ * that was actually persisted and re-verified from disk. This is the single
+ * control-plane entry point for the Bridge's loopback admin surface and the CLI.
+ *
+ * Semantics (deliberately stricter than a bare setPermission call):
+ *  - The baseline is never persisted as level2; `level2` only ever writes a
+ *    persistent level1 baseline plus a session grant bound to this process's own
+ *    Windows logon identity (`getCurrentSessionIdentityFingerprint()`).
+ *  - When that identity cannot be confirmed, NOTHING is written and
+ *    `SESSION_IDENTITY_UNVERIFIED` is raised.
+ *  - When the caller asked for level2 and the re-read effective mode is not
+ *    level2, `LEVEL2_NOT_EFFECTIVE` is raised instead of reporting success.
+ *  - Busy, malformed, or unwritable state raises a PermissionControlError with a
+ *    stable code; the previous state is left untouched where possible.
+ *  - The authorization epoch is bumped by setPermission itself.
+ */
+export function applyPermission(workspaceId: string, mode: PermissionMode): AppliedPermission {
+  if (!isWorkspaceId(workspaceId)) throw new TypeError("Invalid workspaceId");
+  if (!isPermissionMode(mode)) throw new TypeError("Invalid permission mode");
+
+  if (mode === "level2" && getCurrentSessionIdentityFingerprint() === null) {
+    throw new PermissionControlError(
+      "SESSION_IDENTITY_UNVERIFIED",
+      "The current Windows logon session identity could not be confirmed; Level 2 was not enabled and nothing was changed.",
+      409
+    );
+  }
+
+  let appliedMode: PermissionMode;
+  try {
+    appliedMode = setPermission(workspaceId, mode);
+  } catch (error) {
+    throw toControlError(error);
+  }
+
+  let status: PermissionStatus;
+  try {
+    status = readPermissionStatus(workspaceId);
+  } catch (error) {
+    throw toControlError(error);
+  }
+  if (permissionLockBlocksRead(workspaceId)) {
+    throw new PermissionControlError(
+      "PERMISSION_STATE_BUSY",
+      "Permission state could not be re-verified after the update; treat the change as unconfirmed.",
+      409
+    );
+  }
+  if ((status.baselineMode as string) === "level2") {
+    throw new PermissionControlError(
+      "PERMISSION_BASELINE_INVALID",
+      "Persisted baseline is invalid; refusing to confirm the change.",
+      500
+    );
+  }
+  if (mode === "level2" && status.effectiveMode !== "level2") {
+    throw new PermissionControlError(
+      "LEVEL2_NOT_EFFECTIVE",
+      `Level 2 was not effective after the update (effective mode is ${status.effectiveMode}).`,
+      409
+    );
+  }
+  if (status.effectiveMode !== appliedMode) {
+    throw new PermissionControlError(
+      "PERMISSION_STATE_INCONSISTENT",
+      "Permission state changed while it was being confirmed; treat the change as unconfirmed.",
+      409
+    );
+  }
+
+  return {
+    requestedMode: mode,
+    effectiveMode: status.effectiveMode,
+    baselineMode: status.baselineMode,
+    sessionElevation: status.sessionElevation,
+    status,
+  };
 }
