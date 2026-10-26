@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
+import { observeBridgeProcessLifecycle, type BridgeShutdownSource } from "../diagnostics/bridge-lifecycle.js";
 import { collectRuntimeDiagnostics, restoreWorkspace } from "../process/recovery.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
@@ -405,16 +406,17 @@ program
   .option("--port <port>", "preferred port")
   .action(async (opts: { workspace: string; port?: string }) => {
     const logger = new Logger({ name: "bridge", console: true });
+    observeBridgeProcessLifecycle(logger);
     const bridge = await startBridge({
       workspaceRoot: resolveWorkspace(opts.workspace),
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
     });
-    const shutdown = (): void => {
-      void bridge.close().then(() => process.exit(0));
+    const shutdown = (source: BridgeShutdownSource): void => {
+      void bridge.close(source).then(() => process.exit(0));
     };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", () => shutdown("sigint"));
+    process.on("SIGTERM", () => shutdown("sigterm"));
     say(`bridge ready on ${bridge.localBaseUrl()} (workspace ${bridge.workspace.name})`);
   });
 
@@ -660,7 +662,7 @@ program
   .description("Stop the bridge for this workspace")
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
-    const stopped = await stopBridge(resolveWorkspace(opts.workspace));
+    const stopped = await stopBridge(resolveWorkspace(opts.workspace), "cli_stop");
     if (stopped) check("Bridge 已停止");
     else say("没有正在运行的 Bridge。");
   });
@@ -672,7 +674,7 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    await stopBridge(root);
+    await stopBridge(root, "cli_restart");
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
       const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
@@ -1309,7 +1311,7 @@ program
     if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
       if (namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
-        await stopBridge(root);
+        await stopBridge(root, "doctor_repair");
         await new Promise((resolve) => setTimeout(resolve, 400));
         try {
           runtime = (await ensureBridge(root)).runtime;
@@ -1984,7 +1986,7 @@ tunnelCmd
       if (mode === "quick") {
         const state = chooseQuickTunnel(workspace.id);
         if (await findLiveBridge(workspace.id)) {
-          if (previous.preference === "named") await stopBridge(root);
+          if (previous.preference === "named") await stopBridge(root, "tunnel_transition");
         }
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
@@ -2016,7 +2018,7 @@ tunnelCmd
         zone,
         hostname: opts.hostname,
       });
-      if (await findLiveBridge(workspace.id)) await stopBridge(root);
+      if (await findLiveBridge(workspace.id)) await stopBridge(root, "tunnel_configuration");
       const payload = {
         ...tunnelChoicePayload(workspace),
         ok: true,

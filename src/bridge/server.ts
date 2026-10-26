@@ -28,6 +28,11 @@ import {
   isEventLoopTraceEnabled,
   recordEventLoopTrace,
 } from "../diagnostics/event-loop-trace.js";
+import {
+  recordShutdownLifecycle,
+  resolveAdminShutdownSource,
+  type BridgeShutdownSource,
+} from "../diagnostics/bridge-lifecycle.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -70,7 +75,7 @@ export interface Bridge {
   taskSupervisor: TaskSupervisor;
   getPublicBaseUrl(): string | null;
   localBaseUrl(): string;
-  close(): Promise<void>;
+  close(source?: BridgeShutdownSource): Promise<void>;
 }
 
 /**
@@ -243,6 +248,14 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     next();
   };
 
+  let shutdownSource: BridgeShutdownSource | null = null;
+  let shutdownPromise: Promise<void> | null = null;
+  const requestShutdown = (source: BridgeShutdownSource): void => {
+    if (shutdownSource !== null) return;
+    shutdownSource = source;
+    recordShutdownLifecycle(logger, "shutdown_requested", source);
+  };
+
   if (isEventLoopTraceEnabled()) {
     app.get("/admin/event-loop-trace", adminGuard, (_req, res) => {
       res.json(getEventLoopTraceSnapshot());
@@ -385,10 +398,12 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     });
   });
 
-  app.post("/admin/shutdown", adminGuard, (_req, res) => {
+  app.post("/admin/shutdown", adminGuard, express.json({ limit: "1kb" }), (req, res) => {
+    const source = resolveAdminShutdownSource(req.body);
+    requestShutdown(source);
     res.json({ shuttingDown: true });
     setTimeout(() => {
-      void shutdown().then(() => process.exit(0));
+      void shutdown(source).then(() => process.exit(0));
     }, 100);
   });
 
@@ -450,17 +465,27 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     throw error;
   }
 
-  let closed = false;
-  const shutdown = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    await supervisor.shutdown();
-    await persistentTaskSupervisor.shutdown();
-    await tunnel.stop().catch(() => undefined);
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
-    await instanceLock.release().catch(() => undefined);
-    logger.info("Bridge stopped");
+  const shutdown = (source: BridgeShutdownSource = "admin_shutdown"): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    requestShutdown(source);
+    const effectiveSource = shutdownSource ?? source;
+    shutdownPromise = (async () => {
+      recordShutdownLifecycle(logger, "shutdown_begin", effectiveSource);
+      try {
+        await supervisor.shutdown();
+        await persistentTaskSupervisor.shutdown();
+        await tunnel.stop().catch(() => undefined);
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
+        await instanceLock.release().catch(() => undefined);
+        logger.info("Bridge stopped");
+        recordShutdownLifecycle(logger, "shutdown_complete", effectiveSource);
+      } catch (error) {
+        recordShutdownLifecycle(logger, "shutdown_failed", effectiveSource);
+        throw error;
+      }
+    })();
+    return shutdownPromise;
   };
 
   return {

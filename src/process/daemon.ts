@@ -6,6 +6,7 @@ import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { inspectBridgeInstanceLock } from "../bridge/instance-lock.js";
 import { Workspace } from "../workspace/manager.js";
+import type { AdminShutdownSource } from "../diagnostics/bridge-lifecycle.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -198,14 +199,17 @@ export async function adminFetch<T = unknown>(
   }
 }
 
-export async function stopBridge(workspaceRoot: string): Promise<boolean> {
+export async function stopBridge(
+  workspaceRoot: string,
+  source: AdminShutdownSource = "admin_shutdown",
+): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
   const runtime = readRuntimeState(workspace.id);
   if (!runtime) return false;
   const healthy = await probeBridge(runtime.port);
   if (healthy && healthy.workspaceId === workspace.id) {
     try {
-      await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
+      await adminFetch(runtime, "POST", "/admin/shutdown", 5000, { source });
       return true;
     } catch {
       // fall through to kill
