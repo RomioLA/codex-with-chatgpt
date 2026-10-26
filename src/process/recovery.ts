@@ -1,6 +1,7 @@
 import path from "node:path";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
+import { getStateDir } from "../config/paths.js";
 import { findBridgeObservation, type BridgeObservation, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, BridgeAdminIdentityError, ensureBridge, type EnsureBridgeResult } from "./daemon.js";
 import { Logger, type Logger as LoggerType } from "../logger/index.js";
@@ -219,6 +220,26 @@ function namedInfoUrl(info: RecoveryAdminInfo, hostname: string | null | undefin
   return publicUrl ?? tunnelUrl;
 }
 
+/** Require explicit current Named Tunnel state before doctor treats a failed public probe as a false alarm. */
+export function isNamedTunnelConfirmedConnected(
+  info: RecoveryAdminInfo,
+  hostname: string | null | undefined
+): boolean {
+  return info.tunnel.provider === "cloudflare-named" &&
+    info.tunnel.running === true &&
+    info.tunnel.processRunning === true &&
+    info.tunnel.connected === true &&
+    namedInfoUrl(info, hostname) !== null;
+}
+
+/** Only a positively reported stopped Named Tunnel may be started automatically by doctor. */
+export function isNamedTunnelConfirmedStopped(info: RecoveryAdminInfo): boolean {
+  return info.tunnel.provider === "cloudflare-named" &&
+    info.tunnel.running === false &&
+    info.tunnel.processRunning === false &&
+    info.tunnel.connected === false;
+}
+
 function samePath(left: string, right: string): boolean {
   const a = path.resolve(left);
   const b = path.resolve(right);
@@ -246,6 +267,12 @@ function runtimeMatchesObservation(runtime: RuntimeState, observation: BridgeObs
 function namedInfoConnected(info: RecoveryAdminInfo): boolean {
   if (!info.tunnel.running || info.tunnel.connected === false || info.tunnel.processRunning === false) return false;
   return true;
+}
+
+function readOAuthTokenCount(workspaceId: string): number {
+  return new AuthStore(workspaceId, {
+    file: path.join(getStateDir(), "auth", `${workspaceId}.json`),
+  }).tokenCount();
 }
 
 function namedInfoStartable(info: RecoveryAdminInfo): boolean {
@@ -403,7 +430,7 @@ export async function collectRuntimeDiagnostics(
     connectorEndpointHealthy: connectorHealthy,
     endpointStable,
     restartSafeConnector: endpointStable,
-    oauth: { tokenCount: info?.tokenCount ?? new AuthStore(workspace.id).tokenCount() },
+    oauth: { tokenCount: info?.tokenCount ?? readOAuthTokenCount(workspace.id) },
     recovery: { status: reason ? "actionNeeded" : "healthy", reason },
   };
 }

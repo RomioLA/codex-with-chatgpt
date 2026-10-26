@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
 /**
@@ -21,7 +21,7 @@ export interface RuntimeState {
 }
 
 export function runtimeFile(workspaceId: string): string {
-  return path.join(ensureDir(path.join(getStateDir(), "runtime")), `${workspaceId}.json`);
+  return path.join(getStateDir(), "runtime", `${workspaceId}.json`);
 }
 
 export function writeRuntimeState(state: RuntimeState): void {

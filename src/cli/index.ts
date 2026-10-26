@@ -7,7 +7,12 @@ import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { observeBridgeProcessLifecycle, type BridgeShutdownSource } from "../diagnostics/bridge-lifecycle.js";
-import { collectRuntimeDiagnostics, restoreWorkspace } from "../process/recovery.js";
+import {
+  collectRuntimeDiagnostics,
+  isNamedTunnelConfirmedConnected,
+  isNamedTunnelConfirmedStopped,
+  restoreWorkspace,
+} from "../process/recovery.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -217,7 +222,13 @@ interface AdminInfo {
   workspaceRoot: string;
   port: number;
   publicUrl: string | null;
-  tunnel: { running: boolean; url: string | null; provider: string };
+  tunnel: {
+    running: boolean;
+    url: string | null;
+    provider: string;
+    processRunning?: boolean;
+    connected?: boolean;
+  };
   tokenCount: number;
   pairingActive: boolean;
   pid: number;
@@ -735,7 +746,7 @@ program
       const diagnostics = await collectRuntimeDiagnostics(root, { observation });
       if (opts.json) say(JSON.stringify({ ok: false, running: false, permissionMode, diagnostics, autostart }));
       else {
-        say("Bridge 未运行。使用 `c2c start` 启动。");
+        say("Bridge 未运行。可使用 `c2c restore -w <workspace>` 显式恢复 Bridge 和已配置 Tunnel。");
         printRuntimeDiagnostics(diagnostics, autostart);
       }
       return;
@@ -1190,6 +1201,10 @@ program
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; fix: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
+    const repairMode = opts.fix ? "auto-repair" : "read-only";
+    const repairEffects = opts.fix
+      ? ["codex_sandbox_allowlist", "bridge_start_or_restart", "tunnel_start", "endpoint_metadata_write"]
+      : [];
     const report: Record<string, { ok: boolean; detail?: string }> = {};
     const results: string[] = [];
 
@@ -1321,10 +1336,27 @@ program
           report.tunnel = { ok: false, detail: (error as Error).message };
         }
       }
-      const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedReady;
-      let currentUrl = info.publicUrl ?? info.tunnel.url;
+      let namedTunnelConnected = Boolean(
+        namedReady && tunnelState && isNamedTunnelConfirmedConnected(info, tunnelState.hostname)
+      );
+      let namedTunnelStopped = Boolean(
+        namedReady && tunnelState && isNamedTunnelConfirmedStopped(info)
+      );
+      let namedTunnelDisconnected = Boolean(
+        namedReady && info.tunnel.provider === "cloudflare-named" &&
+        info.tunnel.processRunning === true && info.tunnel.connected === false
+      );
+      const namedIdentityRequired = Boolean(
+        namedReady ||
+        info.tunnel.provider === "cloudflare-named" ||
+        tunnelState?.preference === "named"
+      );
+      const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedIdentityRequired;
+      let currentUrl = namedIdentityRequired
+        ? info.publicUrl || info.tunnel.url
+        : info.publicUrl ?? info.tunnel.url;
       let healthy = false;
-      if (currentUrl) {
+      if (currentUrl && (!namedIdentityRequired || namedTunnelConnected)) {
         try {
           const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
           healthy = response.ok;
@@ -1332,15 +1364,53 @@ program
           healthy = false;
         }
       }
+      let namedStartRejected = false;
 
-      if ((!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && (expectedPublic || info.tunnel.running)) {
+      const mayStartTunnel = namedReady
+        ? namedTunnelStopped
+        : namedIdentityRequired
+          ? false
+          : expectedPublic || info.tunnel.running;
+      if ((!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && mayStartTunnel) {
         try {
           const binaries = detectTunnelBinaries();
           if (!binaries.cloudflared) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
             const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-            if (started.url) {
+            if (namedIdentityRequired) {
+              info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+              currentUrl = info.publicUrl || info.tunnel.url;
+              namedTunnelConnected = Boolean(
+                namedReady && tunnelState && isNamedTunnelConfirmedConnected(info, tunnelState.hostname)
+              );
+              namedTunnelStopped = Boolean(
+                namedReady && isNamedTunnelConfirmedStopped(info)
+              );
+              namedTunnelDisconnected = Boolean(
+                namedReady && info.tunnel.provider === "cloudflare-named" &&
+                info.tunnel.processRunning === true && info.tunnel.connected === false
+              );
+              const startMatchesAdminUrl = Boolean(
+                started.url && currentUrl &&
+                normalizePublicUrl(started.url) === normalizePublicUrl(currentUrl)
+              );
+              if (!namedTunnelConnected || !startMatchesAdminUrl) {
+                namedStartRejected = true;
+                healthy = false;
+              } else {
+                try {
+                  const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
+                  healthy = response.ok;
+                } catch {
+                  healthy = false;
+                }
+                const previousUrl = lastEndpoint?.publicUrl;
+                const sameAddress =
+                  previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(started.url!);
+                results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
+              }
+            } else if (started.url) {
               const previousUrl = lastEndpoint?.publicUrl;
               currentUrl = started.url;
               healthy = true;
@@ -1364,11 +1434,16 @@ program
           needed: true,
           userMessage: namedTunnelCredentialRepairMessage(namedCredential.status),
         };
-      } else if (currentUrl && healthy) {
+      } else if (namedStartRejected) {
+        report.tunnel = {
+          ok: false,
+          detail: "Named Tunnel start identity did not match refreshed Admin state; health and endpoint persistence were rejected.",
+        };
+      } else if (currentUrl && healthy && (!namedIdentityRequired || namedTunnelConnected)) {
         report.tunnel = { ok: true, detail: currentUrl };
         const nextMcp = mcpUrlFromPublic(currentUrl);
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
-        const boundName = nextMcp && action !== "update"
+        const boundName = nextMcp && action !== "update" && opts.fix
           ? persistWorkspaceEndpoint({
               workspaceId: info.workspaceId,
               workspaceName: info.workspaceName,
@@ -1391,9 +1466,25 @@ program
         if (action === "update") {
           results.push(`安全连接地址已更换，需要更新「${boundName}」`);
         }
-      } else if (namedReady) {
-        report.tunnel = report.tunnel ?? { ok: false, detail: "NAMED_TUNNEL_DOWN" };
-        namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
+      } else if (namedTunnelConnected) {
+        report.tunnel = {
+          ok: true,
+          detail: currentUrl
+            ? "Named Tunnel reports connected; the public health probe is degraded, so no restart was attempted."
+            : "Named Tunnel reports connected, but the public health URL is unavailable; no restart was attempted.",
+        };
+      } else if (namedTunnelStopped) {
+        report.tunnel = report.tunnel ?? { ok: false, detail: "Named Tunnel is confirmed stopped." };
+      } else if (namedTunnelDisconnected) {
+        report.tunnel = report.tunnel ?? {
+          ok: false,
+          detail: "Named Tunnel process is running but disconnected; automatic start was skipped.",
+        };
+      } else if (namedIdentityRequired) {
+        report.tunnel = report.tunnel ?? {
+          ok: false,
+          detail: "Named Tunnel runtime state could not be confirmed; automatic start was skipped.",
+        };
       } else if (expectedPublic) {
         report.tunnel = report.tunnel ?? { ok: false, detail: "安全连接未恢复" };
         chatgptRepair = {
@@ -1439,7 +1530,7 @@ program
     const diagnostics = workspace ? await collectRuntimeDiagnostics(root) : null;
     const autostart = collectAutostartDiagnostics(root);
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, diagnostics, autostart }));
+      say(JSON.stringify({ repairMode, repairEffects, report, repairs: results, chatgptRepair, namedRepair, diagnostics, autostart }));
       const hasFailures =
         Object.values(report).some((value) => !value.ok) ||
         chatgptRepair.needed ||
@@ -1450,6 +1541,9 @@ program
     }
     say(`${PRODUCT_NAME} Doctor`);
     say("");
+    say(opts.fix
+      ? "模式：自动修复。可能更新 Codex 沙箱可写目录、启动或重启 Bridge、启动 Tunnel，并写入本地连接地址元数据。只读诊断请使用 `c2c doctor --no-fix`。"
+      : "模式：只读诊断（--no-fix）；不会执行自动修复、启动 Bridge/Tunnel 或写入本地连接地址元数据。");
     if (diagnostics) {
       printRuntimeDiagnostics(diagnostics, autostart);
       say("");

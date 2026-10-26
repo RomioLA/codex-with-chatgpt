@@ -3,32 +3,38 @@ name: c2c-local
 description: >
   按运行环境区分本机工具路由：Codex 本机优先原生命令工具，仅在用户明确指定 C2C Local
   或任务确实需要 C2C 独有能力时才考虑调用；ChatGPT 网页版访问本机时优先 C2C Local。
-  介绍 V1.4 batch_read/batch_search/collect_evidence、execution_run、持久 Task、文件读写、Git、
+  介绍 V1.5 授权合同与恢复流程、V1.4 batch_read/batch_search/collect_evidence、execution_run、持久 Task、文件读写、Git、
   Host Observation、Windows 自启诊断及权限与安全约束。Remote Desktop Commander 仅用于 C2C 故障恢复、
   能力不足、GUI/UAC 或用户明确要求。
 ---
 
 # C2C Local
 
-本 Skill 描述 C2C Local V1.4 的工具路由和本机运维流程。工具优先级按运行环境区分：
+本 Skill 描述 C2C Local V1.5 当前源码合同、工具路由和本机运维流程。除非有实际部署证据，不能据此宣称用户 Runtime 已升级：
 
 - **Codex 本机**：Native Tools > C2C Local（仅在用户明确指定或确需 C2C 独有能力时考虑）。
 - **ChatGPT 网页版访问本机**：C2C Local > Remote Desktop Commander。
 
+已提交的源码、Skill 或版本字符串都不证明本机已部署该版本。按实际工具 schema、运行中 Bridge 身份与本机安装记录判定。
+
 ## 工具选择与安全边界
+
+路由合同：**Codex 本机优先 Native Tools；ChatGPT 网页端访问本机优先 C2C Local。** Remote 是独立 fallback，不是恢复 C2C 的强制前置步骤。
 
 - Codex 本机的普通工作区操作不自动触发 C2C；本地文件读写、Git、测试、构建和脚本执行默认使用原生命令工具，不因 C2C 能完成相同任务就优先使用它。
 - 原生工具被沙箱、安全门禁或访问限制拒绝时，不自动改走 C2C 绕过。即使用户明确要求 C2C，仍须遵守 Codex 沙箱、访问限制、审批和现有安全约束。
 - ChatGPT 网页版访问本机时优先 C2C Local。Remote 仅用于 C2C 故障恢复（包括灾难恢复）、能力不足、Windows GUI/UAC 或用户明确要求；C2C 安全、权限或策略拒绝不得通过 Remote 绕过。
 - 决定使用 C2C 后，才检查 workspace_info、permission_status 等状态；先确认本对话实际暴露的工具 schema 和版本，再按当前权限与安全约束执行。
 - GUI/UAC 目前仍不是 C2C 的目标能力；C2C 自身停止时，不能依靠已停止的 C2C 自救，此时独立 Remote 通道可作为故障恢复观察/操作通道。
+- `-32603 Internal error` 只说明本次平台/工具调用失败，不能单独证明 Bridge 已退出。区分平台拒绝（请求未到 C2C）、Bridge 已停止、Bridge 身份不明/无响应、Tunnel 不通和 connector 配置/在线状态；`INSUFFICIENT_SCOPE`、`LOCAL_PERMISSION_DENIED`、Git policy 拒绝属于授权/策略结果，不是掉线。
+- C2C 完全离线时，本机 Codex 可以通过已有、独立的 Runtime 安装/Launcher 证据定位正式 Runtime，再直接调用该 Runtime 的 CLI `restore`。恢复不依赖先调用 C2C，也不要求 Remote；Remote 是独立 fallback。不能确认 Runtime 身份时停止，不从 PATH、旧源码目录、历史 PID/HEAD 或版本字符串挑一个 CLI 运行。
 
 ChatGPT 可在 OAuth scope、本机专用策略、workspace 文件权限模式和用户任务授权共同允许时，通过 MCP
 使用文件、Git Write、Batch、Level2 Full Access 通用 execution_run、受控历史 Level3 和持久 Task 能力。
 本机权限是能力上限，不是对任意操作的用户任务授权；C2C 不提供远程提权或 OS 沙箱。
 
 
-## V1.4 当前工具路由（仅适用于已选用 C2C 的任务；优先于下文 V1/V1.3 历史说明）
+## 当前工具路由与版本边界（仅适用于已选用 C2C 的任务；优先于下文 V1/V1.3 历史说明）
 
 **决定使用 C2C 后，以本对话真实暴露的工具 schema 和实际版本为准；开始 C2C workspace 操作前再检查 workspace_info 与 permission_status。**
 GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从旧项目源、旧 PID、旧聊天猜当前状态。
@@ -44,7 +50,7 @@ GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从�
 | 固定多步骤任务 | task_create、task_status、task_list、task_result、task_output、task_cancel | 确定性、有限、持久 Task，非自主 Agent |
 | Nested Git / Host Observation | git_info/status/diff（带 repository_path）、专用 host 工具 | Git 要指定真正目标仓库，Host Observation 只读 |
 
-### V1.4 execution_run 合同
+### execution_run 合同
 
 - engine 为 program / powershell / cmd。program 需要 executable 和可选 args，不传 command；powershell/cmd 传 command，不传 executable/args。
 - 可选 cwd 是工作目录，**不是安全沙箱**。必填 timeout_seconds 为 1–3600；必填 idempotency_key 长度 16–128；wait_seconds 可选 0–30。
@@ -52,15 +58,15 @@ GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从�
 - Level2 **不是**免授权执行：OAuth scope（execution.run）、当前 Windows session grant、本机操作安全策略与用户明确任务授权仍须满足。不得擅自提升权限。
 - 返回 running 时继续根据 job_id 查询/取消；不能因为一次调用还在运行就使用新的 idempotency key 重跑。
 
-### V1.4 Final Level2 authority
+### Level2 authority
 
 - Level2 是当前 Windows 登录会话的本地 session elevation；baseline 仍应是 readonly/level1，而不是永久 Level2。
 - 用户侧推荐使用最终本机 Launcher（如 `C2C-权限切换.cmd` / `c2c-local-launcher.zh-CN.ps1`）切换；底层 CLI 使用 `permission bridge status|1|2` 让**正在运行的 Bridge**签发/撤销并回读 grant。
 - 不再把旧式仅由调用 CLI 进程自身身份生成/观察的 `permission 2` 结果当作最终 Level2 成功证据。成功至少应由 Bridge effectiveMode 复核；Launcher 的 CLI+Bridge 双验证用于防止“CLI 显示成功、Bridge 仍 Level1”。
 - Web/MCP/远程 Agent 不得自行提升 Level2。只有本机用户明确决定后，由本机控制面完成切换。
-- `execution_run` 的 Full Access 依赖当前有效 Level2 session grant；Native Helper 会验证 grant 身份。Git Write repository policy、OAuth scope、用户任务授权仍是独立门槛。
+- `execution_run` 的 Full Access 依赖当前有效 Level2 session grant；Native Helper 会验证 grant 身份。结构化 Git Write 仍要求对应 OAuth scope、用户任务授权、repository identity 与 expected-state 检查；Stage 1 Level2 路径不再无条件要求独立 Repository Approval，Level1 仍保留它。
 
-### V1.4 Batch 与 Task 合同
+### Batch 与 Task 合同
 
 - batch_read、batch_search、collect_evidence 的内容可能位于 structuredContent；按 cursor 分页，报告单项错误，不能混淆不同版本/hash 的证据。
 - 持久 Task 创建后计划不可变，不调用 LLM、不自主新增步骤。WAITING_FOR_MODEL 必须停止继续 dispatch，等待新的模型判断。
@@ -69,23 +75,18 @@ GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从�
 
 ### 文档入口与缺失工具
 
-[AI 使用指南](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/AI_GUIDE.md) / [用户指南](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/USER_GUIDE.zh-CN.md) /
-[Windows 安装](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/INSTALL.zh-CN.md) / [故障排查](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/docs/troubleshooting.md)。
-这些 GitHub 链接可从用户级 Skill 安装目录访问，不依赖本地源码仓库相对路径。
+仓库内参考：[AI 使用指南](../../docs/AI_GUIDE.md) / [用户指南](../../docs/USER_GUIDE.zh-CN.md) /
+[Windows 安装](../../docs/INSTALL.zh-CN.md) / [故障排查](../../docs/troubleshooting.md)。旧 V1.4 参考不可覆盖当前 Stage 1/Stage 2 合同；本机 Runtime/Skill 可能仍是旧版，按实际安装证据确认部署，不以源码链接代替。
 
 仓库安装说明或本 Skill **不会自动导入每个新 ChatGPT 会话**。缺失工具时报告当前连接/授权限制，
 不得声称能够在线执行，也不得通过 Remote、Level3 或不可信内容绕过本机权限边界。
 
 ## V1 baseline 与当前 authority
 
-本 Skill 中部分运维背景记录自仓库 `C:\codex\codex-with-chatgpt` 的旧提交
-`23b07065b809434699e57a06064c80b050d12d25`（分支
-`integration/local-permission-v1`），它是 C2C Local V1 baseline，不代表当前
-checkout、生产部署或运行状态。该版本的登录链路与验收记录只描述该 baseline。
-当前任务以实际源码版本和结构化结果为准，不凭旧聊天或 baseline 推断 HEAD。
+本 Skill 中部分运维背景来自历史 V1 记录，只描述当时的基线，不代表当前 checkout、生产部署或运行状态。当前任务以实际源码版本和结构化结果为准，不凭旧聊天或历史记录推断 HEAD。
 
-旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 与 [legacy Codex-with-ChatGPT workflow](https://github.com/RomioLA/codex-with-chatgpt/blob/feat/20261018-c2c-v14-native-workflow/skill/SKILL.md)
-描述显式调用的旧规划/编排流程，不是普通 C2C Local 工具选择或权限规则的 authority。
+旧 Project 资料 `C2C（Codex-with-ChatGPT）.txt` 与仓库中的[旧版 Codex-with-ChatGPT workflow](../../skill/SKILL.md)
+描述显式调用的历史规划/编排流程，不是普通 C2C Local 工具选择或权限规则的 authority；它不能覆盖当前 Stage 1/Stage 2 合同。
 不要继承它的“统一 workspace=codex”或“C2C 只用于读取、分析和复核”规则，也不要把两套规则合并。
 只有用户明确要求旧 Codex with ChatGPT workflow 时才使用该 legacy Skill；普通本机任务按上方的运行环境路由选择工具，
 ChatGPT 网页版访问本机时优先 C2C Local。单纯查看/改文件不需要 GUI、重新配对或重启服务。
@@ -120,8 +121,8 @@ workspace；不要自动把所有项目接到 `C:\codex`，也不要跨 connecto
 下表描述的是 **C2C 文件类工具自身的边界**，不要把它误当成 `execution_run` 的文件系统沙箱。
 V1.4 Level2 下的 `execution_run` 是独立的 Full Access 执行能力：在 OAuth、当前 session grant、
 用户任务授权及其他本机策略共同允许时，目标进程按其 Windows 进程权限运行；它不受
-`delete_file`“单文件/不递归”等文件工具 API 合同的限制。反过来，拥有 Level2 也不自动批准
-Git Write、Level3、GUI/UAC 或任何未获用户授权的动作。
+`delete_file`“单文件/不递归”等文件工具 API 合同的限制。反过来，拥有 Level2 也不自动授权具体任务、免除 expected-state 检查、开启 Level3 或支持 GUI/UAC。
+Stage 1 已支持的结构化 Git Write 在有效 Level2 + 对应 OAuth scope 下不要求独立 Repository Approval；Level1 仍保留该 policy。
 
 | 本机模式 | workspace | workspace 外 |
 |---|---|---|
@@ -185,18 +186,18 @@ a path hides it; repository negation cannot reopen a workspace-level deny.
    `INSUFFICIENT_SCOPE` 是 OAuth scope 问题，必须与本机 policy 拒绝区分。
 2. **workspace local permission / session elevation**：持久化 baseline 为 `readonly` 或 `level1`；
    V1.4 Final 的 `level2` 是当前 Windows 登录会话 grant。它既提高对应文件工具权限，也是
-   `execution_run` Full Access 的本地前置门槛，但仍不等于 Git Write repository policy、OAuth scope、
-   用户任务授权、Level 3 approval 或 Windows UAC。workspace 文件工具的修改/移动需 `workspace.write`，
+   `execution_run` Full Access 的本地前置门槛；structured Git Write 仍需对应 OAuth scope、用户任务授权、
+   repository identity 与 expected-state 检查，Level1 仍需 Repository Approval。它不等于 Level 3 approval
+   或 Windows UAC。workspace 文件工具的修改/移动需 `workspace.write`，
    删除需 `workspace.delete`；外部读/写分别需 `filesystem.external.read` /
    `filesystem.external.write`，并同时通过对应本机门槛。
-3. **专用本机 policy** 独立控制额外 capability：Git Write 按 repository/worktree 单独批准；bounded
-   execution 按 repository 和固定 package script recipe 进入本机 trusted-command registry。
+3. **专用本机 policy** 独立控制额外 capability：有效 Level2 Full Access 且具备对应 OAuth scope 时，Stage 1 已支持的结构化 `git_write` 不再无条件要求独立 Repository Approval；Level1 仍保留 Repository Approval。受限 `execution_start` recipe 仍走 trusted-command registry；不要把它的审批规则套到 Level2 `execution_run`。
 4. **Level 3** 默认关闭。只有本机用户先明确执行 `c2c level3 enable -w <workspace> --approve` 才能创建
    Level 3 pending request。之后每个精确 request 仍需本机 inspect、digest 核对、按 risk 分类和 approve；
    MCP 才能调用 `level3_start`。开启本身不运行命令，也不授予永久 unrestricted shell。
 
-OAuth scopes 和本机策略是两层独立门槛：scope 获准不代表本机 policy 已批准，本机模式也不能补足 OAuth
-scope。不得通过提高 Level 3 或切换 Remote 绕过 Git/recipe policy 拒绝。
+OAuth scopes 和本机策略是两层独立门槛：scope 获准不代表本机权限或用户任务授权已满足，本机模式也不能补足 OAuth
+scope。Level1 的 Git policy 拒绝、OAuth、permission 或其他执行环境安全拒绝不得通过提高 Level 3、C2C 或 Remote 绕过。
 
 权限变更只能由本机用户明确决定。普通用户优先使用最终 Launcher；维护/诊断时使用
 **当前已核验正式 Runtime** 的 bridge-authority CLI，而不是旧源码目录里的 CLI：
@@ -271,17 +272,94 @@ Tunnel preference/provider/连接状态、endpoint 匹配和 `recovery.status/re
 恢复需求再使用 `restore -w ... --json`；它会恢复/reuse 运行时，不重新配对、不撤销 token，
 不修改 ChatGPT connector 设置。只做读取或已有服务健康时无需调用 restore。
 
+### C2C 完全离线时的本机恢复
+
+先分类 `-32603`，不能把它直接记作 Bridge 已死。若 C2C 工具全部不可用，本机恢复按以下证据链进行，不能先在线调用 C2C：
+
+1. 只读查看已有的正式 Launcher、原始安装交接记录，或 Windows 计划任务的实际 Action/WorkingDirectory。可用下列只读查询查看既有任务；不要修改任务：
+
+   ```powershell
+   Get-ScheduledTask -ErrorAction SilentlyContinue |
+     Where-Object { $_.TaskName -like 'C2C-Workspace-Autostart-*' } |
+     Select-Object -First 16 |
+     ForEach-Object { $task = $_; $task.Actions | ForEach-Object {
+       [pscustomobject]@{ TaskName = $task.TaskName; Execute = $_.Execute; Arguments = $_.Arguments; WorkingDirectory = $_.WorkingDirectory }
+      } } | Format-List | Out-String -Width 2000 | ForEach-Object { $_.Substring(0, [Math]::Min($_.Length, 6000)) }
+   ```
+
+   若正式 Task 的 Arguments 带有 base64url JSON payload，可对选中的既有 Task 只解码其最后一个参数以回读 workspace/state（只解码，不执行任何 Action 或 CLI）：
+
+   ```powershell
+   $task = Get-ScheduledTask -TaskName '<上一步核对的任务名>' -ErrorAction Stop
+   if (@($task.Actions).Count -ne 1) { throw 'Task action is not unique.' }
+   $action = @($task.Actions)[0]
+   $tokens = [regex]::Matches([string]$action.Arguments, '[A-Za-z0-9_-]{40,}')
+   if ($tokens.Count -lt 1) { throw 'Task payload was not found.' }
+   $encoded = $tokens[$tokens.Count - 1].Value.Replace('-', '+').Replace('_', '/')
+   $encoded += '=' * ((4 - $encoded.Length % 4) % 4)
+   $payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded)) | ConvertFrom-Json -ErrorAction Stop
+   if ($payload.version -ne 1 -or $payload.workspaceId -notmatch '^[a-f0-9]{12}$' -or
+       -not [IO.Path]::IsPathRooted([string]$payload.workspaceRoot) -or -not [IO.Path]::IsPathRooted([string]$payload.stateDir)) { throw 'Task payload identity is invalid.' }
+   $runtimeRoot = [IO.Path]::GetFullPath([string]$action.WorkingDirectory)
+   $c2cNode = Join-Path $runtimeRoot 'node\node.exe'
+   $c2cCli = Join-Path $runtimeRoot 'dist\cli\index.js'
+   if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) { throw 'Runtime root is missing.' }
+   if ((Get-Item -LiteralPath $runtimeRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Runtime root reparse point rejected.' }
+   foreach ($file in @($c2cNode, $c2cCli, (Join-Path $runtimeRoot 'dist\autostart\task-launcher.js'), (Join-Path $runtimeRoot 'assets\c2c-autostart-task.cmd'))) {
+     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Runtime file missing: $file" }
+     if ((Get-Item -LiteralPath $file).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Runtime reparse point rejected: $file" }
+   }
+   [pscustomobject]@{ WorkspaceId = $payload.workspaceId; WorkspaceRoot = $payload.workspaceRoot; StateRoot = $payload.stateDir; RuntimeRoot = $runtimeRoot; Node = $c2cNode; Cli = $c2cCli; Command = $action.Execute }
+   ```
+
+   这些路径只是候选值。原始可信安装记录或现有正式 Launcher 的校验未确认 Runtime 与 workspace 对应前，禁止执行这里显示的 Node/CLI。
+
+   已有 Launcher 的 `-Action Check` 只用于它绑定的 workspace，能报告其通过校验的 Runtime 标识和 Bridge 状态，不是通用恢复命令。
+2. 核对登记的目标 workspace 路径/ID、Task Action 的命令/参数/工作目录、实际生效的 state root（`C2C_STATE_DIR` 或 Task payload 指定值；未覆盖时才是 Runtime 默认值）、随附 Node、CLI 与已有安装记录相互对应。Windows Task Launcher 要求 Node、`dist/cli/index.js` 与 launcher 来自同一 Runtime；已有本机 Permission Launcher 另校验正式 Task 的 Runtime 目录布局并拒绝 reparse point。state 文件、目录名、PATH 命中、Node/CLI 版本字符串单独都不是 Runtime 身份证明。
+3. 只有可信安装/Launcher 证据足以把该 Runtime 与目标 workspace 关联时，才使用同一 Runtime 内的 `node\node.exe` 与 `bin\c2c.js` 执行一次 `restore -w <workspace> --json`。若实际 Launcher 布局使用 `dist\cli\index.js`，按其已核验的正式入口执行，不混用其他 Runtime 的 Node/CLI。
+4. 如果没有匹配的正式 Task/Launcher/安装记录、workspace 或 state root 不一致、Runtime 文件缺失/跨版本/位于非预期路径、出现 reparse point，或实际身份仍不确定，停止并报告具体缺失证据；请本机维护者提供可信安装记录或按正式安装流程恢复。不要试跑 PATH/source CLI、改任务/权限、删除 state、重配 OAuth/Pairing/Tunnel。Remote 可以作为独立 fallback，但不能绕过执行环境拒绝。
+
+示意调用（先由本机只读证据确认 Runtime、workspace 与 state root。临时设置当前 PowerShell process 的 `C2C_STATE_DIR`，使既有 shell override 不会指到其他 state；值必须来自匹配的正式 Task payload/安装记录，不能用来绕过拒绝）：
+
+```powershell
+$c2cNode = '<已核验 Runtime 内的 Node 路径>'
+$c2cCli = '<同一 Runtime 内的 CLI 路径>'
+$targetWorkspace = '<已核验的真实 workspace 路径>'
+$verifiedWorkspaceId = '<从已核验 Task payload/安装记录读取的 workspace ID>'
+$verifiedStateDir = '<与已核验 Task payload/安装记录一致的 state root>'
+$hadStateOverride = Test-Path Env:C2C_STATE_DIR
+$previousStateDir = $env:C2C_STATE_DIR
+try {
+  $env:C2C_STATE_DIR = $verifiedStateDir
+  $status = & $c2cNode $c2cCli status -w $targetWorkspace --json | ConvertFrom-Json
+  $bridgeStatus = [string]$status.diagnostics.bridge.status
+  $bridgeIdentityMatches = if ($bridgeStatus -eq 'running') {
+    $status.running -eq $true -and
+    $status.workspaceId -eq $verifiedWorkspaceId -and
+    $status.diagnostics.bridge.pid -eq $status.pid -and
+    $status.diagnostics.bridge.port -eq $status.port
+  } else {
+    $status.running -ne $true
+  }
+  if ($LASTEXITCODE -ne 0 -or $status.diagnostics.workspace.id -ne $verifiedWorkspaceId -or $bridgeStatus -notin @('running', 'stopped', 'uncertain') -or $bridgeStatus -eq 'uncertain' -or $status.state -eq 'unknown' -or -not $bridgeIdentityMatches) { throw 'Runtime, workspace, or Bridge identity could not be confirmed.' }
+  # Review diagnostics.bridge.status, runtime identity fields, and trusted Runtime/install evidence before recovery.
+  if ($status.ok -ne $true) { & $c2cNode $c2cCli restore -w $targetWorkspace --json }
+} finally {
+  if ($hadStateOverride) { $env:C2C_STATE_DIR = $previousStateDir }
+  else { Remove-Item Env:C2C_STATE_DIR -ErrorAction SilentlyContinue }
+}
+```
+
+`status --json` 是此预检使用的只读诊断：将 `diagnostics.workspace.id` 与可信安装记录中的 workspace ID 比对，并将 `diagnostics.bridge.status` 作为 Bridge observation；运行中还要核对 JSON 顶层 `workspaceId`、`pid`、`port` 与 `diagnostics.bridge.pid/port` 一致。Bridge 为 `uncertain`、顶层 `state` 为 `unknown` 或身份不符时停止。它不会触发权限迁移。不要在恢复预检中调用 `permission status`：它可能获取写锁、创建 permissions 目录、迁移 legacy 权限文件并写入 Level1 baseline。当前公开 CLI 没有通用的 Runtime 安装根目录发现命令。源码中的正式 Launcher 解析方式只适用于其绑定的安装/工作区；不应把测试 seam、旧 Launcher 或本机特定绝对路径推广成通用 authority。未部署的 V1.5 源码不代表已部署 Runtime。
+
 Named 的本机公网 self-probe 只访问 `/health`。Bridge/runtime/single-instance、Named
 连接与 endpoint authority 都重新确认正常时，单独 degraded/ECONNRESET 是 diagnostic-only：
 不重启健康 Tunnel，不让正式 restore exit 1。真实 ChatGPT 工具调用成功与否独立判断。
 Quick 仍以公网 health 为启动/恢复门槛，不能套用 Named 的诊断豁免。
 
-**最终源码的 doctor 并未统一为上述 restore 语义。** 它默认会尝试自动修复，
-`report.tunnel` / `namedRepair` / exit code 仍可能把 Named self-probe 失败当作故障。
-不要复制旧 Skill 的“doctor 失败就静默修复”或“所有 report 都 green 才能工作”。
-如确需其附加诊断，使用 `doctor --no-fix -w ... --json`，同时仍检查后续保存 endpoint
-的副作用；它不是严格纯只读命令。Named 判定回到 status/restore 的结构化 diagnostics。
-仅凭 doctor 的 self-probe 失败，不登录 Cloudflare、不重建 connector、不触发重启。
+`status -w ... --json` 是只读状态入口。`doctor` 的默认模式是 auto-repair；JSON 会报告 `repairMode` / `repairEffects`，文本模式会说明可能的修改。默认 doctor 可更新 Codex sandbox allowlist、启动或重启 Bridge、启动明确停止的 Named Tunnel（Quick Tunnel 按既有健康门槛处理），以及写入本地 endpoint metadata。
+
+`doctor --no-fix -w ... --json` 是只读诊断，不修改 allowlist、启动 Bridge/Tunnel 或写 endpoint metadata。Named Tunnel 的 admin 状态、provider、hostname、进程/connected 信号均被确认且 public `/health` 单独 degraded 时，doctor 会报告 Tunnel 仍连接，不自动重启或仅因该探针失败返回故障。Named Tunnel 已明确停止时才可按默认 auto-repair 启动；断开或 identity 不明时跳过自动启动并报告。不要将授权/OAuth/Git policy 拒绝归类成掉线。
 
 本机命令、registration 状态、故障决策树和诊断取证步骤见
 [运维与故障决策](references/operations.md)；只在相关故障或明确运维请求时读取。
