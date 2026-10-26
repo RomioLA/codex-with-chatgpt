@@ -26,6 +26,21 @@ const gitOperation = z.discriminatedUnion("kind", [
 
 function result(data: object) { return { content: [{ type: "text" as const, text: JSON.stringify(data) }], structuredContent: data as Record<string, unknown> }; }
 function fail(error: string) { return { content: [{ type: "text" as const, text: JSON.stringify({ error }) }], isError: true }; }
+function failDetails(data: Record<string, string>) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data) }], structuredContent: data, isError: true as const };
+}
+function failGitWrite(error: string) {
+  const category = error === "FULL_ACCESS_REQUIRED" || error === "EXECUTION_PERMISSION_DENIED"
+    ? "LOCAL_AUTH_REQUIRED"
+    : error === "NOT_APPROVED"
+      ? "REPOSITORY_POLICY_DENIED"
+      : error === "PATH_CHANGED" || error === "REPOSITORY_IDENTITY_CHANGED"
+        ? "REPOSITORY_IDENTITY_CHANGED"
+        : error === "EXPECTED_STATE_CHANGED" || error === "GIT_STATE_CHANGED" || error === "STATE_CHANGED"
+          ? "STATE_CHANGED"
+          : null;
+  return category ? failDetails({ error: category, machine_error: error }) : fail(error);
+}
 function requireCapability(auth: AuthInfo | undefined, scope: "git.read" | "git.write" | "execution.level3", resource?: string) {
   if (!auth?.clientId) return fail("UNAUTHENTICATED");
   if (auth.scopes.includes(scope)) return null;
@@ -130,17 +145,20 @@ export function registerV13Tools(server: McpServer, ctx: McpContext): void {
 
   server.registerTool("git_write", {
     ...executionToolAuth("git_write"), title: "Controlled Git operation",
-    description: "Perform one structured operation in an exact locally approved repository/worktree. Call git_info/status first and supply expected HEAD and branch. Local grants restrict operations, branch names and exact HTTPS remotes. No arbitrary Git arguments, forced push, reset, clean, branch deletion or rebase are accepted. Job results include post-operation state confirmation.",
+    description: "Perform one structured Git operation in the exact repository/worktree. Full Access requires a current Level2 session grant; Level1 requires the local repository policy. Call git_info/status first and supply expected HEAD and branch. Remote, branch, operation, materials and state are rechecked before launch. Use git_branches for branch reads.",
     inputSchema: { repository_path: z.string().min(1).max(1024), operation: gitOperation,
       timeout_seconds: z.number().int().min(1).max(3600), idempotency_key: key },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   }, async (args, extra) => {
     const denied = requireCapability(extra.authInfo, "git.write", ctx.oauthResourceMetadataUri);
     if (denied) return denied;
+    if (args.operation.kind === "branch_list") {
+      return failDetails({ error: "USE_GIT_BRANCHES", next_step: "Call git_branches (requires git.read); it is read-only and does not require Git Write approval." });
+    }
     if (!ctx.executionSupervisor) return fail("EXECUTION_UNAVAILABLE");
     const started = ctx.executionSupervisor.startGitWrite({ repositoryPath: args.repository_path,
       operation: args.operation as GitWriteOperation, timeoutSeconds: args.timeout_seconds,
       idempotencyKey: args.idempotency_key, oauthClientId: extra.authInfo!.clientId, scopes: extra.authInfo!.scopes });
-    return started.ok ? result({ job: executionJobView(started.job), duplicate: started.duplicate }) : fail(started.error);
+    return started.ok ? result({ job: executionJobView(started.job), duplicate: started.duplicate }) : failGitWrite(started.error);
   });
 }

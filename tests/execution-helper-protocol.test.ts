@@ -4,7 +4,12 @@ import os from "node:os";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { HelperOutputDecoder } from "../src/execution/helper-protocol.js";
+import {
+  EXECUTION_HELPER_PROTOCOL_VERSION,
+  HelperOutputDecoder,
+  serializeFullAccessGitHelperRequest,
+  type FullAccessGitHelperRequest,
+} from "../src/execution/helper-protocol.js";
 import { resolveExecutionHelperPath, resolveExecutionLauncherPath } from "../src/execution/native-runner.js";
 function makeTmpDir(name: string): string {
   return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `c2c-${name}-`)));
@@ -18,12 +23,85 @@ function fakePe(): Buffer {
   return bytes;
 }
 
+function fullAccessGitRequest(): FullAccessGitHelperRequest {
+  const identity = "a:1";
+  const hash = "a".repeat(64);
+  const workspaceId = "abcdef123456";
+  const jobId = "b".repeat(24);
+  return {
+    packageManager: "npm",
+    kind: "package_script",
+    timeoutSeconds: 30,
+    cwd: "C:\\repo",
+    gitDirectory: "C:\\repo\\.git",
+    gitDirectoryFileIdentity: identity,
+    commonGitDirectory: "C:\\repo\\.git",
+    commonGitDirectoryFileIdentity: identity,
+    nodeExecutable: "C:\\tools\\node.exe",
+    nodeFileIdentity: identity,
+    nodeHash: hash,
+    managerCli: "C:\\tools\\npm-cli.js",
+    managerFileIdentity: identity,
+    managerHash: hash,
+    managerLibCli: "C:\\tools\\npm-lib-cli.js",
+    managerLibCliFileIdentity: identity,
+    managerLibCliHash: hash,
+    managerValidateEngines: "C:\\tools\\npm-validate-engines.js",
+    managerValidateEnginesFileIdentity: identity,
+    managerValidateEnginesHash: hash,
+    managerMainEntry: "C:\\tools\\npm-main.js",
+    managerMainEntryFileIdentity: identity,
+    managerMainEntryHash: hash,
+    managerPackageJson: "C:\\tools\\npm-package.json",
+    managerPackageJsonFileIdentity: identity,
+    managerPackageJsonHash: hash,
+    managerExitHandler: "C:\\tools\\npm-exit.js",
+    managerExitHandlerFileIdentity: identity,
+    managerExitHandlerHash: hash,
+    managerCore: "C:\\tools\\npm-core.js",
+    managerCoreFileIdentity: identity,
+    managerCoreHash: hash,
+    target: "v13",
+    tempRootPath: "C:\\state\\execution-jobs\\" + workspaceId + "\\execution-temp",
+    tempRootFileIdentity: identity,
+    tempWorkspaceId: workspaceId,
+    tempJobId: jobId,
+    tempNonce: hash,
+    tempCreatedAtMs: 1,
+    jobTempDir: "C:\\state\\execution-jobs\\" + workspaceId + "\\execution-temp\\tmp-" + jobId,
+    jobTempFileIdentity: identity,
+    repositoryFileIdentity: identity,
+    gitEntryFileIdentity: identity,
+    gitEntryType: "directory",
+    gitEntryHash: hash,
+    packageJsonHash: hash,
+    genericCommand: {
+      mode: "direct",
+      executable: "C:\\Git\\bin\\git.exe",
+      executableFileIdentity: identity,
+      executableHash: hash,
+      args: ["status", "--short"],
+      cwd: "C:\\repo",
+      cwdFileIdentity: identity,
+      approvalManifest: "C:\\state\\execution\\git-plans\\" + workspaceId + "\\" + jobId + ".json",
+      approvalManifestFileIdentity: identity,
+      approvalManifestHash: hash,
+      materials: [],
+      launchSnapshots: [{ path: "C:\\repo\\tracked.txt", fileIdentity: identity, hash }],
+    },
+    oauthClientId: "native-git-test-client",
+    permissionMode: "level2",
+    sessionGrantFingerprint: "d".repeat(64),
+    sessionGrantId: "e".repeat(64),
+  };
+}
+
 function writeIntegrityMetadata(root: string, helperBytes: Buffer, launcherBytes = helperBytes): void {
   const metadata = path.join(root, "dist", "execution", "c2c-execution-helper-integrity.json");
   fs.mkdirSync(path.dirname(metadata), { recursive: true });
   fs.writeFileSync(metadata, JSON.stringify({
     version: 2,
-    protocolVersion: 7,
+    protocolVersion: 8,
     helperPath: "build/native/c2c-execution-helper.exe",
     sha256: createHash("sha256").update(helperBytes).digest("hex"),
     launcherPath: "build/native/c2c-execution-launcher.exe",
@@ -66,6 +144,24 @@ describe("execution helper build and protocol contract", () => {
       .toThrow("HELPER_PROTOCOL_BAD_HEADER");
     expect(() => decoder.push(Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x36, 0x00])))
       .toThrow("HELPER_PROTOCOL_BAD_HEADER");
+    expect(() => decoder.push(Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x37, 0x00])))
+      .toThrow("HELPER_PROTOCOL_BAD_HEADER");
+  });
+
+  it("serializes bound Full Access Git as V8 with the existing plan materials and snapshots", () => {
+    const request = fullAccessGitRequest();
+    const bytes = serializeFullAccessGitHelperRequest(request);
+    expect(EXECUTION_HELPER_PROTOCOL_VERSION).toBe(8);
+    expect(bytes.subarray(0, 8)).toEqual(Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x38, 0x00]));
+    expect(bytes.readUInt16LE(8)).toBe(8);
+    expect(bytes.readUInt8(10)).toBe(2);
+    expect(bytes.readUInt8(12)).toBe(5);
+    expect(bytes.includes(Buffer.from(request.genericCommand!.approvalManifest, "utf8"))).toBe(true);
+    expect(bytes.includes(Buffer.from("tracked.txt", "utf8"))).toBe(true);
+    expect(() => serializeFullAccessGitHelperRequest({
+      ...request,
+      sessionGrantId: "not-a-grant",
+    })).toThrow("Invalid Full Access Git execution context");
   });
 
   it("rejects helper hash and metadata mismatches", () => {
@@ -75,7 +171,7 @@ describe("execution helper build and protocol contract", () => {
     fs.mkdirSync(path.join(root, "dist", "execution"), { recursive: true });
     fs.writeFileSync(helper, fakePe());
     fs.writeFileSync(path.join(root, "dist", "execution", "c2c-execution-helper-integrity.json"), JSON.stringify({
-      version: 2, protocolVersion: 7, helperPath: "build/native/c2c-execution-helper.exe", sha256: "0".repeat(64),
+      version: 2, protocolVersion: 8, helperPath: "build/native/c2c-execution-helper.exe", sha256: "0".repeat(64),
       launcherPath: "build/native/c2c-execution-launcher.exe",
       launcherSha256: createHash("sha256").update(fakePe()).digest("hex"),
     }));
@@ -104,7 +200,7 @@ describe("execution helper build and protocol contract", () => {
 
     fs.writeFileSync(path.join(root, "dist", "execution", "c2c-execution-helper-integrity.json"), JSON.stringify({
       version: 2,
-      protocolVersion: 7,
+      protocolVersion: 8,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: createHash("sha256").update(fakePe()).digest("hex"),
       launcherPath: "build/native/c2c-execution-launcher.exe",
@@ -132,7 +228,7 @@ describe("execution helper build and protocol contract", () => {
     fs.writeFileSync(launcher, launcherBytes);
     fs.writeFileSync(metadata, JSON.stringify({
       version: 2,
-      protocolVersion: 7,
+      protocolVersion: 8,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: createHash("sha256").update(corrupt).digest("hex"),
       launcherPath: "build/native/c2c-execution-launcher.exe",

@@ -4,8 +4,17 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { readCurrentSessionGrant, readPermission, readPermissionStatus } from "../permission/store.js";
 import type { Workspace } from "../workspace/manager.js";
-import type { ExecutionJob, ExecutionKind, FullAccessExecutionJob, OutputStream, PackageManager, RepositoryExecutionAuthorization, RepositoryExecutionJob } from "./job-types.js";
-import { isExecutionKind, isFullAccessExecutionJob } from "./job-types.js";
+import type {
+  ExecutionJob,
+  ExecutionKind,
+  FullAccessExecutionJob,
+  FullAccessGitExecutionAuthorization,
+  OutputStream,
+  PackageManager,
+  RepositoryExecutionAuthorization,
+  RepositoryExecutionJob,
+} from "./job-types.js";
+import { isExecutionKind, isFullAccessExecutionJob, isFullAccessGitAuthorization } from "./job-types.js";
 import { checkExecutionPermission } from "./permission.js";
 import { beginEventLoopTraceSpan, isEventLoopTraceEnabled } from "../diagnostics/event-loop-trace.js";
 import { resolveRepositoryIdentity, RepositoryIdentityError, type RepositoryIdentity } from "./repository-identity.js";
@@ -24,6 +33,7 @@ import { jobCanBeArchived } from "./record-archive.js";
 import { hasGitReviewHold, requireGitReview } from "./git-review-hold.js";
 import { verifyGitPostconditions } from "../git-write/planner.js";
 import { confirmGitWriteState, listGitRepositoryApprovals, type GitWriteOperation } from "../git-write/index.js";
+import type { GitWritePlanAuthorization } from "../git-write/types.js";
 import { acquireRepositoryWriteLock } from "./repository-write-lock.js";
 import { resolveFullAccessCommand, verifyFullAccessCommand, type FullAccessCommandInput } from "./full-access-command.js";
 
@@ -143,6 +153,37 @@ function jobRepositoryIdentity(job: ExecutionJob): string | null {
   return isFullAccessExecutionJob(job) ? job.repositoryScope?.identity ?? null : job.repositoryIdentity;
 }
 
+function planAuthorizationForExecutionJob(
+  authorization: RepositoryExecutionAuthorization,
+): GitWritePlanAuthorization {
+  if (authorization.type !== "git") throw new Error("V13_AUTHORIZATION_DENIED");
+  if (authorization.source === "full_access") {
+    return {
+      source: "full_access",
+      permissionMode: authorization.permissionMode,
+      sessionGrantFingerprint: authorization.sessionGrantFingerprint,
+      sessionGrantId: authorization.sessionGrantId,
+    };
+  }
+  if (authorization.source !== undefined && authorization.source !== "repository_approval") {
+    throw new Error("V13_AUTHORIZATION_DENIED");
+  }
+  return { source: "repository_approval" };
+}
+
+function sameGitPlanAuthorization(
+  left: GitWritePlanAuthorization | undefined,
+  right: GitWritePlanAuthorization,
+): boolean {
+  if (!left) return right.source === "repository_approval";
+  if (left.source !== right.source) return false;
+  if (left.source === "repository_approval") return right.source === "repository_approval";
+  if (right.source !== "full_access") return false;
+  return left.permissionMode === right.permissionMode &&
+    left.sessionGrantFingerprint === right.sessionGrantFingerprint &&
+    left.sessionGrantId === right.sessionGrantId;
+}
+
 export class ExecutionSupervisor {
   readonly store: ExecutionJobStore;
   private readonly runner: ExecutionRunner;
@@ -232,29 +273,103 @@ export class ExecutionSupervisor {
     const denied = this.controlledGate(input.scopes, "git.write", input.oauthClientId, input.idempotencyKey);
     if (denied) return { ok: false, error: denied };
     if (!Number.isSafeInteger(input.timeoutSeconds) || input.timeoutSeconds < 1 || input.timeoutSeconds > MAX_EXECUTION_TIMEOUT_SECONDS) return { ok: false, error: "INVALID_ARGUMENTS" };
+
+    let grant: { identityFingerprint: string; grantId: string } | null = null;
+    let planAuthorization: GitWritePlanAuthorization;
+    try {
+      const permission = readPermissionStatus(this.workspace.id);
+      if (permission.effectiveMode === "level2") {
+        if (!permission.sessionElevation.active) return { ok: false, error: "FULL_ACCESS_REQUIRED" };
+        grant = this.currentFullAccessGrant();
+        if (!grant) return { ok: false, error: "FULL_ACCESS_REQUIRED" };
+        planAuthorization = {
+          source: "full_access",
+          permissionMode: "level2",
+          sessionGrantFingerprint: grant.identityFingerprint,
+          sessionGrantId: grant.grantId,
+        };
+      } else if (permission.effectiveMode === "level1") {
+        planAuthorization = { source: "repository_approval" };
+      } else {
+        return { ok: false, error: "EXECUTION_PERMISSION_DENIED" };
+      }
+    } catch {
+      return { ok: false, error: "FULL_ACCESS_REQUIRED" };
+    }
+
     const hash = createHash("sha256").update(input.idempotencyKey).digest("hex");
     const previous = this.store.findIdempotent(input.oauthClientId, hash);
     if (previous) {
       try {
-        if (isFullAccessExecutionJob(previous) || previous.authorization?.type !== "git") throw new Error("IDEMPOTENCY_CONFLICT");
-        const old = readGitJobPlan(this.workspace, previous.authorization.requestId, previous.authorization.digest);
+        if (isFullAccessExecutionJob(previous) || previous.authorization?.type !== "git" ||
+            !sameGitPlanAuthorization(
+              planAuthorizationForExecutionJob(previous.authorization),
+              planAuthorization,
+            )) throw new Error("IDEMPOTENCY_CONFLICT");
+        const old = readGitJobPlan(
+          this.workspace,
+          previous.authorization.requestId,
+          previous.authorization.digest,
+          planAuthorization,
+        );
         const original = { ...old.operation };
         if (input.operation.expectedStatusHash === undefined) delete original.expectedStatusHash;
         const comparable = (operation: GitWriteOperation) => JSON.stringify(operation, Object.keys(operation).sort());
         if (resolveRepositoryIdentity(this.workspace, input.repositoryPath).identity !== old.repository.identity ||
-            comparable(original) !== comparable(input.operation) || previous.timeoutSeconds !== input.timeoutSeconds) throw new Error("IDEMPOTENCY_CONFLICT");
+            comparable(original) !== comparable(input.operation) || previous.timeoutSeconds !== input.timeoutSeconds) {
+          throw new Error("IDEMPOTENCY_CONFLICT");
+        }
         return { ok: true, job: previous, duplicate: true };
-      } catch { return { ok: false, error: "IDEMPOTENCY_CONFLICT" }; }
+      } catch {
+        return { ok: false, error: "IDEMPOTENCY_CONFLICT" };
+      }
     }
     try {
       this.store.prepareCapacity();
       if (hasGitReviewHold(this.workspace, input.repositoryPath)) return { ok: false, error: "GIT_REVIEW_REQUIRED" };
-      const created = createGitJobPlan(this.workspace, input.repositoryPath, input.operation);
-      return this.enqueueControlled(created.plan.repository, { type: "git", requestId: created.requestId, digest: created.digest }, input.timeoutSeconds, hash, input.oauthClientId);
-    } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
-  }
-
-  private enqueueControlled(repository: RepositoryIdentity, authorization: RepositoryExecutionAuthorization, timeoutSeconds: number, idempotencyKeyHash: string, oauthClientId: string): StartExecutionResult<RepositoryExecutionJob> {
+      const created = createGitJobPlan(this.workspace, input.repositoryPath, input.operation, planAuthorization);
+      const authorization: RepositoryExecutionAuthorization = grant
+        ? {
+            type: "git",
+            source: "full_access",
+            permissionMode: "level2",
+            sessionGrantFingerprint: grant.identityFingerprint,
+            sessionGrantId: grant.grantId,
+            requestId: created.requestId,
+            digest: created.digest,
+          }
+        : {
+            type: "git",
+            source: "repository_approval",
+            requestId: created.requestId,
+            digest: created.digest,
+          };
+      const grantStillCurrent = grant
+        ? () => {
+            const current = this.currentFullAccessGrant();
+            return current !== null && current.identityFingerprint === grant!.identityFingerprint &&
+              current.grantId === grant!.grantId;
+          }
+        : undefined;
+      return this.enqueueControlled(
+        created.plan.repository,
+        authorization,
+        input.timeoutSeconds,
+        hash,
+        input.oauthClientId,
+        grantStillCurrent,
+      );
+    } catch (error) {
+      return { ok: false, error: cleanCode((error as Error).message) };
+    }
+  }  private enqueueControlled(
+    repository: RepositoryIdentity,
+    authorization: RepositoryExecutionAuthorization,
+    timeoutSeconds: number,
+    idempotencyKeyHash: string,
+    oauthClientId: string,
+    beforeCreate?: () => boolean,
+  ): StartExecutionResult<RepositoryExecutionJob> {
     const job: RepositoryExecutionJob = {
       jobId: randomBytes(24).toString("base64url"), workspaceId: this.workspace.id,
       executionContext: "repository",
@@ -265,6 +380,7 @@ export class ExecutionSupervisor {
       stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
       stderr: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
     };
+    if (beforeCreate && !beforeCreate()) return { ok: false, error: "FULL_ACCESS_REQUIRED" };
     try { this.store.create(job); } catch (error) { return { ok: false, error: cleanCode((error as Error).message) }; }
     this.logger.info("Controlled execution authorized", { workspaceId: this.workspace.id, jobId: job.jobId, oauthClientId, capability: authorization.type, requestId: authorization.requestId, digest: authorization.digest });
     this.schedule();
@@ -382,6 +498,12 @@ export class ExecutionSupervisor {
     const current = this.currentFullAccessGrant();
     return current !== null && current.identityFingerprint === job.authorization.sessionGrantFingerprint &&
       current.grantId === job.authorization.sessionGrantId;
+  }
+
+  private hasCurrentFullAccessGitGrant(authorization: FullAccessGitExecutionAuthorization): boolean {
+    const current = this.currentFullAccessGrant();
+    return current !== null && current.identityFingerprint === authorization.sessionGrantFingerprint &&
+      current.grantId === authorization.sessionGrantId;
   }
 
   async startFullAccess(
@@ -691,10 +813,19 @@ export class ExecutionSupervisor {
         if (job.authorization) {
           releaseWriteLock = acquireRepositoryWriteLock(repository, job.jobId);
           if (job.authorization.type === "git" && hasGitReviewHold(this.workspace, job.repositoryPath)) throw new Error("GIT_REVIEW_REQUIRED");
+          if (isFullAccessGitAuthorization(job.authorization) &&
+              !this.hasCurrentFullAccessGitGrant(job.authorization)) throw new Error("FULL_ACCESS_REQUIRED");
           const resolved = job.authorization.type === "level3"
             ? resolveConsumedLevel3Request(this.workspace, job.authorization.requestId, job.oauthClientId, job.authorization.digest)
-            : resolveGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
+            : resolveGitJobPlan(
+                this.workspace,
+                job.authorization.requestId,
+                job.authorization.digest,
+                planAuthorizationForExecutionJob(job.authorization),
+              );
           if (resolved.repository.identity !== repository.identity) throw new RepositoryIdentityError("PATH_CHANGED");
+          if (isFullAccessGitAuthorization(job.authorization) &&
+              !this.hasCurrentFullAccessGitGrant(job.authorization)) throw new Error("FULL_ACCESS_REQUIRED");
           genericCommand = resolved.genericCommand;
           trustedCommand = { workspaceId: this.workspace.id, repositoryIdentity: repository.identity,
             canonicalRepositoryPath: repository.canonicalPath, kind: "package_script", target: "v13", packageManager: "npm",
@@ -744,6 +875,10 @@ export class ExecutionSupervisor {
         nonce: tempLease.nonce,
         createdAtMs: tempLease.createdAtMs,
       } });
+      const fullAccessGitAuthorization = isFullAccessGitAuthorization(job.authorization)
+        ? job.authorization
+        : undefined;
+      if (fullAccessGitAuthorization && !genericCommand) throw new Error("V13_AUTHORIZATION_DENIED");
       const runnerRequest: NativeRunnerRequest = isFullAccessExecutionJob(job) ? {
         jobId: job.jobId,
         timeoutSeconds: job.timeoutSeconds,
@@ -758,6 +893,20 @@ export class ExecutionSupervisor {
           idempotencyKeyHash: job.idempotencyKeyHash,
           requestHash: job.authorization.requestHash,
           command: job.fullAccessCommand,
+        },
+      } : fullAccessGitAuthorization ? {
+        jobId: job.jobId,
+        repository: repository!,
+        trustedCommand: trustedCommand!,
+        timeoutSeconds: job.timeoutSeconds,
+        stateDirectory: this.store.directory,
+        tempLease,
+        genericCommand: genericCommand!,
+        fullAccessGit: {
+          oauthClientId: job.oauthClientId,
+          permissionMode: fullAccessGitAuthorization.permissionMode,
+          sessionGrantFingerprint: fullAccessGitAuthorization.sessionGrantFingerprint,
+          sessionGrantId: fullAccessGitAuthorization.sessionGrantId,
         },
       } : {
         jobId: job.jobId,
@@ -975,7 +1124,12 @@ export class ExecutionSupervisor {
       if (job.authorization.type === "level3") {
         completeLevel3Request(this.workspace.id, job.authorization.requestId, job.oauthClientId, job.state === "succeeded" ? "completed" : "failed", jobCanBeArchived(job));
       } else {
-        const plan = readGitJobPlan(this.workspace, job.authorization.requestId, job.authorization.digest);
+        const plan = readGitJobPlan(
+          this.workspace,
+          job.authorization.requestId,
+          job.authorization.digest,
+          planAuthorizationForExecutionJob(job.authorization),
+        );
         const confirmed = confirmGitWriteState(this.workspace, job.repositoryPath, plan.before);
         const network = ["push", "fetch", "pull_ff_only"].includes(plan.operation.kind);
         const remoteOutcome = !network ? "not_applicable" : !job.startedAt ? "not_attempted" : job.state === "succeeded" ? "reported_success" : "unknown";
@@ -1060,7 +1214,9 @@ export class ExecutionSupervisor {
           if (isFullAccessExecutionJob(job)) authorized = this.hasCurrentFullAccessGrant(job);
           else if (job.authorization) authorized = job.authorization.type === "level3"
               ? isLevel3Enabled(this.workspace.id) && ["consumed", "launching"].includes(getLevel3Request(this.workspace.id, job.authorization.requestId)?.status ?? "")
-              : listGitRepositoryApprovals(this.workspace.id).some((approval) => approval.repositoryIdentity === job.repositoryIdentity);
+              : isFullAccessGitAuthorization(job.authorization)
+                ? this.hasCurrentFullAccessGitGrant(job.authorization)
+                : listGitRepositoryApprovals(this.workspace.id).some((approval) => approval.repositoryIdentity === job.repositoryIdentity);
         } catch { /* corrupt or revoked authority fails closed */ }
         if (!authorized) this.cancel(job.jobId, job.oauthClientId);
       }

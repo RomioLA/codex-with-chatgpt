@@ -9,11 +9,15 @@ import {
   findGitRepositoryApproval,
   gitWritePolicyHash,
   type GitRepositoryApproval,
+  type GitWriteCredentialHelper,
+  type GitWriteRemoteApproval,
 } from "./registry.js";
 import {
   assertNoReparsePath,
   buildCommonGitArgs,
+  captureGitBundleCriticalMaterials,
   configFilesAsMaterials,
+  configUserValue,
   decodeGitPaths,
   GIT_WRITE_CLEAR_ENVIRONMENT,
   getGitWriteEnvironment,
@@ -24,6 +28,7 @@ import {
   readFileMaterial,
   remoteValues,
   requireGitSuccess,
+  resolveGitExecutable,
   runVerifiedGit,
   validateGitConfig,
   verifyExecutable,
@@ -37,6 +42,7 @@ import {
   type GitWriteMaterial,
   type GitWriteOperation,
   type GitWritePlan,
+  type GitWritePlanAuthorization,
   type GitWriteStateSnapshot,
 } from "./types.js";
 
@@ -45,6 +51,10 @@ const BRANCH_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MAX_ADD_PATHS = 256;
 const MAX_ADD_PATH_BYTES = 24 * 1024;
+
+type GitWritePolicy = Pick<GitRepositoryApproval,
+  "allowedOperations" | "allowedBranches" | "allowedRemotes" | "approvedProxy" |
+  "credentialHelper" | "author" | "bundleMaterials">;
 
 function norm(value: string): string {
   return process.platform === "win32" || process.platform === "darwin" ? value.toLowerCase() : value;
@@ -194,16 +204,16 @@ function verifyIdentityWithExecutable(
   }
 }
 
-function requireAllowedOperation(approval: GitRepositoryApproval, kind: GitWriteOperation["kind"]): void {
+function requireAllowedOperation(approval: GitWritePolicy, kind: GitWriteOperation["kind"]): void {
   if (!approval.allowedOperations.includes(kind)) throw new GitWriteError("NOT_APPROVED");
 }
 
-function requireAllowedBranch(approval: GitRepositoryApproval, value: string): void {
+function requireAllowedBranch(approval: GitWritePolicy, value: string): void {
   if (!validBranchName(value) || !approval.allowedBranches.includes(value)) throw new GitWriteError("NOT_APPROVED");
 }
 
 function approvedRemote(
-  approval: GitRepositoryApproval,
+  approval: GitWritePolicy,
   config: GitConfigEntry[],
   requested: string,
 ): { name: string; url: string } {
@@ -217,11 +227,170 @@ function approvedRemote(
   return { name: remote.name, url: remote.url };
 }
 
-function credentialHelperCommand(approval: GitRepositoryApproval, needsRemote: boolean): string | null {
+function credentialHelperCommand(approval: GitWritePolicy, needsRemote: boolean): string | null {
   if (!needsRemote || !approval.credentialHelper) return null;
   const current = fs.realpathSync.native(approval.credentialHelper.path).replace(/\\/g, "/");
   if (/[\0\r\n"'`$&|<>^%!;(){}\[\]]/.test(current)) throw new GitWriteError("GIT_EXECUTABLE_CHANGED");
   return `"${current}"`;
+}
+
+function exactHttpsRemoteUrl(value: string): boolean {
+  if (value.length > 2048 || /[\0\r\n]/.test(value)) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && parsed.hostname.length > 0 &&
+      parsed.username === "" && parsed.password === "" && parsed.search === "" && parsed.hash === "" &&
+      parsed.href === value;
+  } catch {
+    return false;
+  }
+}
+
+function currentFullAccessRemote(config: GitConfigEntry[], name: string): GitWriteRemoteApproval {
+  if (!REMOTE_NAME.test(name)) throw new GitWriteError("INVALID_REMOTE");
+  const urls = remoteValues(config, name, "url");
+  const pushUrls = remoteValues(config, name, "pushurl");
+  if (urls.length !== 1 || pushUrls.length > 1 ||
+      (pushUrls.length === 1 && pushUrls[0] !== urls[0]) ||
+      !exactHttpsRemoteUrl(urls[0])) throw new GitWriteError("INVALID_REMOTE");
+  return { name, url: urls[0] };
+}
+
+function normalizeFullAccessProxy(value: string): string {
+  if (value.length > 2048 || value.trim() !== value || /[\0\r\n]/.test(value)) {
+    throw new GitWriteError("UNSAFE_GIT_CONFIG");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new GitWriteError("UNSAFE_GIT_CONFIG");
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      !parsed.hostname || parsed.username || parsed.password || parsed.pathname !== "/" ||
+      parsed.search || parsed.hash || (parsed.port !== "" && Number(parsed.port) === 0)) {
+    throw new GitWriteError("UNSAFE_GIT_CONFIG");
+  }
+  return parsed.origin;
+}
+
+function fullAccessHttpsProxy(): string | null {
+  for (const names of [
+    ["HTTPS_PROXY", "https_proxy"],
+    ["HTTP_PROXY", "http_proxy"],
+    ["ALL_PROXY", "all_proxy"],
+  ]) {
+    const configured = names
+      .map((name) => process.env[name])
+      .filter((value): value is string => value !== undefined && value !== "");
+    if (configured.length === 0) continue;
+    const normalized = [...new Set(configured.map(normalizeFullAccessProxy))];
+    if (normalized.length !== 1) throw new GitWriteError("UNSAFE_GIT_CONFIG");
+    return normalized[0]!;
+  }
+  return null;
+}
+function gitBundleRoot(executable: string): string {
+  const canonical = path.resolve(executable).replace(/\\/g, "/");
+  const lower = canonical.toLowerCase();
+  if (lower.endsWith("/mingw64/bin/git.exe")) return path.dirname(path.dirname(path.dirname(canonical)));
+  if (lower.endsWith("/bin/git.exe") || lower.endsWith("/cmd/git.exe")) return path.dirname(path.dirname(canonical));
+  throw new GitWriteError("INVALID_ARGUMENTS");
+}
+
+function fullAccessCredentialHelper(
+  executable: GitExecutable,
+  config: GitConfigEntry[],
+  needsRemote: boolean,
+): GitWriteCredentialHelper | null {
+  if (!needsRemote) return null;
+  const configured = config.filter((entry) => entry.key.toLowerCase() === "credential.helper")
+    .map((entry) => entry.value.trim()).filter(Boolean);
+  const expected = path.join(gitBundleRoot(executable.path), "mingw64", "bin", "git-credential-manager.exe");
+  if (configured.length === 0) {
+    try {
+      return readFileMaterial(expected);
+    } catch {
+      return null;
+    }
+  }
+  const requested = configured[configured.length - 1];
+  const recognized = ["manager", "manager-core"].includes(requested.toLowerCase()) ||
+    path.isAbsolute(requested) && norm(path.resolve(requested)) === norm(path.resolve(expected));
+  if (configured.length > 1 || !recognized) throw new GitWriteError("UNSAFE_GIT_CONFIG");
+  try {
+    return readFileMaterial(expected);
+  } catch {
+    throw new GitWriteError("GIT_EXECUTABLE_CHANGED");
+  }
+}
+
+function fullAccessAuthor(config: GitConfigEntry[], shouldCommit: boolean): { name: string; email: string } | null {
+  const name = configUserValue(config, "user.name");
+  const email = configUserValue(config, "user.email");
+  if (!name || !email) {
+    if (shouldCommit) throw new GitWriteError("INVALID_ARGUMENTS");
+    return null;
+  }
+  if (name.length > 256 || email.length > 320 || /[\0\r\n]/.test(name) || /[\0\r\n]/.test(email)) {
+    throw new GitWriteError("INVALID_ARGUMENTS");
+  }
+  return { name, email };
+}
+
+function fullAccessBranches(operation: GitWriteOperation): string[] {
+  const branches = new Set<string>();
+  if (operation.expectedBranch) branches.add(operation.expectedBranch);
+  switch (operation.kind) {
+    case "push":
+    case "pull_ff_only":
+      branches.add(operation.branch);
+      break;
+    case "fetch":
+      for (const branch of operation.branches ?? []) branches.add(branch);
+      break;
+    case "branch_create":
+      branches.add(operation.name);
+      if (operation.startPoint) branches.add(operation.startPoint);
+      break;
+    case "switch":
+      branches.add(operation.name);
+      break;
+  }
+  return [...branches];
+}
+
+function fullAccessGitPolicy(
+  repository: ReturnType<typeof resolveRepositoryIdentity>,
+  executable: GitExecutable,
+  config: GitConfigEntry[],
+  operation: GitWriteOperation,
+): GitWritePolicy {
+  const remoteName = "remote" in operation ? operation.remote : null;
+  const fullAccessRemote = remoteName ? currentFullAccessRemote(config, remoteName) : null;
+  const approvedProxy = fullAccessRemote ? fullAccessHttpsProxy() : null;
+  const branches = fullAccessBranches(operation);
+  const common = buildCommonGitArgs(config, null);
+  for (const branch of branches) {
+    if (branch === "HEAD") continue;
+    if (!validBranchName(branch) || branch.includes("..") || branch.includes("//") ||
+        branch.endsWith("/") || branch.endsWith(".") || branch.includes("@{")) {
+      throw new GitWriteError("INVALID_BRANCH");
+    }
+    const check = runVerifiedGit(executable, repository.canonicalPath, [
+      ...common, "check-ref-format", "refs/heads/" + branch,
+    ], { maxBuffer: 4096 });
+    if (check.code !== 0) throw new GitWriteError("INVALID_BRANCH");
+  }
+  return {
+    allowedOperations: [operation.kind],
+    allowedBranches: branches,
+    allowedRemotes: fullAccessRemote ? [fullAccessRemote] : [],
+    approvedProxy,
+    credentialHelper: fullAccessCredentialHelper(executable, config, remoteName !== null),
+    author: fullAccessAuthor(config, operation.kind === "commit"),
+    bundleMaterials: captureGitBundleCriticalMaterials(executable, repository.canonicalPath),
+  };
 }
 
 function assertExpectedState(operation: GitWriteOperation, state: GitWriteStateSnapshot): void {
@@ -314,7 +483,7 @@ function expandAddPaths(
   return paths;
 }
 
-function requireRemoteBranches(approval: GitRepositoryApproval, requested: string[] | undefined): string[] {
+function requireRemoteBranches(approval: GitWritePolicy, requested: string[] | undefined): string[] {
   const branches = requested ?? approval.allowedBranches;
   if (branches.length < 1 || new Set(branches).size !== branches.length) throw new GitWriteError("INVALID_BRANCH");
   for (const branch of branches) requireAllowedBranch(approval, branch);
@@ -338,7 +507,7 @@ function validateStartPoint(
   executable: GitExecutable,
   root: string,
   config: GitConfigEntry[],
-  approval: GitRepositoryApproval,
+  approval: GitWritePolicy,
   startPoint: string,
 ): string {
   if (startPoint === "HEAD") return "HEAD";
@@ -412,7 +581,7 @@ function buildOperationArgs(
   repositoryRoot: string,
   executable: GitExecutable,
   config: GitConfigEntry[],
-  approval: GitRepositoryApproval,
+  approval: GitWritePolicy,
   operation: GitWriteOperation,
 ): { args: string[]; remoteBinding: { name: string; url: string } | null; sourcePaths: string[] } {
   const needsRemote = operation.kind === "push" || operation.kind === "fetch" || operation.kind === "pull_ff_only";
@@ -611,7 +780,7 @@ function collectMaterials(
   repository: ReturnType<typeof resolveRepositoryIdentity>,
   executable: GitExecutable,
   config: GitConfigEntry[],
-  approval: GitRepositoryApproval,
+  approval: GitWritePolicy,
   sourcePaths: string[],
   headMaterial: GitWriteMaterial,
   lockHead: boolean,
@@ -654,8 +823,33 @@ function immutableOperation(operation: GitWriteOperation): GitWriteOperation {
   return JSON.parse(JSON.stringify(operation)) as GitWriteOperation;
 }
 
-export function planGitWrite(workspace: Workspace, repositoryPath: string, input: GitWriteOperation): GitWritePlan {
+export function planGitWrite(
+  workspace: Workspace,
+  repositoryPath: string,
+  input: GitWriteOperation,
+  requestedAuthorization?: GitWritePlanAuthorization,
+): GitWritePlan {
   validateOperationShape(input);
+  let authorization: GitWritePlanAuthorization | undefined;
+  if (requestedAuthorization !== undefined) {
+    if (requestedAuthorization.source === "repository_approval" &&
+        Object.keys(requestedAuthorization).length === 1) {
+      authorization = { source: "repository_approval" };
+    } else if (requestedAuthorization.source === "full_access" &&
+        requestedAuthorization.permissionMode === "level2" &&
+        /^[a-f0-9]{64}$/.test(requestedAuthorization.sessionGrantFingerprint) &&
+        /^[a-f0-9]{64}$/.test(requestedAuthorization.sessionGrantId) &&
+        Object.keys(requestedAuthorization).length === 4) {
+      authorization = {
+        source: "full_access",
+        permissionMode: "level2",
+        sessionGrantFingerprint: requestedAuthorization.sessionGrantFingerprint,
+        sessionGrantId: requestedAuthorization.sessionGrantId,
+      };
+    } else {
+      throw new GitWriteError("INVALID_ARGUMENTS");
+    }
+  }
   let repository: ReturnType<typeof resolveRepositoryIdentity>;
   try {
     repository = resolveRepositoryIdentity(workspace, repositoryPath);
@@ -663,13 +857,19 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
     if (error instanceof RepositoryIdentityError && error.code === "REPARSE_POINT") throw new GitWriteError("REPARSE_POINT");
     throw new GitWriteError("INVALID_REPOSITORY");
   }
-  const approval = findGitRepositoryApproval(workspace.id, repository.identity, repository.canonicalPath);
-  if (!approval.allowedOperations.includes(input.kind)) throw new GitWriteError("NOT_APPROVED");
-  const executable: GitExecutable = {
-    path: approval.executable,
-    fileIdentity: approval.executableFileIdentity,
-    hash: approval.executableHash,
-  };
+
+  let approval: GitRepositoryApproval | null = null;
+  let executable: GitExecutable;
+  if (authorization?.source === "full_access") {
+    executable = resolveGitExecutable();
+  } else {
+    approval = findGitRepositoryApproval(workspace.id, repository.identity, repository.canonicalPath);
+    executable = {
+      path: approval.executable,
+      fileIdentity: approval.executableFileIdentity,
+      hash: approval.executableHash,
+    };
+  }
   verifyExecutable(executable);
   const config = loadGitConfig(executable, repository.canonicalPath);
   validateGitConfig(config);
@@ -677,26 +877,31 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
   assertNoAlternateOrPromisorObjects(repository);
   if (input.kind !== "branch_list") assertNoUnmergedIndex(executable, repository.canonicalPath, config);
   if (input.kind === "commit") assertNoCommitInProgress(executable, repository.canonicalPath, config);
+  let policy: GitWritePolicy;
+  if (approval) {
+    policy = approval;
+  } else {
+    policy = fullAccessGitPolicy(repository, executable, config, input);
+  }
+  if (!policy.allowedOperations.includes(input.kind)) throw new GitWriteError("NOT_APPROVED");
   const { args, remoteBinding, sourcePaths } = buildOperationArgs(
     workspace,
     repository.workspaceRelativePath,
     repository.canonicalPath,
     executable,
     config,
-    approval,
+    policy,
     input,
   );
-  const helper = input.kind === "push" || input.kind === "fetch" || input.kind === "pull_ff_only" ? approval.credentialHelper : null;
-  const helperCommand = credentialHelperCommand(approval, helper !== null);
-  // write-tree may update the cache-tree extension: capture it before index
-  // identity/hash, and bind the tree rather than re-reading a mutable index.
+  const helper = input.kind === "push" || input.kind === "fetch" || input.kind === "pull_ff_only" ? policy.credentialHelper : null;
+  const helperCommand = credentialHelperCommand(policy, helper !== null);
   const state = stateSnapshot(repository.identity, executable, repository.canonicalPath, config, helperCommand);
   assertExpectedState(input, state);
   const headMaterial = captureHeadMaterial(repository, state);
   if (input.kind === "add" || input.kind === "commit") {
-    if (!state.branch || !approval.allowedBranches.includes(state.branch)) throw new GitWriteError("NOT_APPROVED");
+    if (!state.branch || !policy.allowedBranches.includes(state.branch)) throw new GitWriteError("NOT_APPROVED");
   }
-  if (input.kind === "switch" && state.branch !== null && !approval.allowedBranches.includes(state.branch)) {
+  if (input.kind === "switch" && state.branch !== null && !policy.allowedBranches.includes(state.branch)) {
     throw new GitWriteError("NOT_APPROVED");
   }
   if (input.kind === "pull_ff_only" && state.branch !== input.branch) throw new GitWriteError("INVALID_BRANCH");
@@ -705,9 +910,8 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
   const reviewed = input.kind === "commit" ? reviewedIndexTree(repository, executable, config) : null;
   const tree = reviewed?.tree ?? null;
   if (tree !== null && !HEX.test(tree)) throw new GitWriteError("STATE_UNAVAILABLE");
-
   const { materials, snapshotMaterials } = collectMaterials(
-    repository, executable, config, approval, sourcePaths, headMaterial, input.kind !== "switch",
+    repository, executable, config, policy, sourcePaths, headMaterial, input.kind !== "switch",
   );
   if (reviewed) {
     const index = snapshotMaterials.find(item => norm(item.path) === norm(reviewed.source.path));
@@ -728,10 +932,23 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
     expectedStatusHash: input.expectedStatusHash ?? state.statusHash,
   } as GitWriteOperation);
   const environment = getGitWriteEnvironment();
-  const policyHash = gitWritePolicyHash(approval);
+  const policyHash = approval
+    ? gitWritePolicyHash(approval)
+    : sha256(JSON.stringify({ authorization, policy: {
+        allowedOperations: policy.allowedOperations,
+        allowedBranches: policy.allowedBranches,
+        allowedRemotes: policy.allowedRemotes,
+        approvedProxy: policy.approvedProxy,
+        credentialHelper: policy.credentialHelper,
+        author: policy.author,
+        bundleMaterials: policy.bundleMaterials,
+      } }));
   const commitBinding = tree && state.branch ? { tree, parent: state.head, branch: state.branch } : undefined;
-  const switchBinding = input.kind === "switch" ? { head: runText(executable, repository.canonicalPath, ["rev-parse", "--verify", `refs/heads/${input.name}^{commit}`], buildCommonGitArgs(config, null)) } : undefined;
-  const digest = sha256(JSON.stringify({
+  const switchBinding = input.kind === "switch"
+    ? { head: runText(executable, repository.canonicalPath,
+        ["rev-parse", "--verify", "refs/heads/" + input.name + "^{commit}"], buildCommonGitArgs(config, null)) }
+    : undefined;
+  const digestMaterial = {
     commitBinding,
     switchBinding,
     repository: repository.identity,
@@ -746,7 +963,9 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
     snapshotMaterials,
     credentialHelper: helper,
     policyHash,
-  }));
+    ...(authorization ? { authorization } : {}),
+  };
+  const digest = sha256(JSON.stringify(digestMaterial));
   return {
     ...(commitBinding ? { commitBinding } : {}),
     ...(switchBinding ? { switchBinding } : {}),
@@ -763,12 +982,11 @@ export function planGitWrite(workspace: Workspace, repositoryPath: string, input
     materials,
     snapshotMaterials,
     operation,
+    ...(authorization ? { authorization } : {}),
     remoteBinding,
     credentialHelper: helper ? { ...helper } : null,
   };
-}
-
-/** Verify operation-specific postconditions while the C2C writer lock is held.
+}/** Verify operation-specific postconditions while the C2C writer lock is held.
  * This detects unexpected outcomes; it never rolls back external user data. */
 export function verifyGitPostconditions(workspace: Workspace, repositoryPath: string, plan: GitWritePlan): boolean {
   const repository = resolveRepositoryIdentity(workspace, repositoryPath);

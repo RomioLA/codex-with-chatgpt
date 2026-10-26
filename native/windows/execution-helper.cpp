@@ -24,6 +24,8 @@
 #include <cwchar>
 #include <iterator>
 #include <mutex>
+#include <cstring>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -51,7 +53,8 @@ constexpr BYTE kFrameResult = 3;
 
 constexpr BYTE kRequestMagicV5[8] = {'C', '2', 'C', 'J', 'O', 'B', '5', 0};
 constexpr BYTE kRequestMagicV7[8] = {'C', '2', 'C', 'J', 'O', 'B', '7', 0};
-constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '7', 0};
+constexpr BYTE kRequestMagicV8[8] = {'C', '2', 'C', 'J', 'O', 'B', '8', 0};
+constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '8', 0};
 constexpr BYTE kTempCleanupMagic[8] = {'C', '2', 'C', 'T', 'M', 'P', '1', 0};
 
 struct UniqueHandle {
@@ -293,6 +296,7 @@ struct Request {
     std::wstring sessionGrantId;
     std::wstring idempotencyKeyHash;
     std::wstring requestHash;
+    bool hasFullAccessGrant = false;
     std::wstring approvalManifest;
     std::wstring approvalManifestFileIdentity;
     std::wstring approvalManifestHash;
@@ -498,7 +502,8 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
     }
     const bool requestV5 = std::equal(std::begin(magic), std::end(magic), std::begin(kRequestMagicV5));
     const bool requestV7 = std::equal(std::begin(magic), std::end(magic), std::begin(kRequestMagicV7));
-    if (!requestV5 && !requestV7) {
+    const bool requestV8 = std::equal(std::begin(magic), std::end(magic), std::begin(kRequestMagicV8));
+    if (!requestV5 && !requestV7 && !requestV8) {
         error = ERROR_INVALID_DATA;
         return false;
     }
@@ -517,9 +522,11 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         return false;
     }
 
-    const bool validRepositoryRequest = requestV5 && version == 5 &&
-        (recipe == 1 || recipe == 2) && (request.manager == 1 || request.manager == 2) &&
-        request.kind >= 1 && request.kind <= 5;
+    const bool validRepositoryRequest =
+        (requestV5 && version == 5 && (recipe == 1 || recipe == 2) &&
+         (request.manager == 1 || request.manager == 2) && request.kind >= 1 && request.kind <= 5) ||
+        (requestV8 && version == 8 && recipe == 2 &&
+         (request.manager == 1 || request.manager == 2) && request.kind == 5);
     const bool validHostRequest = requestV7 && version == 7 && recipe == 3 &&
         request.manager == 0 && request.kind == 0;
     if ((!validRepositoryRequest && !validHostRequest) || reservedByte != 0 || reservedWord != 0 ||
@@ -567,6 +574,7 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
         }
         request.tempWorkspaceId = request.fullAccessWorkspaceId;
         request.tempJobId = request.fullAccessJobId;
+        request.hasFullAccessGrant = true;
         if (request.genericMode < 1 || request.genericMode > 3 ||
             (request.genericMode == 1 && !request.genericCommandText.empty()) ||
             (request.genericMode != 1 &&
@@ -683,6 +691,23 @@ bool ReadRequest(HANDLE input, Request& request, DWORD& error) {
                 !ReadString(input, kMaxFieldBytes, material.hash, error) ||
                 !IsIdentity(material.fileIdentity) || !IsHex(material.hash, 64)) return false;
             request.launchSnapshots.push_back(std::move(material));
+        }
+        if (requestV8) {
+            if (!ReadString(input, kMaxFieldBytes, request.fullAccessWorkspaceId, error) ||
+                !ReadString(input, kMaxFieldBytes, request.fullAccessJobId, error) ||
+                !ReadString(input, kMaxFieldBytes, request.oauthClientId, error) ||
+                !ReadString(input, kMaxFieldBytes, request.permissionMode, error) ||
+                !ReadString(input, kMaxFieldBytes, request.sessionGrantFingerprint, error) ||
+                !ReadString(input, kMaxFieldBytes, request.sessionGrantId, error)) return false;
+            if (request.fullAccessWorkspaceId != request.tempWorkspaceId ||
+                request.fullAccessJobId != request.tempJobId ||
+                request.oauthClientId.empty() || request.oauthClientId.size() > 200 ||
+                request.permissionMode != L"level2" ||
+                !IsHex(request.sessionGrantFingerprint, 64) || !IsHex(request.sessionGrantId, 64)) {
+                error = ERROR_INVALID_DATA;
+                return false;
+            }
+            request.hasFullAccessGrant = true;
         }
         const bool validMode = request.genericMode >= 1 && request.genericMode <= 3;
         const bool validCommandShape = request.genericMode == 1
@@ -1092,6 +1117,10 @@ bool ValidateFullAccessRequestPaths(Request& request, DWORD& error) {
 
 bool ValidateRequestPaths(Request& request, DWORD& error) {
     if (request.recipe == 3) return ValidateFullAccessRequestPaths(request, error);
+    if (request.hasFullAccessGrant && (request.recipe != 2 || request.kind != 5)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
 
     if (!ValidateTarget(request)) {
         error = ERROR_INVALID_DATA;
@@ -1856,6 +1885,197 @@ bool ExpectedPermissionStatePaths(const Request& request, std::wstring& statePat
     return true;
 }
 
+bool Sha256Text(const std::string& value, std::string& hex) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectLength = 0;
+    DWORD digestLength = 0;
+    DWORD resultLength = 0;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) return false;
+    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                               reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+                               &resultLength, 0);
+    if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(algorithm, 0); return false; }
+    status = BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+                               reinterpret_cast<PUCHAR>(&digestLength), sizeof(digestLength),
+                               &resultLength, 0);
+    if (!BCRYPT_SUCCESS(status) || digestLength != 32) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    std::vector<BYTE> object(objectLength);
+    std::array<BYTE, 32> digest{};
+    status = BCryptCreateHash(algorithm, &hash, object.data(), objectLength, nullptr, 0, 0);
+    if (BCRYPT_SUCCESS(status)) {
+        status = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(value.data())),
+                                static_cast<ULONG>(value.size()), 0);
+    }
+    if (BCRYPT_SUCCESS(status)) {
+        status = BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    }
+    if (hash) BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!BCRYPT_SUCCESS(status)) return false;
+    std::ostringstream output;
+    output << std::hex << std::nouppercase << std::setfill('0');
+    for (BYTE byte : digest) output << std::setw(2) << static_cast<unsigned int>(byte);
+    hex = output.str();
+    return true;
+}
+
+bool CurrentWindowsSessionFingerprint(std::string& fingerprint, DWORD& error) {
+    using NtQuerySystemInformationFn = LONG (NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto query = ntdll ? reinterpret_cast<NtQuerySystemInformationFn>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation")) : nullptr;
+    if (!query) { error = ERROR_PROC_NOT_FOUND; return false; }
+    const auto queryExact = [query](ULONG informationClass, BYTE* bytes, ULONG size) {
+        ULONG returned = 0;
+        const LONG status = query(informationClass, bytes, size, &returned);
+        return status >= 0 && returned == size;
+    };
+
+    std::array<BYTE, 32> environment{};
+    GUID bootIdentifier{};
+    bool hasBootIdentifier = false;
+    bool hasExtendedEnvironment = false;
+    std::uint64_t bootTimeFileTicks = 0;
+    for (ULONG informationClass : { 107u, 90u }) {
+        environment.fill(0xAA);
+        if (!queryExact(informationClass, environment.data(),
+                        static_cast<ULONG>(environment.size()))) continue;
+        GUID candidate{};
+        std::memcpy(&candidate, environment.data(), sizeof(candidate));
+        std::uint64_t candidateBootTime = 0;
+        std::memcpy(&candidateBootTime, environment.data() + 24, sizeof(candidateBootTime));
+        const bool emptyGuid = candidate.Data1 == 0 && candidate.Data2 == 0 && candidate.Data3 == 0 &&
+            std::all_of(std::begin(candidate.Data4), std::end(candidate.Data4), [](BYTE value) { return value == 0; });
+        if (informationClass == 90u && !emptyGuid) {
+            bootIdentifier = candidate;
+            hasBootIdentifier = true;
+        }
+        if (emptyGuid || candidateBootTime == 0 || candidateBootTime >= 2650467743999999999ULL) continue;
+        bootIdentifier = candidate;
+        hasBootIdentifier = true;
+        bootTimeFileTicks = candidateBootTime;
+        hasExtendedEnvironment = true;
+        break;
+    }
+
+    std::array<BYTE, 48> timeOfDay{};
+    timeOfDay.fill(0xAA);
+    bool hasTimeOfDayBoot = false;
+    std::uint64_t timeOfDayBootTicks = 0;
+    if (queryExact(3u, timeOfDay.data(), static_cast<ULONG>(timeOfDay.size()))) {
+        std::memcpy(&timeOfDayBootTicks, timeOfDay.data(), sizeof(timeOfDayBootTicks));
+        hasTimeOfDayBoot = timeOfDayBootTicks > 0 && timeOfDayBootTicks < 2650467743999999999ULL;
+    }
+    if (hasExtendedEnvironment) {
+        if (hasTimeOfDayBoot && timeOfDayBootTicks != bootTimeFileTicks) {
+            error = ERROR_INVALID_DATA;
+            return false;
+        }
+    } else {
+        if (!hasTimeOfDayBoot) { error = ERROR_NOT_SUPPORTED; return false; }
+        if (!hasBootIdentifier) {
+            environment.fill(0xAA);
+            if (!queryExact(90u, environment.data(), static_cast<ULONG>(environment.size()))) {
+                error = ERROR_NOT_SUPPORTED;
+                return false;
+            }
+            std::memcpy(&bootIdentifier, environment.data(), sizeof(bootIdentifier));
+            const bool emptyGuid = bootIdentifier.Data1 == 0 && bootIdentifier.Data2 == 0 && bootIdentifier.Data3 == 0 &&
+                std::all_of(std::begin(bootIdentifier.Data4), std::end(bootIdentifier.Data4), [](BYTE value) { return value == 0; });
+            if (emptyGuid) { error = ERROR_NOT_SUPPORTED; return false; }
+            hasBootIdentifier = true;
+        }
+        bootTimeFileTicks = timeOfDayBootTicks;
+    }
+    std::ostringstream bootIdText;
+    bootIdText << std::hex << std::nouppercase << std::setfill('0')
+        << std::setw(8) << bootIdentifier.Data1 << '-'
+        << std::setw(4) << bootIdentifier.Data2 << '-'
+        << std::setw(4) << bootIdentifier.Data3 << '-'
+        << std::setw(2) << static_cast<unsigned int>(bootIdentifier.Data4[0])
+        << std::setw(2) << static_cast<unsigned int>(bootIdentifier.Data4[1]) << '-';
+    for (size_t index = 2; index < 8; ++index) {
+        bootIdText << std::setw(2) << static_cast<unsigned int>(bootIdentifier.Data4[index]);
+    }
+
+    FILETIME bootFileTime{};
+    bootFileTime.dwLowDateTime = static_cast<DWORD>(bootTimeFileTicks & 0xFFFFFFFFULL);
+    bootFileTime.dwHighDateTime = static_cast<DWORD>(bootTimeFileTicks >> 32);
+    SYSTEMTIME bootSystemTime{};
+    if (!FileTimeToSystemTime(&bootFileTime, &bootSystemTime)) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    const std::uint64_t subMillisecondTicks = (bootTimeFileTicks % 10000000ULL) % 10000ULL;
+    std::ostringstream bootTimeText;
+    bootTimeText << std::setfill('0') << std::setw(4) << bootSystemTime.wYear << '-'
+        << std::setw(2) << bootSystemTime.wMonth << '-' << std::setw(2) << bootSystemTime.wDay << 'T'
+        << std::setw(2) << bootSystemTime.wHour << ':' << std::setw(2) << bootSystemTime.wMinute << ':'
+        << std::setw(2) << bootSystemTime.wSecond << '.' << std::setw(3) << bootSystemTime.wMilliseconds;
+    if (subMillisecondTicks != 0) bootTimeText << std::setw(4) << subMillisecondTicks;
+    bootTimeText << 'Z';
+
+    HANDLE rawToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) {
+        error = GetLastError();
+        return false;
+    }
+    UniqueHandle token(rawToken);
+    DWORD needed = 0;
+    GetTokenInformation(token.value, TokenUser, nullptr, 0, &needed);
+    if (needed == 0 || needed > 64 * 1024) { error = ERROR_INVALID_DATA; return false; }
+    std::vector<BYTE> userBuffer(needed);
+    if (!GetTokenInformation(token.value, TokenUser, userBuffer.data(), needed, &needed)) {
+        error = GetLastError();
+        return false;
+    }
+    const auto* tokenUser = reinterpret_cast<const TOKEN_USER*>(userBuffer.data());
+    if (!IsValidSid(tokenUser->User.Sid)) { error = ERROR_INVALID_DATA; return false; }
+    LPWSTR sidRaw = nullptr;
+    if (!ConvertSidToStringSidW(tokenUser->User.Sid, &sidRaw)) {
+        error = GetLastError();
+        return false;
+    }
+    std::string userSid;
+    for (const wchar_t ch : std::wstring(sidRaw)) {
+        if (ch > 0x7F) { LocalFree(sidRaw); error = ERROR_INVALID_DATA; return false; }
+        char value = static_cast<char>(ch);
+        if (value >= 'a' && value <= 'z') value = static_cast<char>(value - 'a' + 'A');
+        userSid.push_back(value);
+    }
+    LocalFree(sidRaw);
+
+    TOKEN_STATISTICS statistics{};
+    if (!GetTokenInformation(token.value, TokenStatistics, &statistics, sizeof(statistics), &needed) ||
+        (statistics.AuthenticationId.LowPart == 0 && statistics.AuthenticationId.HighPart == 0)) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_INVALID_DATA;
+        return false;
+    }
+    DWORD sessionId = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId)) {
+        error = GetLastError();
+        return false;
+    }
+    std::ostringstream logonIdText;
+    logonIdText << std::hex << std::nouppercase << std::setfill('0')
+        << std::setw(8) << static_cast<std::uint32_t>(statistics.AuthenticationId.HighPart)
+        << std::setw(8) << statistics.AuthenticationId.LowPart;
+
+    const std::string canonical = "{\"bootId\":\"" + bootIdText.str() +
+        "\",\"bootTime\":\"" + bootTimeText.str() + "\",\"userSid\":\"" + userSid +
+        "\",\"sessionId\":" + std::to_string(sessionId) +
+        ",\"logonId\":\"" + logonIdText.str() + "\"}";
+    if (!Sha256Text(canonical, fingerprint)) { error = ERROR_GEN_FAILURE; return false; }
+    error = ERROR_SUCCESS;
+    return true;
+}
+
 bool ReadPermissionState(const Request& request, const std::wstring& statePath, DWORD& error) {
     UniqueHandle file;
     file.reset(CreateFileW(statePath.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
@@ -1891,14 +2111,152 @@ bool ReadPermissionState(const Request& request, const std::wstring& statePath, 
     std::string expectedWorkspaceId;
     std::string expectedIdentityFingerprint;
     std::string expectedGrantId;
+    std::string currentIdentityFingerprint;
+    if (!CurrentWindowsSessionFingerprint(currentIdentityFingerprint, error)) return false;
     if (!ToAscii(request.fullAccessWorkspaceId, expectedWorkspaceId) ||
         !ToAscii(request.sessionGrantFingerprint, expectedIdentityFingerprint) ||
         !ToAscii(request.sessionGrantId, expectedGrantId) ||
         !ParsePermissionState(json, state) || state.version != "2" ||
         state.workspaceId != expectedWorkspaceId || state.baselineMode != "level1" ||
         state.sessionGrant.identityFingerprint != expectedIdentityFingerprint ||
+        expectedIdentityFingerprint != currentIdentityFingerprint ||
         state.sessionGrant.grantId != expectedGrantId) {
         error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    return true;
+}
+
+enum class GitPlanAuthorizationKind { legacy, repositoryApproval, fullAccess };
+
+struct ParsedGitPlanAuthorization {
+    GitPlanAuthorizationKind kind = GitPlanAuthorizationKind::legacy;
+    std::string permissionMode;
+    std::string sessionGrantFingerprint;
+    std::string sessionGrantId;
+};
+
+bool ParseGitPlanAuthorizationValue(const std::string& json, size_t& cursor,
+                                    ParsedGitPlanAuthorization& authorization) {
+    SkipJsonWhitespace(json, cursor);
+    if (cursor >= json.size() || json[cursor++] != '{') return false;
+    bool hasSource = false;
+    bool hasPermissionMode = false;
+    bool hasFingerprint = false;
+    bool hasGrantId = false;
+    size_t fields = 0;
+    for (;;) {
+        std::string key;
+        if (!ReadJsonObjectMemberPrefix(json, cursor, key)) return false;
+        SkipJsonWhitespace(json, cursor);
+        if (key == "source") {
+            if (hasSource || !ParseJsonString(json, cursor, authorization.permissionMode)) return false;
+            hasSource = true;
+            if (authorization.permissionMode == "repository_approval") {
+                authorization.kind = GitPlanAuthorizationKind::repositoryApproval;
+            } else if (authorization.permissionMode == "full_access") {
+                authorization.kind = GitPlanAuthorizationKind::fullAccess;
+            } else {
+                return false;
+            }
+        } else if (key == "permissionMode") {
+            if (hasPermissionMode || !ParseJsonString(json, cursor, authorization.permissionMode)) return false;
+            hasPermissionMode = true;
+        } else if (key == "sessionGrantFingerprint") {
+            if (hasFingerprint || !ParseJsonString(json, cursor, authorization.sessionGrantFingerprint)) return false;
+            hasFingerprint = true;
+        } else if (key == "sessionGrantId") {
+            if (hasGrantId || !ParseJsonString(json, cursor, authorization.sessionGrantId)) return false;
+            hasGrantId = true;
+        } else {
+            return false;
+        }
+        ++fields;
+        SkipJsonWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == '}') { ++cursor; break; }
+        if (json[cursor++] != ',') return false;
+        SkipJsonWhitespace(json, cursor);
+    }
+    if (!hasSource) return false;
+    if (authorization.kind == GitPlanAuthorizationKind::repositoryApproval) {
+        return fields == 1 && !hasPermissionMode && !hasFingerprint && !hasGrantId;
+    }
+    return authorization.kind == GitPlanAuthorizationKind::fullAccess && fields == 4 &&
+        hasPermissionMode && hasFingerprint && hasGrantId &&
+        authorization.permissionMode == "level2" &&
+        IsHex(std::wstring(authorization.sessionGrantFingerprint.begin(),
+                           authorization.sessionGrantFingerprint.end()), 64) &&
+        IsHex(std::wstring(authorization.sessionGrantId.begin(),
+                           authorization.sessionGrantId.end()), 64);
+}
+
+bool ParseGitPlanAuthorization(const std::string& json, ParsedGitPlanAuthorization& authorization) {
+    size_t cursor = 0;
+    SkipJsonWhitespace(json, cursor);
+    if (cursor >= json.size() || json[cursor++] != '{') return false;
+    bool seenAuthorization = false;
+    for (;;) {
+        std::string key;
+        if (!ReadJsonObjectMemberPrefix(json, cursor, key)) return false;
+        SkipJsonWhitespace(json, cursor);
+        if (key == "authorization") {
+            if (seenAuthorization) return false;
+            seenAuthorization = true;
+            if (!ParseGitPlanAuthorizationValue(json, cursor, authorization)) return false;
+        } else if (!SkipJsonValue(json, cursor, 1)) {
+            return false;
+        }
+        SkipJsonWhitespace(json, cursor);
+        if (cursor >= json.size()) return false;
+        if (json[cursor] == '}') { ++cursor; break; }
+        if (json[cursor++] != ',') return false;
+        SkipJsonWhitespace(json, cursor);
+    }
+    SkipJsonWhitespace(json, cursor);
+    return cursor == json.size();
+}
+
+bool ReadGitPlanAuthorization(const Request& request, ParsedGitPlanAuthorization& authorization,
+                              DWORD& error) {
+    UniqueHandle file;
+    file.reset(CreateFileW(request.approvalManifest.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!file.valid()) { error = GetLastError(); return false; }
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    LARGE_INTEGER size{};
+    if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo,
+                                      &attributes, sizeof(attributes)) ||
+        !GetFileSizeEx(file.get(), &size)) {
+        error = GetLastError();
+        return false;
+    }
+    if ((attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0 ||
+        size.QuadPart < 2 || size.QuadPart > 1024 * 1024) {
+        error = ERROR_INVALID_DATA;
+        return false;
+    }
+    std::wstring actualHash;
+    if (!Sha256(file.get(), actualHash, error) || !SameOrdinal(actualHash, request.approvalManifestHash)) {
+        if (error == ERROR_SUCCESS) error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    LARGE_INTEGER beginning{};
+    if (!SetFilePointerEx(file.get(), beginning, nullptr, FILE_BEGIN)) {
+        error = GetLastError();
+        return false;
+    }
+    std::string json(static_cast<size_t>(size.QuadPart), '\\0');
+    DWORD received = 0;
+    if (!ReadFile(file.get(), json.data(), static_cast<DWORD>(json.size()), &received, nullptr) ||
+        received != json.size()) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_HANDLE_EOF;
+        return false;
+    }
+    if (!ParseGitPlanAuthorization(json, authorization)) {
+        error = ERROR_INVALID_DATA;
         return false;
     }
     return true;
@@ -1929,13 +2287,42 @@ bool AcquireFullAccessLaunchPermit(const Request& request, PermissionLaunchPermi
     return true;
 }
 
-// Authorization provenance remains in the trusted Bridge. This narrowly binds
-// its revocable launch permit to the locked manifest through ResumeThread.
+// The Bridge binds the Git plan and grant to the job; the helper independently
+// validates the revocable grant while retaining the existing material locks.
 bool AcquireLaunchPermit(const Request& request, UniqueHandle& permit,
                          PermissionLaunchPermit& fullAccessPermit, DWORD& error) {
     if (request.recipe == 3) return AcquireFullAccessLaunchPermit(request, fullAccessPermit, error);
-    if (request.recipe != 2 || !HasRequestIdSuffix(request.approvalManifest.substr(
-            request.approvalManifest.find_last_of(L'\\') + 1), L".manifest.json")) return true;
+    if (request.recipe != 2) {
+        if (request.hasFullAccessGrant) { error = ERROR_INVALID_DATA; return false; }
+        return true;
+    }
+    const std::wstring leaf = request.approvalManifest.substr(
+        request.approvalManifest.find_last_of(L'\\') + 1);
+    const bool level3Manifest = HasRequestIdSuffix(leaf, L".manifest.json");
+    if (!level3Manifest) {
+        ParsedGitPlanAuthorization authorization;
+        if (!ReadGitPlanAuthorization(request, authorization, error)) return false;
+        if (request.hasFullAccessGrant) {
+            std::string expectedFingerprint;
+            std::string expectedGrantId;
+            if (authorization.kind != GitPlanAuthorizationKind::fullAccess ||
+                authorization.permissionMode != "level2" ||
+                !ToAscii(request.sessionGrantFingerprint, expectedFingerprint) ||
+                !ToAscii(request.sessionGrantId, expectedGrantId) ||
+                authorization.sessionGrantFingerprint != expectedFingerprint ||
+                authorization.sessionGrantId != expectedGrantId) {
+                error = ERROR_ACCESS_DENIED;
+                return false;
+            }
+            return AcquireFullAccessLaunchPermit(request, fullAccessPermit, error);
+        }
+        if (authorization.kind == GitPlanAuthorizationKind::fullAccess) {
+            error = ERROR_ACCESS_DENIED;
+            return false;
+        }
+        return true;
+    }
+    if (request.hasFullAccessGrant) { error = ERROR_INVALID_DATA; return false; }
     std::string expected;
     if (!ToAscii(request.approvalManifestHash, expected)) { error = ERROR_INVALID_DATA; return false; }
     return OpenMatchingMarkerFile(request.approvalManifest + L".permit", expected,

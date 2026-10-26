@@ -113,7 +113,7 @@ describe("V1.3 Level 3 over authenticated Streamable HTTP", () => {
     });
     const ownerToken = bridge.authStore.issueTokens({
       clientId: "level3-owner-client",
-      scopes: ["execution.level3", "execution.jobs.read", "execution.cancel", "git.write"],
+      scopes: ["execution.level3", "execution.jobs.read", "execution.cancel", "git.read", "git.write"],
     }).accessToken;
     const otherToken = bridge.authStore.issueTokens({
       clientId: "level3-other-client",
@@ -139,23 +139,33 @@ describe("V1.3 Level 3 over authenticated Streamable HTTP", () => {
     else process.env.C2C_STATE_DIR = originalStateDir;
   });
 
-  it("keeps structured Git jobs behind both scope and a local grant over HTTP", async () => {
-    const arguments_ = { repository_path: ".", operation: { kind: "branch_list",
-      expectedHead: git(workspace.root, "rev-parse", "HEAD").trim(), expectedBranch: "main" },
-      timeout_seconds: 30, idempotency_key: "mcp-git-branch-list-0123456789" };
+  it("uses Level2 Git Write without repository approval and routes reads to git_branches", async () => {
+    const head = git(workspace.root, "rev-parse", "HEAD").trim();
+    const branch = git(workspace.root, "branch", "--show-current").trim();
+    const branchListWrite = { repository_path: ".", operation: { kind: "branch_list",
+      expectedHead: head, expectedBranch: branch }, timeout_seconds: 30,
+      idempotency_key: "mcp-git-legacy-branch-list-0123456" };
+    const writeArguments = { repository_path: ".", operation: { kind: "add", paths: ["safe-task.js"],
+      expectedHead: head, expectedBranch: branch }, timeout_seconds: 30,
+      idempotency_key: "mcp-git-level2-switch-0123456789" };
     const before = runner.runs.size;
-    expect(jsonOf(await legacy!.callTool({ name: "git_write", arguments: arguments_ }))).toMatchObject({ error: "INSUFFICIENT_SCOPE" });
-    expect(jsonOf(await owner!.callTool({ name: "git_write", arguments: arguments_ }))).toMatchObject({ error: "NOT_APPROVED" });
+    expect(jsonOf(await legacy!.callTool({ name: "git_write", arguments: writeArguments })))
+      .toMatchObject({ error: "INSUFFICIENT_SCOPE" });
+    expect(jsonOf(await owner!.callTool({ name: "git_write", arguments: branchListWrite })))
+      .toMatchObject({ error: "USE_GIT_BRANCHES" });
+    const branches = structuredJsonOf<{ branches: Array<{ ref: string }> }>(
+      await owner!.callTool({ name: "git_branches", arguments: { repository_path: ".", offset: 0, limit: 10 } }));
+    expect(branches.branches.map((branch) => branch.ref)).toContain("refs/heads/main");
     expect(runner.runs.size).toBe(before);
-    const policy = { allowedOperations: ["branch_list" as const], allowedBranches: ["main"], allowedRemotes: [] };
-    const preview = previewGitRepositoryApproval(workspace, ".", policy);
-    approveGitRepository(workspace, ".", { ...policy, localApproval: true }, preview.digest);
-    const started = structuredJsonOf<{ job: { job_id: string; recipe: { kind: string }; authorization: { type: string } } }>(
-      await owner!.callTool({ name: "git_write", arguments: arguments_ }));
+
+    const started = structuredJsonOf<{
+      job: { job_id: string; recipe: { kind: string }; authorization: { type: string; source?: string } };
+    }>(await owner!.callTool({ name: "git_write", arguments: writeArguments }));
     expect(started.job.recipe.kind).toBe("git_write");
-    expect(started.job.authorization.type).toBe("git");
+    expect(started.job.authorization).toMatchObject({ type: "git", source: "full_access" });
     expect(runner.runs.size).toBe(before + 1);
-    expect(runner.runs.get(started.job.job_id)?.request.genericCommand?.args).toContain("for-each-ref");
+    expect(runner.runs.get(started.job.job_id)?.request.genericCommand?.args).toContain("safe-task.js");
+    git(workspace.root, "add", "--", "safe-task.js");
     runner.finish(started.job.job_id, 0);
     await waitForState(async () => {
       const status = structuredJsonOf<{ job: { state: string; git_result?: { confirmationScope: string } } }>(
@@ -165,6 +175,62 @@ describe("V1.3 Level 3 over authenticated Streamable HTTP", () => {
     }, "succeeded");
     runner.runs.delete(started.job.job_id);
   }, 30_000);
+
+  it("keeps Level1 Git Write behind the worktree repository approval", async () => {
+    setPermission(workspace.id, "level1");
+    try {
+      const head = git(workspace.root, "rev-parse", "HEAD").trim();
+      const branch = git(workspace.root, "branch", "--show-current").trim();
+      const arguments_ = { repository_path: ".", operation: { kind: "add", paths: ["approval-material.txt"],
+        expectedHead: head, expectedBranch: branch }, timeout_seconds: 30,
+        idempotency_key: "mcp-git-level1-switch-0123456789" };
+      const before = runner.runs.size;
+      expect(jsonOf(await owner!.callTool({ name: "git_write", arguments: arguments_ })))
+        .toMatchObject({ error: "REPOSITORY_POLICY_DENIED", machine_error: "NOT_APPROVED" });
+      expect(runner.runs.size).toBe(before);
+
+      const policy = { allowedOperations: ["add" as const], allowedBranches: [branch], allowedRemotes: [] };
+      const preview = previewGitRepositoryApproval(workspace, ".", policy);
+      approveGitRepository(workspace, ".", { ...policy, localApproval: true }, preview.digest);
+      const started = structuredJsonOf<{
+        job: { job_id: string; authorization: { type: string; source?: string } };
+      }>(await owner!.callTool({ name: "git_write", arguments: arguments_ }));
+      expect(started.job.authorization).toMatchObject({ type: "git", source: "repository_approval" });
+      expect(runner.runs.size).toBe(before + 1);
+      git(workspace.root, "add", "--", "approval-material.txt");
+      runner.finish(started.job.job_id, 0);
+      await waitForState(async () => structuredJsonOf<{ job: { state: string } }>(
+        await owner!.callTool({ name: "execution_status", arguments: { job_id: started.job.job_id } })).job.state,
+      "succeeded");
+      runner.runs.delete(started.job.job_id);
+    } finally {
+      setPermission(workspace.id, "level2");
+    }
+  }, 30_000);
+
+  it("classifies stale Git state and local permission failures without hiding the machine error", async () => {
+    const base = { repository_path: ".", operation: { kind: "switch", name: "main",
+      expectedHead: "0".repeat(40), expectedBranch: "main" }, timeout_seconds: 30,
+      idempotency_key: "mcp-git-stale-state-0123456789" };
+    const stale = jsonOf(await owner!.callTool({ name: "git_write", arguments: base }));
+    expect(stale).toMatchObject({ error: "STATE_CHANGED", machine_error: "EXPECTED_STATE_CHANGED" });
+    expect(runner.runs.size).toBe(0);
+
+    setPermission(workspace.id, "readonly");
+    try {
+      const denied = jsonOf(await owner!.callTool({ name: "git_write", arguments: {
+        ...base,
+        operation: { kind: "switch", name: "main",
+          expectedHead: git(workspace.root, "rev-parse", "HEAD").trim(), expectedBranch: "main" },
+        idempotency_key: "mcp-git-readonly-0123456789",
+      } }));
+      expect(denied.error).toBe("LOCAL_AUTH_REQUIRED");
+      expect(["FULL_ACCESS_REQUIRED", "EXECUTION_PERMISSION_DENIED"]).toContain(denied.machine_error);
+      expect(runner.runs.size).toBe(0);
+    } finally {
+      setPermission(workspace.id, "level2");
+    }
+  });
 
   it.skipIf(process.platform !== "win32")("auto-authorizes safe-development Level 3 requests over MCP without a local approval round-trip", async () => {
     setLevel3Enabled(workspace.id, true, true);

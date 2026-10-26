@@ -4,8 +4,10 @@ import path from "node:path";
 const REQUEST_MAGIC_V5 = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x35, 0x00]); // C2CJOB5\0
 const RESPONSE_MAGIC_V5 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x35, 0x00]); // C2COUT5\0
 const REQUEST_MAGIC_V7 = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x37, 0x00]); // C2CJOB7\0
+const REQUEST_MAGIC_V8 = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x38, 0x00]); // C2CJOB8\0
 const RESPONSE_MAGIC_V7 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x37, 0x00]); // C2COUT7\0
-export const EXECUTION_HELPER_PROTOCOL_VERSION = 7;
+const RESPONSE_MAGIC_V8 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x38, 0x00]); // C2COUT8\0
+export const EXECUTION_HELPER_PROTOCOL_VERSION = 8;
 export const HELPER_CANCEL_BYTE = 0x01;
 export const MAX_HELPER_STRING_BYTES = 128 * 1024;
 export const MAX_HELPER_FRAME_BYTES = 64 * 1024;
@@ -84,6 +86,13 @@ export interface HelperRequest {
   gitEntryHash: string;
   packageJsonHash: string;
   genericCommand?: GenericCommand;
+}
+
+export interface FullAccessGitHelperRequest extends HelperRequest {
+  oauthClientId: string;
+  permissionMode: "level2";
+  sessionGrantFingerprint: string;
+  sessionGrantId: string;
 }
 
 export interface FullAccessHelperRequest {
@@ -316,6 +325,30 @@ export function serializeHelperRequest(request: HelperRequest): Buffer {
   ]);
 }
 
+export function serializeFullAccessGitHelperRequest(request: FullAccessGitHelperRequest): Buffer {
+  if (!request.genericCommand || request.kind !== "package_script" ||
+      !/^[a-f0-9]{12}$/.test(request.tempWorkspaceId) ||
+      !/^[A-Za-z0-9_-]{24,64}$/.test(request.tempJobId) ||
+      typeof request.oauthClientId !== "string" || request.oauthClientId.length < 1 || request.oauthClientId.length > 200 ||
+      request.permissionMode !== "level2" ||
+      !/^[a-f0-9]{64}$/.test(request.sessionGrantFingerprint) ||
+      !/^[a-f0-9]{64}$/.test(request.sessionGrantId)) {
+    throw new TypeError("Invalid Full Access Git execution context");
+  }
+  const base = Buffer.from(serializeHelperRequest(request));
+  REQUEST_MAGIC_V8.copy(base, 0);
+  base.writeUInt16LE(8, 8);
+  return Buffer.concat([
+    base,
+    encodeString(request.tempWorkspaceId),
+    encodeString(request.tempJobId),
+    encodeString(request.oauthClientId),
+    encodeString(request.permissionMode),
+    encodeString(request.sessionGrantFingerprint),
+    encodeString(request.sessionGrantId),
+  ]);
+}
+
 export function serializeFullAccessHelperRequest(request: FullAccessHelperRequest): Buffer {
   if (!Number.isInteger(request.timeoutSeconds) || request.timeoutSeconds < 1 || request.timeoutSeconds > 3600 ||
       request.permissionMode !== "level2" ||
@@ -350,7 +383,7 @@ export function serializeFullAccessHelperRequest(request: FullAccessHelperReques
   }
 
   const fixed = Buffer.alloc(4);
-  fixed.writeUInt16LE(EXECUTION_HELPER_PROTOCOL_VERSION, 0);
+  fixed.writeUInt16LE(7, 0); // host request shape; helper output/artifact framing is v8
   fixed.writeUInt8(3, 2); // host execution context
   fixed.writeUInt8(0, 3); // no package manager
   const tail = Buffer.alloc(8);
@@ -405,7 +438,7 @@ export class HelperOutputDecoder {
   private headerSeen = false;
   private resultSeen = false;
 
-  constructor(private readonly expectedProtocolVersion?: 5 | 7) {}
+  constructor(private readonly expectedProtocolVersion?: 5 | 7 | 8) {}
 
   push(chunk: Buffer): HelperFrame[] {
     if (this.resultSeen && chunk.byteLength > 0) throw new Error("HELPER_PROTOCOL_TRAILING_DATA");
@@ -414,7 +447,8 @@ export class HelperOutputDecoder {
     if (!this.headerSeen) {
       const candidates = this.expectedProtocolVersion === 5 ? [RESPONSE_MAGIC_V5]
         : this.expectedProtocolVersion === 7 ? [RESPONSE_MAGIC_V7]
-          : [RESPONSE_MAGIC_V5, RESPONSE_MAGIC_V7];
+          : this.expectedProtocolVersion === 8 ? [RESPONSE_MAGIC_V8]
+            : [RESPONSE_MAGIC_V5, RESPONSE_MAGIC_V7, RESPONSE_MAGIC_V8];
       const matched = candidates.find((magic) => isPrefix(this.pending, magic));
       if (!matched) throw new Error("HELPER_PROTOCOL_BAD_HEADER");
       if (this.pending.byteLength < matched.byteLength) return frames;

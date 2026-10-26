@@ -98,7 +98,7 @@ function verifiedExecutionHelperPath(): string {
       helperPath?: unknown;
       sha256?: unknown;
     };
-    if (metadata.version !== 2 || metadata.protocolVersion !== 7 ||
+    if (metadata.version !== 2 || metadata.protocolVersion !== 8 ||
         metadata.helperPath !== "build/native/c2c-execution-helper.exe" ||
         typeof metadata.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.sha256)) {
       throw new Error("INVALID_HELPER_METADATA");

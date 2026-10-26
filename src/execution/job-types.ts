@@ -43,7 +43,25 @@ export type FullAccessCommand =
       cwdFileIdentity: string;
     };
 
-export type RepositoryExecutionAuthorization = { type: "level3" | "git"; requestId: string; digest: string };
+export type RepositoryApprovalGitExecutionAuthorization = {
+  type: "git";
+  source?: "repository_approval";
+  requestId: string;
+  digest: string;
+};
+export type FullAccessGitExecutionAuthorization = {
+  type: "git";
+  source: "full_access";
+  permissionMode: "level2";
+  sessionGrantFingerprint: string;
+  sessionGrantId: string;
+  requestId: string;
+  digest: string;
+};
+export type RepositoryExecutionAuthorization =
+  | { type: "level3"; requestId: string; digest: string }
+  | RepositoryApprovalGitExecutionAuthorization
+  | FullAccessGitExecutionAuthorization;
 export type FullAccessExecutionAuthorization = {
   type: "full_access";
   permissionMode: "level2";
@@ -119,6 +137,12 @@ export type ExecutionJob = RepositoryExecutionJob | FullAccessExecutionJob;
 
 export function isFullAccessExecutionJob(job: ExecutionJob): job is FullAccessExecutionJob {
   return job.executionContext === "host" && job.authorization.type === "full_access";
+}
+
+export function isFullAccessGitAuthorization(
+  authorization: ExecutionJob["authorization"],
+): authorization is FullAccessGitExecutionAuthorization {
+  return authorization?.type === "git" && authorization.source === "full_access";
 }
 
 export interface ExecutionStreamMeta {

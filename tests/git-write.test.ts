@@ -13,6 +13,7 @@ import {
 } from "../src/git-write/index.js";
 import { getGitWriteEnvironment, validateGitConfig } from "../src/git-write/security.js";
 import { Workspace } from "../src/workspace/manager.js";
+import { readCurrentSessionGrant, setPermission } from "../src/permission/store.js";
 import { git, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 let previousStateDir: string | undefined;
@@ -264,6 +265,44 @@ describe("Git write planning", () => {
     })).toThrowError(GitWriteError);
   });
 
+  it.skipIf(process.platform !== "win32")("binds the Full Access HTTPS proxy into the plan without inheriting proxy variables", () => {
+    const { workspace, expectedHead } = makeApprovedRepo();
+    setPermission(workspace.id, "level2");
+    const grant = readCurrentSessionGrant(workspace.id);
+    if (!grant) throw new Error("FULL_ACCESS_TEST_GRANT_UNAVAILABLE");
+    const authorization = {
+      source: "full_access" as const,
+      permissionMode: "level2" as const,
+      sessionGrantFingerprint: grant.identityFingerprint,
+      sessionGrantId: grant.grantId,
+    };
+    const operation: GitWriteOperation = {
+      kind: "fetch", remote: "origin", branches: ["main"], expectedHead, expectedBranch: "main",
+    };
+    const names = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+    const previous = new Map(names.map((name) => [name, process.env[name]]));
+    try {
+      for (const name of names) delete process.env[name];
+      process.env.HTTPS_PROXY = "http://proxy.example:8080/";
+      const proxied = planGitWrite(workspace, ".", operation, authorization);
+      expect(proxied.args).toContain("http.proxy=http://proxy.example:8080");
+      expect(proxied.authorization).toEqual(authorization);
+      expect(proxied.environment).not.toHaveProperty("HTTPS_PROXY");
+      expect(proxied.clearEnvironment).toContain("HTTPS_PROXY");
+
+      delete process.env.HTTPS_PROXY;
+      const direct = planGitWrite(workspace, ".", operation, authorization);
+      expect(proxied.digest).not.toBe(direct.digest);
+
+      process.env.HTTPS_PROXY = "http://user:secret@proxy.example:8080";
+      expect(() => planGitWrite(workspace, ".", operation, authorization)).toThrowError(GitWriteError);
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
   it("pins push to the planned HEAD and disables signed and recursive pushes", () => {
     const { root, workspace, expectedHead } = makeApprovedRepo();
     const marker = path.join(root, "gpg-helper-was-called.marker");

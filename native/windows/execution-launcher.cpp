@@ -16,12 +16,13 @@ namespace {
 
 constexpr BYTE kExecutionMagicV5[8] = {'C', '2', 'C', 'J', 'O', 'B', '5', 0};
 constexpr BYTE kExecutionMagicV7[8] = {'C', '2', 'C', 'J', 'O', 'B', '7', 0};
+constexpr BYTE kExecutionMagicV8[8] = {'C', '2', 'C', 'J', 'O', 'B', '8', 0};
 constexpr BYTE kCleanupMagic[8] = {'C', '2', 'C', 'T', 'M', 'P', '1', 0};
 constexpr wchar_t kHelperName[] = L"c2c-execution-helper.exe";
 constexpr wchar_t kLauncherName[] = L"c2c-execution-launcher.exe";
 constexpr wchar_t kMetadataRelative[] = L"..\\..\\dist\\execution\\c2c-execution-helper-integrity.json";
 constexpr char kMetadataPrefix[] =
-    "{\"version\":2,\"protocolVersion\":7,\"helperPath\":\"build/native/c2c-execution-helper.exe\",\"sha256\":\"";
+    "{\"version\":2,\"protocolVersion\":8,\"helperPath\":\"build/native/c2c-execution-helper.exe\",\"sha256\":\"";
 constexpr char kMetadataMiddle[] =
     "\",\"launcherPath\":\"build/native/c2c-execution-launcher.exe\",\"launcherSha256\":\"";
 
@@ -393,7 +394,8 @@ bool PeekProtocolMode(HANDLE input, bool& cleanupMode, DWORD& error) {
         }
         if (received >= sizeof(prefix)) {
             if (std::equal(std::begin(prefix), std::end(prefix), std::begin(kExecutionMagicV5)) ||
-                std::equal(std::begin(prefix), std::end(prefix), std::begin(kExecutionMagicV7))) {
+                std::equal(std::begin(prefix), std::end(prefix), std::begin(kExecutionMagicV7)) ||
+                std::equal(std::begin(prefix), std::end(prefix), std::begin(kExecutionMagicV8))) {
                 cleanupMode = false;
                 return true;
             }

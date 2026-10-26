@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { TrustedCommand } from "./trusted-registry.js";
 import type { RepositoryIdentity } from "./repository-identity.js";
 import type { FullAccessHelperRequest, GenericCommand, HelperRequest, HelperResultFrame } from "./helper-protocol.js";
-import { EXECUTION_HELPER_PROTOCOL_VERSION, HelperOutputDecoder, HELPER_CANCEL_BYTE, serializeFullAccessHelperRequest, serializeHelperRequest } from "./helper-protocol.js";
+import { EXECUTION_HELPER_PROTOCOL_VERSION, HelperOutputDecoder, HELPER_CANCEL_BYTE, serializeFullAccessGitHelperRequest, serializeFullAccessHelperRequest, serializeHelperRequest } from "./helper-protocol.js";
 import type { FullAccessCommand, OutputStream } from "./job-types.js";
 import { redact } from "../logger/index.js";
 import type { ExecutionTempLease } from "./execution-temp.js";
@@ -60,11 +60,26 @@ export interface FullAccessNativeLaunch {
   command: FullAccessCommand;
 }
 
+export interface FullAccessGitNativeLaunch {
+  oauthClientId: string;
+  permissionMode: "level2";
+  sessionGrantFingerprint: string;
+  sessionGrantId: string;
+}
+
 export type NativeRunnerRequest = NativeRunnerBaseRequest & (
   | {
       repository: RepositoryIdentity;
       trustedCommand: TrustedCommand;
       genericCommand?: GenericCommand;
+      fullAccessGit?: never;
+      fullAccess?: never;
+    }
+  | {
+      repository: RepositoryIdentity;
+      trustedCommand: TrustedCommand;
+      genericCommand: GenericCommand;
+      fullAccessGit: FullAccessGitNativeLaunch;
       fullAccess?: never;
     }
   | {
@@ -202,10 +217,12 @@ export class WindowsNativeExecutionRunner {
       moduleDirectory: this.options.moduleDirectory,
     });
     const fullAccess = "fullAccess" in request ? request.fullAccess : undefined;
+    const fullAccessGit = "fullAccessGit" in request ? request.fullAccessGit : undefined;
     const legacyRequest = fullAccess ? undefined : request as NativeRunnerBaseRequest & {
       repository: RepositoryIdentity;
       trustedCommand: TrustedCommand;
       genericCommand?: GenericCommand;
+      fullAccessGit?: FullAccessGitNativeLaunch;
     };
     const runtime = legacyRequest
       ? (this.options.runtimeResolver ?? resolveTrustedRuntime)(legacyRequest.trustedCommand.packageManager)
@@ -269,7 +286,7 @@ export class WindowsNativeExecutionRunner {
       const trusted = legacy.trustedCommand;
       const repository = legacy.repository;
       const trustedRuntime = runtime!;
-      input = serializeHelperRequest({
+      const helperRequest: HelperRequest = {
         packageManager: trusted.packageManager,
         kind: trusted.kind,
         timeoutSeconds: request.timeoutSeconds,
@@ -317,7 +334,18 @@ export class WindowsNativeExecutionRunner {
         gitEntryHash: repository.gitEntryHash,
         packageJsonHash: legacy.genericCommand?.approvalManifestHash ?? trusted.packageJsonHash,
         genericCommand: legacy.genericCommand,
-      });
+      };
+      if (fullAccessGit && !legacy.genericCommand) throw new Error("FULL_ACCESS_GIT_PLAN_REQUIRED");
+      input = fullAccessGit
+        ? serializeFullAccessGitHelperRequest({
+            ...helperRequest,
+            genericCommand: legacy.genericCommand!,
+            oauthClientId: fullAccessGit.oauthClientId,
+            permissionMode: fullAccessGit.permissionMode,
+            sessionGrantFingerprint: fullAccessGit.sessionGrantFingerprint,
+            sessionGrantId: fullAccessGit.sessionGrantId,
+          })
+        : serializeHelperRequest(helperRequest);
       }
       child = spawnImpl(launcherPath, [], {
         cwd: path.dirname(launcherPath),

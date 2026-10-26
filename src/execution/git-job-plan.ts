@@ -6,7 +6,12 @@ import { resolveTrustedRuntime } from "./runtime-discovery.js";
 import { readFileMaterial } from "../git-write/security.js";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import type { Workspace } from "../workspace/manager.js";
-import { planGitWrite, type GitWriteOperation, type GitWritePlan } from "../git-write/index.js";
+import {
+  planGitWrite,
+  type GitWriteOperation,
+  type GitWritePlan,
+  type GitWritePlanAuthorization,
+} from "../git-write/index.js";
 import type { GenericCommand } from "./helper-protocol.js";
 import type { ExecutionJob } from "./job-types.js";
 import { archiveRecord, readArchivedRecord, jobCanBeArchived } from "./record-archive.js";
@@ -38,8 +43,26 @@ function readPlan(workspace: Workspace, requestId: string, digest: string): { pl
 export function archiveGitJobPlan(workspace: Workspace, job: ExecutionJob): void {
   if (job.workspaceId !== workspace.id || job.authorization?.type !== "git" || !jobCanBeArchived(job)) return;
   const { requestId, digest } = job.authorization;
+  const expectedAuthorization = job.authorization?.type === "git"
+    ? job.authorization.source === "full_access"
+      ? {
+          source: "full_access" as const,
+          permissionMode: job.authorization.permissionMode,
+          sessionGrantFingerprint: job.authorization.sessionGrantFingerprint,
+          sessionGrantId: job.authorization.sessionGrantId,
+        }
+      : { source: "repository_approval" as const }
+    : undefined;
   const original = readPlan(workspace, requestId, digest);
   if (!fs.existsSync(original.file)) return;
+  if (expectedAuthorization?.source === "full_access" &&
+      (!original.plan.authorization || original.plan.authorization.source !== "full_access" ||
+       original.plan.authorization.sessionGrantFingerprint !== expectedAuthorization.sessionGrantFingerprint ||
+       original.plan.authorization.sessionGrantId !== expectedAuthorization.sessionGrantId)) {
+    throw new Error("V13_AUTHORIZATION_DENIED");
+  }
+  if (expectedAuthorization?.source === "repository_approval" &&
+      original.plan.authorization?.source === "full_access") throw new Error("V13_AUTHORIZATION_DENIED");
   if (original.plan.repository.identity !== job.repositoryIdentity) throw new Error("V13_AUTHORIZATION_DENIED");
   archiveRecord(path.dirname(original.file), "git-plans", requestId, { digest, plan: original.plan });
   const archive = path.join(path.dirname(original.file), ".archive", "git-plans", requestId.slice(0, 2), `${requestId}.material.json`);
@@ -51,7 +74,12 @@ export function archiveGitJobPlan(workspace: Workspace, job: ExecutionJob): void
   fs.renameSync(original.file, archive);
 }
 
-export function createGitJobPlan(workspace: Workspace, repositoryPath: string, operation: GitWriteOperation) {
+export function createGitJobPlan(
+  workspace: Workspace,
+  repositoryPath: string,
+  operation: GitWriteOperation,
+  authorization?: GitWritePlanAuthorization,
+) {
   const requestId = randomBytes(24).toString("base64url");
   const file = filePath(workspace.id, requestId);
   const lock = path.join(path.dirname(file), "plans.lock");
@@ -69,7 +97,7 @@ export function createGitJobPlan(workspace: Workspace, repositoryPath: string, o
         if (++count >= MAX_GIT_JOB_PLANS) throw new Error("GIT_PLAN_STORE_FULL");
       }
     } finally { directory.closeSync(); }
-    const plan = planGitWrite(workspace, repositoryPath, operation);
+    const plan = planGitWrite(workspace, repositoryPath, operation, authorization);
     const bytes = Buffer.from(JSON.stringify(plan));
     if (bytes.length > MAX_GIT_PLAN_BYTES) throw new Error("INVALID_ARGUMENTS");
     fs.writeFileSync(file, bytes, { flag: "wx", mode: 0o600 });
@@ -82,14 +110,53 @@ export function createGitJobPlan(workspace: Workspace, repositoryPath: string, o
   }
 }
 
-export function readGitJobPlan(workspace: Workspace, requestId: string, digest: string): GitWritePlan {
-  return readPlan(workspace, requestId, digest).plan;
+export function readGitJobPlan(
+  workspace: Workspace,
+  requestId: string,
+  digest: string,
+  expectedAuthorization?: GitWritePlanAuthorization,
+): GitWritePlan {
+  const plan = readPlan(workspace, requestId, digest).plan;
+  if (expectedAuthorization?.source === "full_access") {
+    if (!plan.authorization || plan.authorization.source !== "full_access" ||
+        plan.authorization.permissionMode !== expectedAuthorization.permissionMode ||
+        plan.authorization.sessionGrantFingerprint !== expectedAuthorization.sessionGrantFingerprint ||
+        plan.authorization.sessionGrantId !== expectedAuthorization.sessionGrantId) {
+      throw new Error("V13_AUTHORIZATION_DENIED");
+    }
+  } else if (expectedAuthorization?.source === "repository_approval" &&
+      plan.authorization?.source === "full_access") {
+    throw new Error("V13_AUTHORIZATION_DENIED");
+  }
+  return plan;
 }
 
-export function resolveGitJobPlan(workspace: Workspace, requestId: string, digest: string) {
+export function resolveGitJobPlan(
+  workspace: Workspace,
+  requestId: string,
+  digest: string,
+  expectedAuthorization?: GitWritePlanAuthorization,
+) {
   const original = readPlan(workspace, requestId, digest);
   if (original.identity === "0:0") throw new Error("V13_AUTHORIZATION_DENIED");
-  const plan = planGitWrite(workspace, original.plan.repository.workspaceRelativePath, original.plan.operation);
+  const storedAuthorization = original.plan.authorization;
+  if (expectedAuthorization?.source === "full_access") {
+    if (!storedAuthorization || storedAuthorization.source !== "full_access" ||
+        storedAuthorization.permissionMode !== expectedAuthorization.permissionMode ||
+        storedAuthorization.sessionGrantFingerprint !== expectedAuthorization.sessionGrantFingerprint ||
+        storedAuthorization.sessionGrantId !== expectedAuthorization.sessionGrantId) {
+      throw new Error("V13_AUTHORIZATION_DENIED");
+    }
+  } else if (expectedAuthorization?.source === "repository_approval" &&
+      storedAuthorization?.source === "full_access") {
+    throw new Error("V13_AUTHORIZATION_DENIED");
+  }
+  const plan = planGitWrite(
+    workspace,
+    original.plan.repository.workspaceRelativePath,
+    original.plan.operation,
+    storedAuthorization,
+  );
   if (plan.digest !== original.plan.digest) throw new Error("V13_AUTHORIZATION_DENIED");
   const executable = plan.materials.find((material) => material.path.toLowerCase() === plan.executable.toLowerCase());
   if (!executable) throw new Error("V13_AUTHORIZATION_DENIED");

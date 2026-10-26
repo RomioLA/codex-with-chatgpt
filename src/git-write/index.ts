@@ -28,6 +28,7 @@ export type {
   GitWriteOperation,
   GitWriteOperationKind,
   GitWritePlan,
+  GitWritePlanAuthorization,
   GitWriteRemoteBinding,
   GitWriteStateSnapshot,
 } from "./types.js";

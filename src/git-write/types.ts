@@ -58,6 +58,15 @@ export interface GitWriteRemoteBinding {
   url: string;
 }
 
+export type GitWritePlanAuthorization =
+  | { source: "repository_approval" }
+  | {
+      source: "full_access";
+      permissionMode: "level2";
+      sessionGrantFingerprint: string;
+      sessionGrantId: string;
+    };
+
 export interface GitWritePlan {
   commitBinding?: { tree: string; parent: string | null; branch: string };
   switchBinding?: { head: string };
@@ -76,6 +85,8 @@ export interface GitWritePlan {
   /** State inputs included in the plan digest but not held open during execution. */
   snapshotMaterials: GitWriteMaterial[];
   operation: GitWriteOperation;
+  /** Present on plans created after authorization-source binding was added. */
+  authorization?: GitWritePlanAuthorization;
   remoteBinding: GitWriteRemoteBinding | null;
   credentialHelper: GitWriteMaterial | null;
 }
