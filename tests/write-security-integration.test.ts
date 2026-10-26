@@ -221,14 +221,30 @@ describe("real OAuth -> MCP -> local permission -> filesystem safety", () => {
     await call(client, "delete_file", { path: ".", expected_hash: hash("") }, "NOT_A_FILE");
     expect(fs.readFileSync(external, "utf8")).toBe("keep external");
     expect(fs.readFileSync(internal, "utf8")).toBe("keep workspace");
-    for (const endpoint of ["/admin/permission", "/admin/set-permission"]) {
-      const response = await fetch(`${bridge.localBaseUrl()}${endpoint}`, {
-        method: "POST", headers: { authorization: `Bearer ${bridge.adminToken}`, "content-type": "application/json" },
-        body: JSON.stringify({ mode: "level1" }),
-      });
-      expect(response.status).toBe(404);
-    }
+    const missingAdminToken = await fetch(bridge.localBaseUrl() + "/admin/permission", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "1" }),
+    });
+    expect(missingAdminToken.status).toBe(404);
     expect(readPermission(bridge.workspace.id)).toBe("level2");
+
+    const localAuthority = await fetch(bridge.localBaseUrl() + "/admin/permission", {
+      method: "POST", headers: { authorization: "Bearer " + bridge.adminToken, "content-type": "application/json" },
+      body: JSON.stringify({ mode: "1" }),
+    });
+    expect(localAuthority.status).toBe(200);
+    expect(await localAuthority.json()).toMatchObject({
+      workspaceId: bridge.workspace.id,
+      baselineMode: "level1",
+      effectiveMode: "level1",
+    });
+    expect(readPermission(bridge.workspace.id)).toBe("level1");
+
+    const legacyEndpoint = await fetch(bridge.localBaseUrl() + "/admin/set-permission", {
+      method: "POST", headers: { authorization: "Bearer " + bridge.adminToken, "content-type": "application/json" },
+      body: JSON.stringify({ mode: "level1" }),
+    });
+    expect(legacyEndpoint.status).toBe(404);
   });
 
   const operations = ["create_file", "replace_file", "edit_file", "move_file", "delete_file", "create_directory",

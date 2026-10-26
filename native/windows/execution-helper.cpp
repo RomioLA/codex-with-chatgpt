@@ -2960,6 +2960,23 @@ bool BuildCommandLine(const Request& request, const ChildEnvironment& environmen
             commandLine.push_back(L'\0');
             return true;
         }
+        if (request.genericMode == 1 &&
+            IsBasename(request.genericExecutable, L"cmd.exe") &&
+            request.genericArguments.size() == 3 &&
+            SameOrdinal(request.genericArguments[0], L"/d") &&
+            SameOrdinal(request.genericArguments[1], L"/c")) {
+            // /C consumes one command-text argument; do not CRT-quote it or
+            // join separate argv items into a new CMD command string.
+            std::wstring command = QuoteWindowsArgument(request.genericExecutable) +
+                L" /D /C " + request.genericArguments[2];
+            if (command.size() >= 32766) {
+                error = ERROR_FILENAME_EXCED_RANGE;
+                return false;
+            }
+            commandLine.assign(command.begin(), command.end());
+            commandLine.push_back(L'\0');
+            return true;
+        }
         arguments.push_back(request.genericExecutable);
         if (request.genericMode == 1) {
             arguments.insert(arguments.end(), request.genericArguments.begin(),

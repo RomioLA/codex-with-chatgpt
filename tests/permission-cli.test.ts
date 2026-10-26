@@ -46,6 +46,7 @@ describe("local permission CLI", () => {
       baselineMode: "readonly",
       effectiveMode: "readonly",
       sessionElevation: { active: false, expiresOn: null },
+      source: "local",
     });
 
     for (const [arg, mode, baselineMode] of [["readonly", "readonly", "readonly"], ["1", "level1", "level1"]]) {
@@ -177,14 +178,39 @@ describe("local permission CLI", () => {
       const requestedElevation = setPermission(bridge.workspace.id, "level2");
       expect((await info()).permissionMode).toBe(requestedElevation);
 
-      for (const endpoint of ["/admin/permission", "/admin/set-permission"]) {
-        const response = await fetch(`${bridge.localBaseUrl()}${endpoint}`, {
+      for (const authorization of [undefined, "Bearer invalid"]) {
+        const unauthorized = await fetch(`${bridge.localBaseUrl()}/admin/permission`, {
           method: "POST",
-          headers: { ...headers, "content-type": "application/json" },
-          body: JSON.stringify({ mode: "level2" }),
+          headers: {
+            "content-type": "application/json",
+            ...(authorization === undefined ? {} : { authorization }),
+          },
+          body: JSON.stringify({ mode: "1" }),
         });
-        expect(response.status).toBe(404);
+        expect(unauthorized.status).toBe(404);
+        expect(readPermission(bridge.workspace.id)).toBe(requestedElevation);
       }
+
+      const controlled = await fetch(`${bridge.localBaseUrl()}/admin/permission`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ mode: "1" }),
+      });
+      expect(controlled.status).toBe(200);
+      expect(await controlled.json()).toMatchObject({
+        workspaceId: bridge.workspace.id,
+        baselineMode: "level1",
+        effectiveMode: "level1",
+        sessionElevation: { active: false, expiresOn: null },
+      });
+      expect((await info()).permissionMode).toBe("level1");
+
+      const legacyEndpoint = await fetch(`${bridge.localBaseUrl()}/admin/set-permission`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ mode: "1" }),
+      });
+      expect(legacyEndpoint.status).toBe(404);
     } finally {
       await bridge.close();
       if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
