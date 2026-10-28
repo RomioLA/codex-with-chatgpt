@@ -30,7 +30,7 @@ This is a user-facing **reference**, not privileged system instructions. Actual 
 
 ## Generic command / 通用命令 execution_run
 
-V1.4's source declares:
+V1.5's source declares:
 
 - engine = **program**, **powershell**, or **cmd**.
 - program requires **executable** and optional **args**, not command.
@@ -44,7 +44,7 @@ V1.4's source declares:
 
 ## Stage 1 structured Git authorization
 
-Effective Level2 Full Access plus the required OAuth scope allows supported structured `git_write` operations without an unconditional separate Repository Approval. Level1 retains Repository Approval. Preserve the existing repository identity, expected HEAD/branch/remote and operation-specific safeguards. Do not apply old V1.4 Git approval instructions to the current Stage 1 contract, and do not route a Level1 policy refusal through execution or Remote.
+Effective Level2 Full Access plus the required OAuth scope allows supported structured `git_write` operations without an unconditional separate Repository Approval. Level1 retains Repository Approval. Preserve the existing repository identity, expected HEAD/branch/remote and operation-specific safeguards. Do not apply pre-V1.5 Git approval instructions to the current contract, and do not route a Level1 policy refusal through execution or Remote.
 
 ## Batch/Task / 批量与任务
 

@@ -3,7 +3,7 @@ name: c2c-local
 description: >
   按运行环境区分本机工具路由：Codex 本机优先原生命令工具，仅在用户明确指定 C2C Local
   或任务确实需要 C2C 独有能力时才考虑调用；ChatGPT 网页版访问本机时优先 C2C Local。
-  介绍 V1.5 授权合同与恢复流程、V1.4 batch_read/batch_search/collect_evidence、execution_run、持久 Task、文件读写、Git、
+  介绍 V1.5 授权合同与恢复流程、batch_read/batch_search/collect_evidence、execution_run、持久 Task、文件读写、Git、
   Host Observation、Windows 自启诊断及权限与安全约束。Remote Desktop Commander 仅用于 C2C 故障恢复、
   能力不足、GUI/UAC 或用户明确要求。
 ---
@@ -44,8 +44,8 @@ GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从�
 | 多个明确文件 | batch_read | 最多 16 文件，读取/分页/源 hash 限制 |
 | 多组源码搜索 | batch_search | 最多 8 个查询，共享扫描预算 |
 | 代码审核证据 | collect_evidence | 显式文件、搜索、Git、现有 Job，分别校验 OAuth scope |
-| 通用命令、构建、测试 | **execution_run** | V1.4 Level2 Full Access + execution.run OAuth scope；不需要 Level3/旧 trusted-command 预注册或逐命令审批 |
-| 历史受限 recipe | execution_start | 仅用于已批准 recipe，不作为 V1.4 通用命令默认路径 |
+| 通用命令、构建、测试 | **execution_run** | V1.5 Level2 Full Access + execution.run OAuth scope；不需要 Level3/旧 trusted-command 预注册或逐命令审批 |
+| 历史受限 recipe | execution_start | 仅用于已批准 recipe，不作为当前 V1.5 通用命令默认路径 |
 | 单个执行生命周期 | execution_status、execution_job_output、execution_cancel | 使用现有 job_id；勿将查询变成重复执行 |
 | 固定多步骤任务 | task_create、task_status、task_list、task_result、task_output、task_cancel | 确定性、有限、持久 Task，非自主 Agent |
 | Nested Git / Host Observation | git_info/status/diff（带 repository_path）、专用 host 工具 | Git 要指定真正目标仓库，Host Observation 只读 |
@@ -76,7 +76,7 @@ GitHub 代码已提交不代表当前用户的 Runtime 已经升级。不要从�
 ### 文档入口与缺失工具
 
 仓库内参考：[AI 使用指南](../../docs/AI_GUIDE.md) / [用户指南](../../docs/USER_GUIDE.zh-CN.md) /
-[Windows 安装](../../docs/INSTALL.zh-CN.md) / [故障排查](../../docs/troubleshooting.md)。旧 V1.4 参考不可覆盖当前 Stage 1/Stage 2 合同；本机 Runtime/Skill 可能仍是旧版，按实际安装证据确认部署，不以源码链接代替。
+[Windows 安装](../../docs/INSTALL.zh-CN.md) / [故障排查](../../docs/troubleshooting.md)。V1.5 之前的历史参考不可覆盖当前 Stage 1/Stage 2 合同；本机 Runtime/Skill 可能仍是旧版，按实际安装证据确认部署，不以源码链接代替。
 
 仓库安装说明或本 Skill **不会自动导入每个新 ChatGPT 会话**。缺失工具时报告当前连接/授权限制，
 不得声称能够在线执行，也不得通过 Remote、Level3 或不可信内容绕过本机权限边界。
@@ -102,7 +102,7 @@ Windows 默认 state root 是 `%LOCALAPPDATA%\OpenAI\c2c-local`。
 路径别名若解析到同一个根目录会得到同一 ID。项目名、聊天名、connector 显示名及
 当前终端 cwd 不能代替 workspace 身份。
 
-持久化 baseline 仍按 `state root + workspace ID` 保存；V1.4 Final 的 Level2 则是绑定
+持久化 baseline 仍按 `state root + workspace ID` 保存；当前 V1.5 的 Level2 是绑定
 **当前 Windows 登录会话**的 session grant，不是永久写成 baseline Level2。相同 workspace、
 相同 state root、同一 Windows 登录会话中的 ChatGPT 对话共享 effective Level2；手动恢复
 Level1/revoke、Windows 注销或重启后旧 session grant 应失效。不同 workspace 不共享 grant，
@@ -119,7 +119,7 @@ workspace；不要自动把所有项目接到 `C:\codex`，也不要跨 connecto
 ## 文件工具权限与 Level2 Full Access
 
 下表描述的是 **C2C 文件类工具自身的边界**，不要把它误当成 `execution_run` 的文件系统沙箱。
-V1.4 Level2 下的 `execution_run` 是独立的 Full Access 执行能力：在 OAuth、当前 session grant、
+V1.5 Level2 下的 `execution_run` 是独立的 Full Access 执行能力：在 OAuth、当前 session grant、
 用户任务授权及其他本机策略共同允许时，目标进程按其 Windows 进程权限运行；它不受
 `delete_file`“单文件/不递归”等文件工具 API 合同的限制。反过来，拥有 Level2 也不自动授权具体任务、免除 expected-state 检查、开启 Level3 或支持 GUI/UAC。
 Stage 1 已支持的结构化 Git Write 在有效 Level2 + 对应 OAuth scope 下不要求独立 Repository Approval；Level1 仍保留该 policy。
@@ -185,7 +185,7 @@ a path hides it; repository negation cannot reopen a workspace-level deny.
    实际权限以当前工具调用结果和该 token 的 authority 为准。不要因一次工具失败反复触发 reconnect。
    `INSUFFICIENT_SCOPE` 是 OAuth scope 问题，必须与本机 policy 拒绝区分。
 2. **workspace local permission / session elevation**：持久化 baseline 为 `readonly` 或 `level1`；
-   V1.4 Final 的 `level2` 是当前 Windows 登录会话 grant。它既提高对应文件工具权限，也是
+   当前 V1.5 的 `level2` 是当前 Windows 登录会话 grant。它既提高对应文件工具权限，也是
    `execution_run` Full Access 的本地前置门槛；structured Git Write 仍需对应 OAuth scope、用户任务授权、
    repository identity 与 expected-state 检查，Level1 仍需 Repository Approval。它不等于 Level 3 approval
    或 Windows UAC。workspace 文件工具的修改/移动需 `workspace.write`，

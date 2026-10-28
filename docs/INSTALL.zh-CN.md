@@ -1,6 +1,6 @@
-# C2C Local V1.4 — Windows 安装指南
+# C2C Local V1.5 — Windows 安装指南
 
-> 面向 Windows x64 从源码试用 V1.4 的新用户。本分支是开发版本，尚不能把维护者的本机 staged Runtime 视为可公开下载安装的发行包。
+> 面向 Windows x64 从源码使用 V1.5 的新用户。V1.5 已发布到默认 `main`，源码标签为 `v1.5.0`；目前仍是源码构建路径，不应把维护者本机 Runtime 目录当成公开一键安装包。
 
 ## 环境要求
 
@@ -22,12 +22,12 @@ cloudflared --version
 
 不要下载来源不明的原生可执行文件。
 
-## 获取 V1.4 并构建
+## 获取 V1.5 并构建
 
-**默认 main 尚未包含这一版说明与完整 V1.4 功能；必须克隆指定分支：**
+默认 `main` 已包含 V1.5，实现与后续文档修订都从这里获取：
 
 ~~~powershell
-git clone --branch feat/20261018-c2c-v14-native-workflow --single-branch https://github.com/RomioLA/codex-with-chatgpt.git
+git clone https://github.com/RomioLA/codex-with-chatgpt.git
 cd codex-with-chatgpt
 corepack pnpm install
 corepack pnpm build
@@ -36,7 +36,7 @@ node .\bin\c2c.js --help
 
 如果构建提示找不到 cl.exe、vswhere 或 Windows SDK，先安装/修复 Visual Studio C++ Build Tools。此处采用 **RomioLA** fork，不要误用 XiaoDuoYa 上游。
 
-## 可选：让 Codex 新对话识别 V1.4 Skill
+## 可选：让 Codex 新对话识别当前 V1.5 Skill
 
 **源码仓库内有 Skill 文件，不代表 Codex 已自动安装。** 需要让本机 Codex 在其他项目中也能找到它，可在当前 C2C 仓库源码根目录执行：
 
@@ -46,7 +46,7 @@ New-Item -ItemType Directory -Path $skillRoot -Force | Out-Null
 Copy-Item -LiteralPath '.\skills\c2c-local' -Destination $skillRoot -Recurse -Force
 ~~~
 
-应包含完整的 SKILL.md 及 references 目录。Codex 的用户级 Skill 位置为 $HOME\.agents\skills；如未显示，可重新打开 Codex。不要安装旧的 skill/SKILL.md 代替当前 V1.4 Skill。**此步骤只帮助 Codex 选择工具，不会自动配置 ChatGPT 连接器或授予权限。**
+应包含完整的 SKILL.md 及 references 目录。Codex 的用户级 Skill 位置为 $HOME\.agents\skills；如未显示，可重新打开 Codex。不要安装旧的 skill/SKILL.md 代替当前 V1.5 Skill。**此步骤只帮助 Codex 选择工具，不会自动配置 ChatGPT 连接器或授予权限。**
 
 ## 第一次连接
 
@@ -69,7 +69,7 @@ node .\bin\c2c.js permission status -w 'C:\Projects' --json
 node .\bin\c2c.js permission 1 -w 'C:\Projects' --json
 ~~~
 
-readonly 只读，level1 允许受限文件修改；level2 为当前 Windows 登录会话的额外授权，重启回落到持久基线。V1.4 通用命令 execution_run 需要 **Level2 Full Access + execution.run OAuth scope**；它不要求 Level3 或逐命令 trusted-command 审批，但仍要遵守用户授权和安全边界。不要安装时默认启用高权限。
+readonly 只读，level1 允许受限文件修改；Level2 是当前 Windows 登录会话的临时提升，注销或重启后回落到持久基线。V1.5 通用命令 `execution_run` 需要 **Level2 Full Access + execution.run OAuth scope + 用户任务授权**；它不要求 Level3 或逐命令 trusted-command 审批。V1.5 的结构化 Git Write 在有效 Level2 下也不再无条件要求独立 Repository Approval，而 Level1 仍保留该策略门。不要安装时默认启用高权限。
 
 对长期使用的 Named Tunnel，可选择在本机启用登录自启：
 

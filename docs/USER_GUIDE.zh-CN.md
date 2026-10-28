@@ -1,4 +1,4 @@
-# C2C Local V1.4 用户使用指南
+# C2C Local V1.5 用户使用指南
 
 [安装](INSTALL.zh-CN.md) · [AI 工具指南](AI_GUIDE.md) · [故障排查](troubleshooting.md)
 
@@ -8,7 +8,7 @@
 
 ChatGPT 应先调用 **workspace_info** 核实工作区身份；权限相关操作再调用 **permission_status**。当一个工作区包含多个仓库时，Git 工具要传 workspace 相对的 repository_path，不能把工作区根目录误认为仓库。
 
-## V1.4 常用工具
+## V1.5 常用工具
 
 | 需求 | 工具 |
 | --- | --- |
@@ -19,9 +19,9 @@ ChatGPT 应先调用 **workspace_info** 核实工作区身份；权限相关操�
 | 查询单条命令 | execution_status / execution_job_output / execution_cancel |
 | 执行固定多步计划 | task_create / task_status / task_list / task_result / task_output / task_cancel |
 
-**通用命令优先 execution_run**。旧 execution_start 面向预注册、受限 package recipe；不要将它的审批前置条件套到 V1.4 execution_run 上。
+**通用命令优先 execution_run**。旧 execution_start 面向预注册、受限 package recipe；不要将它的审批前置条件套到 V1.5 execution_run 上。
 
-execution_run 需要当前的 **Level2 Full Access + execution.run OAuth scope**；Level2 仅在当前 Windows 登录会话有效，重启后恢复到持久基线。它不需要 Level3 逐命令审批，但绝不是无限制远程 shell；仍受用户授权、权限和运行安全策略约束。
+execution_run 需要当前的 **Level2 Full Access + execution.run OAuth scope + 用户任务授权**；Level2 仅在当前 Windows 登录会话有效，注销或重启后恢复到持久基线。它不需要 Level3 逐命令审批，但绝不是无限制远程 shell。有效 Level2 下，受支持的结构化 `git_write` 也不再无条件要求独立 Repository Approval；Level1 仍保留该策略门。repository identity、expected-state、OAuth scope 与具体操作策略仍然有效。
 
 ## 持久 Task 不会自己决策
 
@@ -30,7 +30,8 @@ Task 创建后步骤固定；执行器不会调用模型、增添步骤或自动
 ## 排障
 
 - 工具不可见：检查当前 ChatGPT 连接器与正式 Runtime，GitHub 源码更新不代表运行中的旧 Runtime 自动更新。
-- 执行权限不足：区分 OAuth scope 与本机 permission mode，不要自动提升权限、启用 Level3 或改用其他工具绕过门禁。
+- 执行权限不足：区分 OAuth scope、本机 permission mode 与操作级 policy；不要自动提升权限、启用 Level3 或改用其他工具绕过门禁。
+- Level1 Git Write 返回 `NOT_APPROVED` / `REPOSITORY_POLICY_DENIED`：这是策略拒绝，不是连接故障。若用户明确需要 Level2 操作，应由本机用户切换 Level2 后重新读取 permission_status，再原样重试；Web/MCP 不得自行提权。
 - 连接中断：先用本机 status 观察，再按需要 restore；Named Tunnel 正常恢复通常不需要重配对。
 - /health 或 Bridge 进程正常只说明局部存活；**实际调用 C2C 工具成功**才能确认完整连接。
 - Windows 自启是当前用户登录触发，DNS 刚恢复时可能有延迟。

@@ -25,7 +25,7 @@ session grant 失效；若 logout/reboot 尚未真机验收，应标 PENDING。
 `execution_status`、`execution_list`、`execution_job_output` 和 `execution_cancel` 分别用于 job
 状态、列表、清理后的输出及取消；它们受各自 OAuth scope、job ownership 和本机 execution 状态约束。
 
-Stage 1 已改变结构化 Git Write 授权合同：有效 Level2 Full Access 加上正确 OAuth scope、用户任务授权和该操作支持的 identity/expected-state 校验后，不再无条件要求独立 Repository Approval。Level1 仍保留 Repository Approval。不要把旧 V1.4 文档或历史 `NOT_APPROVED` 样例当成当前通用合同；按实际工具结果及当前部署版本判断。若当前 Level1 的 Git policy 返回 `NOT_APPROVED`，表示请求已到达 C2C 并被策略拒绝，不是 OAuth 或传输故障；不得通过 `execution_run`、Remote 或提权绕过。
+Stage 1 已改变结构化 Git Write 授权合同：有效 Level2 Full Access 加上正确 OAuth scope、用户任务授权和该操作支持的 identity/expected-state 校验后，不再无条件要求独立 Repository Approval。Level1 仍保留 Repository Approval。不要把 V1.5 之前的 Git approval 说明或历史 `NOT_APPROVED` 样例当成当前通用合同；按实际工具结果及当前部署版本判断。若当前 Level1 的 Git policy 返回 `NOT_APPROVED`，表示请求已到达 C2C 并被策略拒绝，不是 OAuth 或传输故障；不得通过 `execution_run`、Remote 或提权绕过。
 
 Level 3 默认关闭。`LEVEL3_DISABLED` 表示 `execution.level3` 请求已经到达 C2C，但本机 Level 3 capability
 当前关闭；它不是 OAuth scope 不足、MCP 网络错误或 ChatGPT 安全层拦截。只有本机用户明确选择开启后，

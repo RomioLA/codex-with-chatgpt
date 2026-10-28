@@ -1,4 +1,4 @@
-# C2C Local — V1.4
+# C2C Local — V1.5
 
 > Connect ChatGPT to a user-authorized local workspace to inspect code, Git, files and host diagnostics, and to perform permission-gated edits and generic local execution.  
 > Maintained by [RomioLA](https://github.com/RomioLA), based on [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt). **Unofficial community project, not affiliated with OpenAI.**
@@ -7,9 +7,9 @@
 
 ## Version status
 
-This README describes the **V1.4 feature branch feat/20261018-c2c-v14-native-workflow**, **not** the repository's default main branch. The maintainer's Windows Runtime has been exercised locally, but that is **not** a claim of a publicly released, validated one-click installer. New users should follow the [source-build installation guide](docs/INSTALL.md).
+**V1.5 is released.** The default `main` branch contains the V1.5 implementation, and the source release is tagged **v1.5.0**. The maintainer's Windows Production Runtime and real ChatGPT online path have been validated for the release, but that is **not** a claim that a tested one-click public installer exists for every new machine. New users should follow the [source-build installation guide](docs/INSTALL.md).
 
-## What V1.4 does
+## What V1.5 does
 
 | Area | Capability |
 | --- | --- |
@@ -23,7 +23,7 @@ This README describes the **V1.4 feature branch feat/20261018-c2c-v14-native-wor
 | Persistent workflow | **task_create/status/list/result/output/cancel** — fixed, deterministic tasks with checkpoints and recovery |
 | Recovery | OAuth-protected MCP, Cloudflare Tunnel, Windows user-logon autostart |
 
-**Use execution_run for generic V1.4 command execution** when a valid Level2 Full Access session grant, execution.run OAuth scope and user authorization are present. It does **not** require the previous execution_start trusted-command recipe registry or Level3 per-command approval. Other security policies still apply.
+**Use execution_run for generic V1.5 command execution** when a valid Level2 Full Access session grant, execution.run OAuth scope and user authorization are present. It does **not** require the previous execution_start trusted-command recipe registry or Level3 per-command approval. V1.5 structured Git Write also no longer requires an unconditional separate Repository Approval when the effective mode is Level2; Level1 retains that policy gate. Repository identity, expected state, OAuth scopes and user authorization still apply.
 
 **Tasks are not autonomous agents.** Plans are finite and immutable; C2C does not invoke an LLM to extend them. WAITING_FOR_MODEL and uncertain side effects must not trigger automatic replay of commands.
 
@@ -32,7 +32,7 @@ This README describes the **V1.4 feature branch feat/20261018-c2c-v14-native-wor
 Requirements: Windows x64, Git, **Node.js 22+**, Corepack with pinned pnpm 11, PowerShell 7, Visual Studio 2022 C++ Build Tools (MSVC x64 + Windows SDK) and cloudflared. Although package.json declares Node >=20, **pnpm 11 requires Node >=22**.
 
 ~~~powershell
-git clone --branch feat/20261018-c2c-v14-native-workflow --single-branch https://github.com/RomioLA/codex-with-chatgpt.git
+git clone https://github.com/RomioLA/codex-with-chatgpt.git
 cd codex-with-chatgpt
 corepack pnpm install
 corepack pnpm build
@@ -63,11 +63,10 @@ A healthy /health is **not** proof of authenticated ChatGPT tool access. If disc
 - [User guide (English)](docs/USER_GUIDE.md) / [中文](docs/USER_GUIDE.zh-CN.md)
 - [AI tool-selection guide](docs/AI_GUIDE.md) and [Current C2C Skill](skills/c2c-local/SKILL.md)
 - [Troubleshooting](docs/troubleshooting.md), [Security](docs/security.md), [Architecture](docs/architecture.md), [Protocol](docs/protocol.md)
-- [Legacy Codex-with-ChatGPT planning Skill](skill/SKILL.md) — only when explicitly requested, not the default V1.4 routing authority
+- [Legacy Codex-with-ChatGPT planning Skill](skill/SKILL.md) — only when explicitly requested, not the default V1.5 routing authority
+- [V1.5 plan](docs/v1.5-plan.md) — retained as the planning/history record for the released V1.5 work
 
 Committing a guide to GitHub does **not** automatically teach every ChatGPT chat to use the connector. Install the skill in supported coding-agent environments and connect the real C2C plugin in ChatGPT. Live tool descriptions and current permissions remain authoritative.
-
-**Next-version proposal (not yet implemented):** [V1.5 Capability Delivery & Operational Observability Plan](docs/v1.5-plan.md). Do not confuse this plan with deployed V1.4 functionality.
 
 ## Development
 

@@ -1,19 +1,19 @@
-# C2C Local V1.4 — Windows installation
+# C2C Local V1.5 — Windows installation
 
 [中文安装指南](INSTALL.zh-CN.md)
 
-This is the **Windows x64 V1.4 source-build path**, not a tested one-click public installer. The maintainer's protected staged Runtime directories are not distributable installation instructions.
+This is the **Windows x64 V1.5 source-build path**, not a tested one-click public installer. V1.5 is released on the default `main` branch and tagged `v1.5.0`; the maintainer's protected Runtime directories are not distributable installation instructions.
 
 ## Prerequisites
 
 Windows 10/11 x64, Git, PowerShell 7, **Node.js 22+ and Corepack**, VS 2022 C++ Build Tools with MSVC x64 and Windows SDK, and cloudflared. The package.json engine field says Node >=20, but the pinned **pnpm 11 requires Node >=22**. You also need a ChatGPT client/account supporting custom MCP/plugin connectors.
 
-## Build the actual V1.4 branch
+## Build V1.5
 
-The default branch does not yet represent this V1.4 source version. Clone the explicit feature branch:
+Clone the RomioLA fork. The default branch contains the released V1.5 implementation:
 
 ~~~powershell
-git clone --branch feat/20261018-c2c-v14-native-workflow --single-branch https://github.com/RomioLA/codex-with-chatgpt.git
+git clone https://github.com/RomioLA/codex-with-chatgpt.git
 cd codex-with-chatgpt
 corepack pnpm install
 corepack pnpm build
@@ -32,7 +32,7 @@ New-Item -ItemType Directory -Path $skillRoot -Force | Out-Null
 Copy-Item -LiteralPath '.\skills\c2c-local' -Destination $skillRoot -Recurse -Force
 ~~~
 
-Copy the whole directory, including SKILL.md and references. Codex's documented user-scope Skill location is $HOME\.agents\skills. Restart Codex if the skill is not detected. Do not substitute the legacy skill/SKILL.md. **Installing a Skill does not install or authorize the ChatGPT MCP connector.**
+Copy the whole directory, including SKILL.md and references. Codex's user-scope Skill location is $HOME\.agents\skills. Restart Codex if the skill is not detected. Do not substitute the legacy skill/SKILL.md. **Installing a Skill does not install or authorize the ChatGPT MCP connector.**
 
 ## Connect and pair
 
@@ -55,7 +55,7 @@ node .\bin\c2c.js status -w 'C:\Projects' --json
 node .\bin\c2c.js doctor -w 'C:\Projects' --no-fix --json
 ~~~
 
-Local level2 is temporary per Windows logon session. Generic V1.4 execution_run needs **Level2 Full Access plus execution.run OAuth scope**; it does not require Level3 or the legacy recipe registry. Do not enable higher local permissions automatically.
+Level2 is a temporary elevation for the current Windows logon session; the persistent baseline remains readonly/level1. Generic V1.5 `execution_run` needs **Level2 Full Access plus execution.run OAuth scope** and user authorization; it does not require Level3 or the legacy recipe registry. V1.5 structured Git Write does not require an unconditional separate Repository Approval when effective Level2 is active, while Level1 retains that policy gate. Do not enable higher local permissions automatically.
 
 Optional Windows **user-logon** autostart (not a background service without login):
 
@@ -64,7 +64,7 @@ node .\bin\c2c.js autostart enable -w 'C:\Projects' --json
 node .\bin\c2c.js autostart status -w 'C:\Projects' --json
 ~~~
 
-Some systems require administrator rights to register the task. Test the full connection by asking ChatGPT to **actually call workspace_info**, not by relying on /health or a running process alone.
+Some systems require administrator rights to register the task. Test the full connection by asking ChatGPT to **actually call workspace_info and permission_status**, not by relying on /health or a running process alone.
 
 For recovery, inspect status then run:
 

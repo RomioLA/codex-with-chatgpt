@@ -1,4 +1,4 @@
-# C2C Local V1.4 — User guide
+# C2C Local V1.5 — User guide
 
 [中文](USER_GUIDE.zh-CN.md) · [Installation](INSTALL.md) · [AI guide](AI_GUIDE.md)
 
@@ -17,7 +17,7 @@ Always verify the actual connector with **workspace_info**, and inspect **permis
 | Track an execution | execution_status / execution_job_output / execution_cancel |
 | Fixed durable plan | task_create / task_status / task_list / task_result / task_output / task_cancel |
 
-Generic **execution_run** is preferred for V1.4 Level2 Full Access. It requires a valid temporary Level2 grant and execution.run OAuth scope but **not** legacy execution_start recipe registration or Level3 per-command approval. Other security and user authorization checks still apply.
+Generic **execution_run** is preferred for V1.5 Level2 Full Access. It requires a valid temporary Level2 grant and execution.run OAuth scope but **not** legacy execution_start recipe registration or Level3 per-command approval. Supported structured `git_write` operations at effective Level2 do not require an unconditional separate Repository Approval; Level1 retains that policy gate. Repository identity, expected state, OAuth scope, operation policy and user authorization still apply.
 
 A persistent Task is a finite, immutable plan, **not** an autonomous agent. At WAITING_FOR_MODEL it stops for a new decision. After a crash or cancellation the outcome of a child command can be uncertain; **never automatically replay potential side effects**. Query status, result and output first.
 
