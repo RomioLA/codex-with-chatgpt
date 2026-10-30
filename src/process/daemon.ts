@@ -199,6 +199,24 @@ export async function adminFetch<T = unknown>(
   }
 }
 
+/** Wait for a Bridge process that acknowledged shutdown to actually exit. */
+export async function waitForBridgeProcessExit(pid: number, timeoutMs = 20_000): Promise<void> {
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error("Invalid Bridge process id.");
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
+  }
+  throw new Error(
+    "Bridge process " + pid + " did not exit within " + timeoutMs + "ms; refusing to continue restart."
+  );
+}
+
 export async function stopBridge(
   workspaceRoot: string,
   source: AdminShutdownSource = "admin_shutdown",

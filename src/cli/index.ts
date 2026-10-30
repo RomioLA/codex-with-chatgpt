@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
-import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
+import { adminFetch, ensureBridge, stopBridge, waitForBridgeProcessExit } from "../process/daemon.js";
 import { observeBridgeProcessLifecycle, type BridgeShutdownSource } from "../diagnostics/bridge-lifecycle.js";
 import {
   collectRuntimeDiagnostics,
@@ -687,10 +687,21 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    await stopBridge(root, "cli_restart");
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const workspaceId = new Workspace(root).id;
+    const previous = await findBridgeObservation(workspaceId);
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      await stopBridge(root, "cli_restart");
+      if (previous.state === "healthy") {
+        await waitForBridgeProcessExit(previous.runtime.pid);
+      }
+      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      if (
+        previous.state === "healthy" &&
+        runtime.pid === previous.runtime.pid &&
+        runtime.startedAt === previous.runtime.startedAt
+      ) {
+        throw new Error("Restart reused the previous Bridge process.");
+      }
       check(`Bridge 已重启（${info.workspaceName}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
