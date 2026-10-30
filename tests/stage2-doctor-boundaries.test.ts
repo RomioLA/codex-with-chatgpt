@@ -21,12 +21,14 @@ type NamedState = "connected" | "stopped" | "disconnected" | "unknown";
 interface FixtureOptions {
   mode?: Mode;
   namedState?: NamedState;
-  publicHealth?: "healthy" | "degraded";
+  publicHealth?: "healthy" | "degraded" | "cloudflare-unavailable" | "cloudflare-still-unavailable";
   withEndpoint?: boolean;
   reportedHostname?: string;
   reportedTunnelHostname?: string;
   startResponseUrl?: string;
   startedAdminHostname?: string;
+  initialAdminPid?: number;
+  startedAdminPid?: number;
 }
 
 interface Fixture {
@@ -145,6 +147,9 @@ async function createLiveFixture(options: FixtureOptions = {}): Promise<Fixture>
   const mode = options.mode ?? "quick";
   const namedState = options.namedState ?? "connected";
   const degraded = options.publicHealth === "degraded";
+  const cloudflareUnavailable = options.publicHealth === "cloudflare-unavailable" ||
+    options.publicHealth === "cloudflare-still-unavailable";
+  const cloudflareRecovers = options.publicHealth === "cloudflare-unavailable";
 
   if (mode === "quick") {
     fixture.publicServer = http.createServer((_req, res) => {
@@ -160,12 +165,29 @@ async function createLiveFixture(options: FixtureOptions = {}): Promise<Fixture>
     process.env.TUNNEL_CRED_FILE = fixture.credentialFile;
     fs.writeFileSync(fixture.preloadFile, `
 const originalFetch = globalThis.fetch.bind(globalThis);
-const probeStatus = ${degraded ? 503 : 200};
-const probeBody = ${JSON.stringify(JSON.stringify({ service: SERVICE_NAME, status: degraded ? "degraded" : "ok" }))};
+let tunnelRestarted = false;
+const probeStatus = ${cloudflareUnavailable ? 530 : degraded ? 503 : 200};
+const probeBody = ${JSON.stringify(cloudflareUnavailable
+    ? "error code: 1033\\n"
+    : JSON.stringify({ service: SERVICE_NAME, status: degraded ? "degraded" : "ok" }))};
+const healthyProbeBody = ${JSON.stringify(JSON.stringify({ service: SERVICE_NAME, status: "ok" }))};
+const probeHeaders = ${JSON.stringify(cloudflareUnavailable
+    ? { "content-type": "text/plain", server: "cloudflare", "cf-ray": "stage2-test" }
+    : { "content-type": "application/json" })};
 globalThis.fetch = async (input, init) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+  if (url.startsWith("http://127.0.0.1:") && url.endsWith("/admin/tunnel/restart") && method.toUpperCase() === "POST") {
+    const response = await originalFetch(input, init);
+    if (response.ok) tunnelRestarted = true;
+    return response;
+  }
   if (url.startsWith("https://") && url.endsWith("/health")) {
-    return new Response(probeBody, { status: probeStatus, headers: { "content-type": "application/json" } });
+    const recovered = ${cloudflareRecovers} && tunnelRestarted;
+    return new Response(recovered ? healthyProbeBody : probeBody, {
+      status: recovered ? 200 : probeStatus,
+      headers: recovered ? { "content-type": "application/json" } : probeHeaders,
+    });
   }
   return originalFetch(input, init);
 };
@@ -194,12 +216,13 @@ globalThis.fetch = async (input, init) => {
     }
     if (req.method === "POST") {
       fixture.posts.push(route);
-      if (route === "/admin/tunnel/start") {
+      if (route === "/admin/tunnel/start" || route === "/admin/tunnel/restart") {
         const startedAdminUrl = options.startedAdminHostname
           ? `https://${options.startedAdminHostname}`
           : fixture.publicUrl;
         adminInfo = {
           ...adminInfo,
+          ...(options.startedAdminPid !== undefined ? { pid: options.startedAdminPid } : {}),
           publicUrl: startedAdminUrl,
           tunnel: {
             running: true,
@@ -247,7 +270,7 @@ globalThis.fetch = async (input, init) => {
     tunnel,
     tokenCount: 0,
     pairingActive: false,
-    pid: process.pid,
+    pid: options.initialAdminPid ?? process.pid,
     startedAt: "2026-10-26T00:00:00.000Z",
     permissionMode: "readonly",
   };
@@ -417,6 +440,139 @@ describe("V1.5 Stage 2 doctor boundaries", () => {
       expect(payload.diagnostics?.publicProbe?.publicProbeStatus).toBe("degraded");
       expect(payload.diagnostics?.recovery?.status).toBe("healthy");
       expect(payload.namedRepair).toMatchObject({ needed: false });
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("reports Cloudflare Tunnel error 1033 when the local Named Tunnel still claims connected", async () => {
+    const fixture = await createLiveFixture({
+      mode: "named",
+      publicHealth: "cloudflare-unavailable",
+      withEndpoint: true,
+    });
+    try {
+      const result = await runCli(fixture, ["doctor", "--json", "--no-fix", "-w", fixture.root]);
+      const payload = JSON.parse(result.stdout) as {
+        report: { tunnel?: { ok: boolean; detail?: string } };
+        diagnostics?: {
+          tunnel?: { status?: string };
+          publicProbe?: { publicProbeError?: string };
+          recovery?: { status?: string; reason?: string | null };
+        };
+      };
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+      expect(payload.report.tunnel).toMatchObject({ ok: false });
+      expect(payload.report.tunnel?.detail).toContain("1033");
+      expect(payload.diagnostics).toMatchObject({
+        tunnel: { status: "broken" },
+        publicProbe: { publicProbeError: "cloudflare_tunnel_unavailable" },
+        recovery: { status: "actionNeeded", reason: "namedRecoveryFailed" },
+      });
+      expect(fixture.posts).not.toContain("/admin/tunnel/restart");
+      expect(fixture.posts).not.toContain("/admin/tunnel/start");
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("restarts only the Named Tunnel when Cloudflare confirms error 1033", async () => {
+    const fixture = await createLiveFixture({
+      mode: "named",
+      publicHealth: "cloudflare-unavailable",
+      withEndpoint: true,
+    });
+    try {
+      const result = await runCli(fixture, ["doctor", "--json", "-w", fixture.root]);
+      const payload = JSON.parse(result.stdout) as {
+        report: { tunnel?: { ok: boolean } };
+        repairs?: string[];
+        diagnostics?: {
+          publicProbe?: { publicProbeStatus?: string };
+          recovery?: { status?: string };
+        };
+      };
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      expect(payload.report.tunnel).toMatchObject({ ok: true });
+      expect(payload.repairs).toContain("已重新建立安全连接");
+      expect(payload.diagnostics).toMatchObject({
+        publicProbe: { publicProbeStatus: "healthy" },
+        recovery: { status: "healthy" },
+      });
+      expect(fixture.posts).toContain("/admin/tunnel/restart");
+      expect(fixture.posts).not.toContain("/admin/tunnel/start");
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("fails doctor repair when Cloudflare still reports error 1033 after one restart", async () => {
+    const fixture = await createLiveFixture({
+      mode: "named",
+      publicHealth: "cloudflare-still-unavailable",
+      withEndpoint: true,
+    });
+    try {
+      const result = await runCli(fixture, ["doctor", "--json", "-w", fixture.root]);
+      const payload = JSON.parse(result.stdout) as {
+        report: { tunnel?: { ok: boolean; detail?: string } };
+        repairs?: string[];
+        diagnostics?: { publicProbe?: { publicProbeError?: string } };
+      };
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+      expect(payload.report.tunnel).toMatchObject({ ok: false });
+      expect(payload.report.tunnel?.detail).toContain("1033");
+      expect(payload.repairs).not.toContain("已重新建立安全连接");
+      expect(payload.diagnostics?.publicProbe?.publicProbeError).toBe("cloudflare_tunnel_unavailable");
+      expect(fixture.posts.filter((route) => route === "/admin/tunnel/restart")).toHaveLength(1);
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("rejects a Named Tunnel restart when refreshed Admin identity changes", async () => {
+    const fixture = await createLiveFixture({
+      mode: "named",
+      publicHealth: "cloudflare-unavailable",
+      withEndpoint: true,
+      startedAdminPid: process.pid + 1000,
+    });
+    try {
+      const result = await runCli(fixture, ["doctor", "--json", "-w", fixture.root]);
+      const payload = JSON.parse(result.stdout) as {
+        report: { tunnel?: { ok: boolean; detail?: string } };
+        chatgptRepair?: { needed: boolean };
+      };
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+      expect(payload.report.tunnel).toMatchObject({ ok: false });
+      expect(payload.report.tunnel?.detail).toContain("identity");
+      expect(payload.chatgptRepair?.needed).toBe(false);
+      expect(fixture.posts).toContain("/admin/tunnel/restart");
+    } finally {
+      await disposeFixture(fixture);
+    }
+  });
+
+  it("does not change the Tunnel when the initial Admin identity differs from the observed runtime", async () => {
+    const fixture = await createLiveFixture({
+      mode: "named",
+      publicHealth: "cloudflare-unavailable",
+      withEndpoint: true,
+      initialAdminPid: process.pid + 1000,
+    });
+    try {
+      const result = await runCli(fixture, ["doctor", "--json", "-w", fixture.root]);
+      const payload = JSON.parse(result.stdout) as { report: { tunnel?: { ok: boolean; detail?: string } } };
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+      expect(payload.report.tunnel).toMatchObject({ ok: false });
+      expect(payload.report.tunnel?.detail).toContain("identity");
+      expect(fixture.posts).not.toContain("/admin/tunnel/restart");
+      expect(fixture.posts).not.toContain("/admin/tunnel/start");
     } finally {
       await disposeFixture(fixture);
     }

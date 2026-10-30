@@ -72,6 +72,7 @@ export interface RuntimeDiagnostics {
       | "timeout"
       | "unavailable"
       | "http_error"
+      | "cloudflare_tunnel_unavailable"
       | "invalid_health_payload"
       | "ECONNRESET"
       | "ENOTFOUND"
@@ -143,7 +144,7 @@ function notCheckedPublicProbe(): PublicProbeDiagnostics {
   return { publicProbeStatus: "notChecked", checkedAt: null };
 }
 
-async function probePublicHealth(url: string, fetchImpl: typeof fetch): Promise<PublicProbeDiagnostics> {
+export async function probePublicHealth(url: string, fetchImpl: typeof fetch = fetch): Promise<PublicProbeDiagnostics> {
   const checkedAt = new Date().toISOString();
   let parsed: URL;
   try {
@@ -159,7 +160,16 @@ async function probePublicHealth(url: string, fetchImpl: typeof fetch): Promise<
       redirect: "error",
       signal: AbortSignal.timeout(8000),
     });
-    if (!response.ok) return { publicProbeStatus: "degraded", publicProbeError: "http_error", checkedAt };
+    if (!response.ok) {
+      if (response.status === 530) {
+        const body = await response.text().catch(() => "");
+        const cloudflareServer = response.headers.get("server")?.toLowerCase() === "cloudflare" || response.headers.has("cf-ray");
+        if (cloudflareServer && /\b1033\b/.test(body.slice(0, 512))) {
+          return { publicProbeStatus: "degraded", publicProbeError: "cloudflare_tunnel_unavailable", checkedAt };
+        }
+      }
+      return { publicProbeStatus: "degraded", publicProbeError: "http_error", checkedAt };
+    }
     const payload = (await response.json().catch(() => null)) as { service?: unknown; status?: unknown } | null;
     if (payload?.service !== "c2c-bridge" || payload.status !== "ok") {
       return { publicProbeStatus: "degraded", publicProbeError: "invalid_health_payload", checkedAt };
@@ -246,7 +256,7 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-function infoMatchesRuntime(info: RecoveryAdminInfo, workspace: Workspace, runtime: RuntimeState): boolean {
+export function infoMatchesRuntime(info: RecoveryAdminInfo, workspace: Workspace, runtime: RuntimeState): boolean {
   return info.workspaceId === workspace.id &&
     samePath(info.workspaceRoot, workspace.root) &&
     info.pid === runtime.pid &&
@@ -377,7 +387,9 @@ export async function collectRuntimeDiagnostics(
   const tunnelStatus: RuntimeDiagnostics["tunnel"]["status"] = bridgeStatus === "uncertain"
     ? "unknown"
     : preference === "named"
-      ? namedTunnelDiagnosticStatus(info, namedUrl)
+      ? publicProbe.publicProbeError === "cloudflare_tunnel_unavailable"
+        ? "broken"
+        : namedTunnelDiagnosticStatus(info, namedUrl)
       : !info?.tunnel.running
         ? "stopped"
         : endpointHealthy
@@ -396,6 +408,7 @@ export async function collectRuntimeDiagnostics(
   else if (preference === "named" && info && info.tunnel.running && !namedConnected) reason = "namedRuntimeMismatch";
   else if (preference === "named" && info && !info.tunnel.running) reason = "namedRecoveryFailed";
   else if (preference === "named" && !namedUrl) reason = "namedRuntimeMismatch";
+  else if (preference === "named" && publicProbe.publicProbeError === "cloudflare_tunnel_unavailable") reason = "namedRecoveryFailed";
   else if (preference === "quick" && info?.tunnel.provider !== "cloudflare-quick") reason = "quickRuntimeMismatch";
   else if (preference === "quick" && !endpointHealthy) reason = activeUrl ? "quickTunnelFailed" : "quickTunnelStopped";
   else if (preference === "unset" && lastEndpoint?.mcpUrl) reason = "tunnelPreferenceUnset";
@@ -664,6 +677,52 @@ export async function restoreWorkspace(
     detail ??= preference === "named" ? "Bridge diagnostics could not be confirmed." : (error as Error).message;
     reason ??= "bridgeRecoveryFailed";
     diagnostics = await collectRuntimeDiagnostics(workspace.root, { fetchImpl });
+  }
+
+  if (
+    preference === "named" &&
+    !reason &&
+    diagnostics.publicProbe.publicProbeError === "cloudflare_tunnel_unavailable" &&
+    runtime &&
+    info
+  ) {
+    const expectedUrl = diagnostics.currentPublicUrl;
+    logger.info("Cloudflare Tunnel error 1033 detected; re-establishing the Named Tunnel.");
+    try {
+      if (!expectedUrl) throw new Error("named_tunnel_url_unavailable");
+      const restarted = await adminFetchImpl<{ url?: string }>(runtime, "POST", "/admin/tunnel/restart", 90_000);
+      const restartedUrl = namedTunnelUrl(restarted.url, tunnelState.hostname);
+      if (!restartedUrl || restartedUrl !== expectedUrl) throw new Error("named_tunnel_restart_url_mismatch");
+
+      const refreshedInfo = await adminFetchImpl<RecoveryAdminInfo>(runtime, "GET", "/admin/info");
+      if (
+        !infoMatchesRuntime(refreshedInfo, workspace, runtime) ||
+        refreshedInfo.tunnel.provider !== "cloudflare-named" ||
+        !namedInfoConnected(refreshedInfo) ||
+        namedInfoUrl(refreshedInfo, tunnelState.hostname) !== expectedUrl
+      ) {
+        throw new Error("named_tunnel_restart_identity_mismatch");
+      }
+
+      info = refreshedInfo;
+      tunnelAction = "restarted";
+      diagnostics = await collectRuntimeDiagnostics(workspace.root, {
+        info,
+        fetchImpl,
+        adminFetchImpl,
+      });
+      if (diagnostics.publicProbe.publicProbeStatus !== "healthy") {
+        reason = "namedRecoveryFailed";
+        detail = `Named Tunnel was restarted after Cloudflare error 1033, but public health remains ${diagnostics.publicProbe.publicProbeError ?? "degraded"}.`;
+      } else {
+        logger.info("Named Tunnel re-established after Cloudflare error 1033.");
+      }
+    } catch {
+      tunnelAction = "failed";
+      reason = "namedRecoveryFailed";
+      detail = "Cloudflare reported Tunnel error 1033; the Named Tunnel could not be re-established and confirmed.";
+      logger.error("Named Tunnel restart after Cloudflare error 1033 failed.");
+    }
   }
 
   if (preference === "named" && !reason && diagnostics.recovery.reason) {

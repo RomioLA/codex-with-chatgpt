@@ -256,6 +256,57 @@ describe("Named Tunnel recovery diagnostics", () => {
     }
   });
 
+  it("restarts a locally connected Named Tunnel when Cloudflare confirms error 1033", async () => {
+    const { root } = fixture("named-cloudflare-1033");
+    const tunnel = new RecoveryTunnel("cloudflare-named", true, NAMED_URL);
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, tunnelProvider: tunnel });
+    const probeFetch = vi.fn(async () => tunnel.restarts === 0
+      ? new Response("error code: 1033\n", {
+          status: 530,
+          headers: { server: "cloudflare", "cf-ray": "test-ray" },
+        })
+      : await healthyFetch());
+    try {
+      const result = await restoreWorkspace(root, { fetchImpl: probeFetch });
+
+      expect(result).toMatchObject({ ok: true, bridgeAction: "reused", tunnelAction: "restarted", reason: null });
+      expect(result.diagnostics.publicProbe.publicProbeStatus).toBe("healthy");
+      expect(result.diagnostics.tunnel.status).toBe("running");
+      expect(result.diagnostics.recovery).toMatchObject({ status: "healthy", reason: null });
+      expect(tunnel.restarts).toBe(1);
+      expect(probeFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("fails restore after one Named Tunnel restart when Cloudflare error 1033 persists", async () => {
+    const { root } = fixture("named-cloudflare-1033-persists");
+    const tunnel = new RecoveryTunnel("cloudflare-named", true, NAMED_URL);
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, tunnelProvider: tunnel });
+    const probeFetch = vi.fn(async () => new Response("error code: 1033\n", {
+      status: 530,
+      headers: { server: "cloudflare", "cf-ray": "test-ray" },
+    }));
+    try {
+      const result = await restoreWorkspace(root, { fetchImpl: probeFetch });
+
+      expect(result).toMatchObject({
+        ok: false,
+        bridgeAction: "reused",
+        tunnelAction: "failed",
+        reason: "namedRecoveryFailed",
+      });
+      expect(result.diagnostics.publicProbe.publicProbeError).toBe("cloudflare_tunnel_unavailable");
+      expect(result.diagnostics.tunnel.status).toBe("broken");
+      expect(result.diagnostics.recovery).toMatchObject({ status: "actionNeeded", reason: "namedRecoveryFailed" });
+      expect(tunnel.restarts).toBe(1);
+      expect(probeFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      await bridge.close();
+    }
+  });
+
   it("fails closed for an existing Named Tunnel process that has not connected and does not spawn another", async () => {
     const { root, workspace } = fixture("named-process-unconfirmed");
     const child = new FakeCloudflaredProcess();

@@ -9,8 +9,10 @@ import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { observeBridgeProcessLifecycle, type BridgeShutdownSource } from "../diagnostics/bridge-lifecycle.js";
 import {
   collectRuntimeDiagnostics,
+  infoMatchesRuntime,
   isNamedTunnelConfirmedConnected,
   isNamedTunnelConfirmedStopped,
+  probePublicHealth,
   restoreWorkspace,
 } from "../process/recovery.js";
 import { Workspace } from "../workspace/manager.js";
@@ -1325,13 +1327,30 @@ program
 
     if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-      if (namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
+      let adminIdentityMatches = Boolean(
+        workspace && infoMatchesRuntime(info, workspace, runtime)
+      );
+      if (!adminIdentityMatches) {
+        report.tunnel = {
+          ok: false,
+          detail: "Authenticated Bridge Admin identity does not match the observed runtime; no Tunnel changes were made.",
+        };
+      }
+      if (adminIdentityMatches && namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
         await stopBridge(root, "doctor_repair");
         await new Promise((resolve) => setTimeout(resolve, 400));
         try {
           runtime = (await ensureBridge(root)).runtime;
           info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-          results.push("已切换到固定域名连接");
+          adminIdentityMatches = Boolean(workspace && infoMatchesRuntime(info, workspace, runtime));
+          if (adminIdentityMatches) {
+            results.push("已切换到固定域名连接");
+          } else {
+            report.tunnel = {
+              ok: false,
+              detail: "Authenticated Bridge Admin identity does not match the new runtime; no Tunnel changes were made.",
+            };
+          }
         } catch (error) {
           report.tunnel = { ok: false, detail: (error as Error).message };
         }
@@ -1352,33 +1371,40 @@ program
         tunnelState?.preference === "named"
       );
       const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedIdentityRequired;
-      let currentUrl = namedIdentityRequired
+      let currentUrl = !adminIdentityMatches
+        ? null
+        : namedIdentityRequired
         ? info.publicUrl || info.tunnel.url
         : info.publicUrl ?? info.tunnel.url;
-      let healthy = false;
+      let publicProbe = null as Awaited<ReturnType<typeof probePublicHealth>> | null;
       if (currentUrl && (!namedIdentityRequired || namedTunnelConnected)) {
-        try {
-          const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
-          healthy = response.ok;
-        } catch {
-          healthy = false;
-        }
+        publicProbe = await probePublicHealth(currentUrl, fetch);
       }
+      let healthy = publicProbe?.publicProbeStatus === "healthy";
+      let cloudflareTunnelUnavailable = publicProbe?.publicProbeError === "cloudflare_tunnel_unavailable";
       let namedStartRejected = false;
+      let namedTunnelRestartFailed = false;
 
-      const mayStartTunnel = namedReady
-        ? namedTunnelStopped
+      const mayStartTunnel = adminIdentityMatches && (namedReady
+        ? namedTunnelStopped || (namedTunnelConnected && cloudflareTunnelUnavailable)
         : namedIdentityRequired
           ? false
-          : expectedPublic || info.tunnel.running;
+          : expectedPublic || info.tunnel.running);
       if ((!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && mayStartTunnel) {
         try {
           const binaries = detectTunnelBinaries();
           if (!binaries.cloudflared) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
-            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
+            const restartConnectedNamedTunnel = namedTunnelConnected && cloudflareTunnelUnavailable;
+            const started = await adminFetch<TunnelStartResponse>(
+              runtime,
+              "POST",
+              restartConnectedNamedTunnel ? "/admin/tunnel/restart" : "/admin/tunnel/start",
+              90_000,
+            );
             if (namedIdentityRequired) {
+              namedTunnelRestartFailed = restartConnectedNamedTunnel;
               info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
               currentUrl = info.publicUrl || info.tunnel.url;
               namedTunnelConnected = Boolean(
@@ -1395,20 +1421,23 @@ program
                 started.url && currentUrl &&
                 normalizePublicUrl(started.url) === normalizePublicUrl(currentUrl)
               );
-              if (!namedTunnelConnected || !startMatchesAdminUrl) {
+              adminIdentityMatches = Boolean(
+                workspace && infoMatchesRuntime(info, workspace, runtime)
+              );
+              if (!namedTunnelConnected || !currentUrl || !adminIdentityMatches || !startMatchesAdminUrl) {
                 namedStartRejected = true;
                 healthy = false;
               } else {
-                try {
-                  const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
-                  healthy = response.ok;
-                } catch {
-                  healthy = false;
-                }
+                publicProbe = await probePublicHealth(currentUrl, fetch);
+                healthy = publicProbe.publicProbeStatus === "healthy";
+                cloudflareTunnelUnavailable = publicProbe.publicProbeError === "cloudflare_tunnel_unavailable";
+                namedTunnelRestartFailed = restartConnectedNamedTunnel && !healthy;
                 const previousUrl = lastEndpoint?.publicUrl;
                 const sameAddress =
                   previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(started.url!);
-                results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
+                if (!restartConnectedNamedTunnel || healthy) {
+                  results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
+                }
               }
             } else if (started.url) {
               const previousUrl = lastEndpoint?.publicUrl;
@@ -1425,7 +1454,12 @@ program
         }
       }
 
-      if (namedCredentialFailure && namedCredential) {
+      if (!adminIdentityMatches) {
+        report.tunnel = {
+          ok: false,
+          detail: "Authenticated Bridge Admin identity does not match the observed runtime; no Tunnel changes were made.",
+        };
+      } else if (namedCredentialFailure && namedCredential) {
         report.tunnel = {
           ok: false,
           detail: `NAMED_TUNNEL_CREDENTIAL_${namedCredential.status.toUpperCase()}`,
@@ -1438,6 +1472,16 @@ program
         report.tunnel = {
           ok: false,
           detail: "Named Tunnel start identity did not match refreshed Admin state; health and endpoint persistence were rejected.",
+        };
+      } else if (cloudflareTunnelUnavailable) {
+        report.tunnel ??= {
+          ok: false,
+          detail: "Cloudflare returned Tunnel error 1033 (HTTP 530) while the local Named Tunnel reports connected.",
+        };
+      } else if (namedTunnelRestartFailed) {
+        report.tunnel ??= {
+          ok: false,
+          detail: "The Named Tunnel was restarted after Cloudflare error 1033, but the public health probe remains degraded.",
         };
       } else if (currentUrl && healthy && (!namedIdentityRequired || namedTunnelConnected)) {
         report.tunnel = { ok: true, detail: currentUrl };
