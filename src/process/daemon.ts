@@ -113,7 +113,7 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
       `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
     );
   }
-  const lockStatus = inspectBridgeInstanceLock(workspace.id);
+  const lockStatus = await inspectBridgeInstanceLock(workspace.id, workspace.root);
   if (lockStatus === "live_pid_unverified" || lockStatus === "unknown") {
     throw new Error("Bridge instance lock is present but its owner cannot be verified; refusing to start another bridge.");
   }

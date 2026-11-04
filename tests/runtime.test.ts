@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import * as processIdentity from "../src/process/bridge-process-identity.js";
 import { startBridge } from "../src/bridge/server.js";
 import {
   findBridgeObservation,
@@ -63,16 +64,18 @@ describe("findBridgeObservation", () => {
     expect(await findLiveBridge(workspace.id)).toBeNull();
   });
 
-  it("does not treat a live pid plus a failed probe as stopped", async () => {
+  it("keeps a live C2C Bridge process uncertain when its health probe fails", async () => {
     dirs.push(isolateStateDir());
     const root = makeTmpDir("obs-unknown");
     dirs.push(root);
     write(root, "a.txt", "a");
     const workspace = new Workspace(root);
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    const bridgeEntry = write(root, "dist/cli/index.js", "setInterval(() => {}, 1000);\n");
+    const child = spawn(process.execPath, [bridgeEntry, "serve", "--workspace", root], {
       stdio: "ignore",
       detached: true,
     });
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("bridge");
     child.unref();
     try {
       if (!child.pid) throw new Error("failed to spawn helper");
@@ -83,12 +86,77 @@ describe("findBridgeObservation", () => {
       expect(await findLiveBridge(workspace.id)).toBeNull();
       await expect(ensureBridge(root)).rejects.toThrow(/uncertain/);
     } finally {
+      ownerProbe.mockRestore();
       if (child.pid) {
         try {
           process.kill(child.pid, "SIGKILL");
         } catch {
           /* ignore */
         }
+      }
+    }
+  });
+
+  it("treats a live unrelated PID as a stopped Bridge and starts one replacement", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-reused-pid");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const workspace = new Workspace(root);
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      detached: true,
+    });
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("unrelated");
+    child.unref();
+    let recovered: Awaited<ReturnType<typeof ensureBridge>> | undefined;
+    try {
+      if (!child.pid) throw new Error("failed to spawn helper");
+      writeRuntimeState(stubRuntime(workspace.id, workspace.root, child.pid, 1));
+      const observation = await findBridgeObservation(workspace.id);
+      expect(observation).toMatchObject({ state: "stopped", reason: "pid_reused" });
+      recovered = await ensureBridge(root);
+      expect(recovered.spawned).toBe(true);
+      expect((await findBridgeObservation(workspace.id)).state).toBe("healthy");
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      ownerProbe.mockRestore();
+      if (recovered) {
+        await stopBridge(root);
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline && (await findBridgeObservation(workspace.id)).state !== "stopped") {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
+      if (child.pid) {
+        try { process.kill(child.pid, "SIGKILL"); } catch { /* ignore */ }
+      }
+    }
+  }, 30_000);
+
+  it("keeps a live PID uncertain when the process identity query misses it", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-identity-missing-race");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const workspace = new Workspace(root);
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      detached: true,
+    });
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("missing");
+    child.unref();
+    try {
+      if (!child.pid) throw new Error("failed to spawn helper");
+      writeRuntimeState(stubRuntime(workspace.id, workspace.root, child.pid, 1));
+      const observation = await findBridgeObservation(workspace.id);
+      expect(observation).toMatchObject({ state: "unknown", reason: "probe_failed" });
+      await expect(ensureBridge(root)).rejects.toThrow(/uncertain/);
+      expect(() => process.kill(child.pid, 0)).not.toThrow();
+    } finally {
+      ownerProbe.mockRestore();
+      if (child.pid) {
+        try { process.kill(child.pid, "SIGKILL"); } catch { /* ignore */ }
       }
     }
   });
@@ -335,6 +403,7 @@ describe("findBridgeObservation", () => {
     writeRuntimeState(stubRuntime(workspace.id, workspace.root, process.pid, 1));
     const originalKill = process.kill;
     vi.stubGlobal("fetch", () => Promise.reject(new Error("health endpoint unavailable")));
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("unknown");
     vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
       if (pid === process.pid && signal === 0) {
         throw Object.assign(new Error("permission denied"), { code: "EPERM" });
@@ -349,6 +418,7 @@ describe("findBridgeObservation", () => {
     } finally {
       vi.restoreAllMocks();
       vi.unstubAllGlobals();
+      ownerProbe.mockRestore();
     }
   });
 

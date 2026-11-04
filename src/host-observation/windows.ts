@@ -187,6 +187,19 @@ switch ($q.operation) {
     })
     $out = @{processes=@($selected | Select-Object -First 4096 | ForEach-Object { ProcessRow $_ });truncated=($selected.Count -gt 4096)}
   }
+  'processIdentity' {
+    $processId = 0
+    if (-not [int]::TryParse([string]$q.pid, [ref]$processId) -or $processId -le 0) {
+      throw 'Invalid process identity query'
+    }
+    $p = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = {0}" -f $processId)
+    if ($null -eq $p) {
+      $out = @{found=$false;pid=$processId}
+    } else {
+      $out = @{found=$true;pid=[int]$p.ProcessId;name=$p.Name;exePath=$p.ExecutablePath;
+        commandLine=$p.CommandLine;startTime=$(if($p.CreationDate){$p.CreationDate.ToUniversalTime().ToString('o')}else{$null})}
+    }
+  }
   'listeners' {
     $rows = [Collections.Generic.List[object]]::new(); $statuses = @{}
     foreach ($protocol in @('tcp','udp')) {
@@ -669,7 +682,7 @@ function observationPowerShellExecutable(): string | undefined {
   return fixedPowerShellCandidates()[0];
 }
 
-export function runWindowsQuery(operation: "context" | "processes" | "listeners" | "network" | "metadata", data: object = {}): Promise<any> {
+export function runWindowsQuery(operation: "context" | "processes" | "processIdentity" | "listeners" | "network" | "metadata", data: object = {}): Promise<any> {
   if (process.platform !== "win32") return Promise.reject(new ObservationError("NOT_SUPPORTED", "Host Observation V1 requires Windows"));
   const executable = observationPowerShellExecutable();
   if (!executable) return Promise.reject(new ObservationError("NOT_SUPPORTED", "PowerShell 7 is required for fixed Windows queries"));
@@ -688,6 +701,21 @@ export function runWindowsQuery(operation: "context" | "processes" | "listeners"
     child.stdin?.end(JSON.stringify({ ...data, operation }));
   });
 }
+
+export interface WindowsProcessIdentity {
+  found: boolean;
+  pid: number;
+  name?: string | null;
+  exePath?: string | null;
+  commandLine?: string | null;
+  startTime?: string | null;
+}
+
+export async function queryWindowsProcessIdentity(pid: number): Promise<WindowsProcessIdentity> {
+  if (!Number.isInteger(pid) || pid <= 0) throw new TypeError("Invalid process id");
+  return await runWindowsQuery("processIdentity", { pid }) as WindowsProcessIdentity;
+}
+
 export const windowsProvider: ObservationProvider = {
   context: () => runWindowsQuery("context", { hostPid: process.pid }),
   processes: (filter?: Pick<QueryInput, "pid" | "parentPid" | "name">) => runWindowsQuery("processes", filter),

@@ -410,7 +410,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // Initialize routes before acquiring the guard so a synchronous setup failure
   // cannot strand a lock owned by this still-running process. Every Bridge,
   // including persistRuntime:false instances, must hold it before listening.
-  const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id);
+  const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id, workspace.root);
   const supervisor = new ExecutionSupervisor(workspace, { runner: opts.executionRunner, logger });
   let taskStore: TaskStore;
   try {

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { observeBridgeProcessOwner } from "../process/bridge-process-identity.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
 /**
@@ -68,7 +69,7 @@ export async function probeBridge(
 
 export type BridgeObservation =
   | { state: "healthy"; runtime: RuntimeState }
-  | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" }
+  | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" | "pid_reused" }
   | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" | "runtime_identity_stale" };
 
 function observePid(pid: number): "present" | "missing" | "unknown" {
@@ -106,6 +107,15 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
     return { state: "healthy", runtime };
   }
   if (pid === "missing") return { state: "stopped", runtime, reason: "pid_missing" };
+  if (pid === "present") {
+    const owner = await observeBridgeProcessOwner(runtime.pid, runtime.workspaceRoot);
+    if (owner === "unrelated") return { state: "stopped", runtime, reason: "pid_reused" };
+    if (owner === "missing") {
+      const recheckedPid = observePid(runtime.pid);
+      if (recheckedPid === "missing") return { state: "stopped", runtime, reason: "pid_missing" };
+      if (recheckedPid === "unknown") return { state: "unknown", runtime, reason: "pid_unknown" };
+    }
+  }
   return { state: "unknown", runtime, reason: pid === "unknown" ? "pid_unknown" : "probe_failed" };
 }
 

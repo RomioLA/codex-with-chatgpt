@@ -5,6 +5,7 @@ import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as oauth from "../src/auth/oauth.js";
+import * as processIdentity from "../src/process/bridge-process-identity.js";
 import { startBridge } from "../src/bridge/server.js";
 import { bridgeInstanceLockFile, inspectBridgeInstanceLock } from "../src/bridge/instance-lock.js";
 import { findBridgeObservation, probeBridge, readRuntimeState, writeRuntimeState } from "../src/bridge/runtime.js";
@@ -66,7 +67,7 @@ describe("workspace Bridge instance lock remediation", () => {
     try {
       await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
         .rejects.toThrow("Injected route initialization failure");
-      expect(inspectBridgeInstanceLock(workspace.id)).toBe("missing");
+      expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("missing");
     } finally {
       router.mockRestore();
     }
@@ -86,7 +87,7 @@ describe("workspace Bridge instance lock remediation", () => {
     try {
       expect(path.relative(getStateDir(), lockFile).startsWith(".." + path.sep)).toBe(false);
       expect(fs.existsSync(lockFile)).toBe(true);
-      expect(inspectBridgeInstanceLock(workspace.id)).toBe("live_pid_unverified");
+      expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("live_pid_unverified");
       expect(bridge.port).toBeGreaterThan(0);
       expect(fs.existsSync(path.join(stateRoot, "runtime", `${workspace.id}.json`))).toBe(false);
     } finally {
@@ -177,7 +178,7 @@ describe("workspace Bridge instance lock remediation", () => {
       token: randomBytes(16).toString("hex"),
       createdAt: new Date(0).toISOString(),
     }));
-    expect(inspectBridgeInstanceLock(workspace.id)).toBe("stale");
+    expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("stale");
 
     const bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
     try {
@@ -190,10 +191,12 @@ describe("workspace Bridge instance lock remediation", () => {
     }
   });
 
-  it("fails closed when a live unrelated PID is recorded, without claiming PID ownership", async () => {
+  it("fails closed when a live Bridge-like PID is recorded", async () => {
     isolateStateDir();
     const { root, workspace } = makeWorkspace("lock-pid-reuse");
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const helper = write(root, "dist/cli/index.js", "setInterval(() => {}, 1000);\n");
+    const child = spawn(process.execPath, [helper, "serve", "--workspace", root], { stdio: "ignore" });
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("bridge");
     try {
       await new Promise<void>((resolve, reject) => {
         child.once("spawn", () => resolve());
@@ -209,18 +212,87 @@ describe("workspace Bridge instance lock remediation", () => {
         token: randomBytes(16).toString("hex"),
         createdAt: new Date(0).toISOString(),
       }));
-      expect(inspectBridgeInstanceLock(workspace.id)).toBe("live_pid_unverified");
+      expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("live_pid_unverified");
       await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
         .rejects.toThrow(/live but unverified|cannot be verified/i);
       expect(() => process.kill(child.pid!, 0)).not.toThrow();
       expect(await probeBridge(await unusedPort())).toBeNull();
     } finally {
+      ownerProbe.mockRestore();
       if (child.pid) {
         try {
           child.kill("SIGKILL");
         } catch {
           // The child may already have exited.
         }
+      }
+    }
+  });
+
+  it("recovers a live PID that process identity proves is unrelated", async () => {
+    isolateStateDir();
+    const { root, workspace } = makeWorkspace("lock-reused-unrelated-pid");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("unrelated");
+    let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", () => resolve());
+        child.once("error", reject);
+      });
+      if (!child.pid) throw new Error("Could not start isolated PID reuse fixture");
+      const lockFile = bridgeInstanceLockFile(workspace.id);
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.writeFileSync(lockFile, JSON.stringify({
+        version: 1,
+        workspaceId: workspace.id,
+        pid: child.pid,
+        token: randomBytes(16).toString("hex"),
+        createdAt: new Date().toISOString(),
+      }));
+      expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("stale");
+      bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
+      expect((await probeBridge(bridge.port))?.workspaceId).toBe(workspace.id);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+      const owner = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid: number };
+      expect(owner.pid).toBe(process.pid);
+    } finally {
+      ownerProbe.mockRestore();
+      if (bridge) await bridge.close();
+      if (child.pid) {
+        try { child.kill("SIGKILL"); } catch { /* the child may already have exited */ }
+      }
+    }
+  });
+
+  it("does not recover a live lock when the process identity query misses its PID", async () => {
+    isolateStateDir();
+    const { root, workspace } = makeWorkspace("lock-identity-missing-race");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("missing");
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", () => resolve());
+        child.once("error", reject);
+      });
+      if (!child.pid) throw new Error("Could not start isolated PID identity fixture");
+      const lockFile = bridgeInstanceLockFile(workspace.id);
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.writeFileSync(lockFile, JSON.stringify({
+        version: 1,
+        workspaceId: workspace.id,
+        pid: child.pid,
+        token: randomBytes(16).toString("hex"),
+        createdAt: new Date().toISOString(),
+      }));
+      expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("live_pid_unverified");
+      await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
+        .rejects.toThrow(/live but unverified|cannot be verified/i);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      ownerProbe.mockRestore();
+      if (child.pid) {
+        try { child.kill("SIGKILL"); } catch { /* the child may already have exited */ }
       }
     }
   });
