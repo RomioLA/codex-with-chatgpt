@@ -77,7 +77,7 @@ afterEach(() => {
 describe("Cloudflared Named Tunnel startup retry", () => {
   it.each(["exhausted", "timeout"] as const)("enforces the production retry defaults through %s", async (outcome) => {
     useFakeTimers();
-    const children = Array.from({ length: 6 }, () => new FakeCloudflaredProcess());
+    const children = Array.from({ length: 7 }, () => new FakeCloudflaredProcess());
     queueChildren(...children);
     const tunnel = new CloudflaredNamedTunnel({
       tunnelName: "c2c-production-defaults-test",
@@ -86,11 +86,11 @@ describe("Cloudflared Named Tunnel startup retry", () => {
     });
     const starting = tunnel.start(48_765);
     const rejected = expect(starting).rejects.toThrow(
-      outcome === "exhausted" ? "startup exhausted: attempts=6" : "category=timeout"
+      outcome === "exhausted" ? "startup exhausted: attempts=7" : "category=timeout"
     );
     await flushMicrotasks();
 
-    for (const [index, delay] of [2_000, 4_000, 8_000, 16_000, 16_000].entries()) {
+    for (const [index, delay] of [2_000, 4_000, 8_000, 16_000, 16_000, 16_000].entries()) {
       transientDns(children[index]!);
       children[index]!.exit(1);
       await flushMicrotasks();
@@ -101,19 +101,19 @@ describe("Cloudflared Named Tunnel startup retry", () => {
     }
 
     if (outcome === "exhausted") {
-      transientDns(children[5]!);
-      children[5]!.exit(1);
+      transientDns(children[6]!);
+      children[6]!.exit(1);
     } else {
-      // The five backoffs consumed 46 seconds of the shared 75-second budget.
-      await vi.advanceTimersByTimeAsync(28_999);
-      expect(children[5]!.kill).not.toHaveBeenCalled();
+      // The six backoffs consumed 62 seconds of the shared 90-second budget.
+      await vi.advanceTimersByTimeAsync(27_999);
+      expect(children[6]!.kill).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
-      expect(children[5]!.kill).toHaveBeenCalledWith("SIGTERM");
-      expect(tunnel.status().detail).toContain("elapsedMs=75000");
-      children[5]!.exit(1);
+      expect(children[6]!.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(tunnel.status().detail).toContain("elapsedMs=90000");
+      children[6]!.exit(1);
     }
     await rejected;
-    expect(spawnMock).toHaveBeenCalledTimes(6);
+    expect(spawnMock).toHaveBeenCalledTimes(7);
   });
 
   it("retries a pre-connection DNS failure once and clears the diagnostic on success", async () => {

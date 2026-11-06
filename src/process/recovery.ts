@@ -292,7 +292,7 @@ function namedInfoStartable(info: RecoveryAdminInfo): boolean {
 /** Only fixed provider diagnostics may leave the Named Tunnel boundary. */
 function namedStartupDiagnostic(detail: unknown): string | undefined {
   if (typeof detail !== "string" || detail.length > 200) return undefined;
-  const match = /^Named tunnel startup (?:retrying|exhausted|failed|cancelled): attempts=[0-6]; category=(?:dns_unavailable|network_unavailable|permanent|unknown|timeout|stopped|binary_missing|termination_unconfirmed); elapsedMs=\d{1,9}(?:; delayMs=\d{1,9})?$/.exec(detail);
+  const match = /^Named tunnel startup (?:retrying|exhausted|failed|cancelled): attempts=[0-7]; category=(?:dns_unavailable|network_unavailable|permanent|unknown|timeout|stopped|binary_missing|termination_unconfirmed); elapsedMs=\d{1,9}(?:; delayMs=\d{1,9})?$/.exec(detail);
   return match?.[0] === detail ? detail : undefined;
 }
 

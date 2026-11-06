@@ -8,10 +8,10 @@ import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provide
 
 const CONNECTED_RE = /registered tunnel connection/i;
 const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
-const DEFAULT_RETRY_BACKOFF_MS = [2_000, 4_000, 8_000, 16_000, 16_000] as const;
-const DEFAULT_STARTUP_DEADLINE_MS = 75_000;
+const DEFAULT_RETRY_BACKOFF_MS = [2_000, 4_000, 8_000, 16_000, 16_000, 16_000] as const;
+const DEFAULT_STARTUP_DEADLINE_MS = 90_000;
 const DEFAULT_STOP_WAIT_MS = 1_000;
-const MAX_START_ATTEMPTS = 6;
+const MAX_START_ATTEMPTS = 7;
 
 type StartupStatus = "retrying" | "exhausted" | "failed" | "cancelled";
 type StartupCategory =
@@ -68,11 +68,11 @@ export interface CloudflaredNamedTunnelOptions {
   binaryOverride?: string;
   /** Maximum time for one attempt to establish a connection. */
   startTimeoutMs?: number;
-  /** Total startup deadline across all attempts and retry delays. Capped at 75 seconds. */
+  /** Total startup deadline across all attempts and retry delays. Capped at 90 seconds. */
   startupDeadlineMs?: number;
-  /** Delay before each retry. The default allows six total attempts. */
+  /** Delay before each retry. The default allows seven total attempts. */
   retryBackoffMs?: readonly number[];
-  /** Maximum number of process attempts, capped at six. */
+  /** Maximum number of process attempts, capped at seven. */
   maxAttempts?: number;
   /** Bounded wait for a SIGTERM'd process to emit exit or close. */
   stopWaitMs?: number;
@@ -172,7 +172,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       startupDeadlineMs <= 0 ||
       startupDeadlineMs > DEFAULT_STARTUP_DEADLINE_MS
     ) {
-      throw new Error("Named tunnel startup deadline must be between 1 and 75000 milliseconds");
+      throw new Error("Named tunnel startup deadline must be between 1 and 90000 milliseconds");
     }
     this.startupDeadlineMs = startupDeadlineMs;
 
@@ -182,7 +182,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
     }
     const maxAttempts = opts.maxAttempts ?? (opts.retryBackoffMs ? retryBackoffMs.length + 1 : MAX_START_ATTEMPTS);
     if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > MAX_START_ATTEMPTS) {
-      throw new Error("Named tunnel maximum attempts must be between 1 and 6");
+      throw new Error("Named tunnel maximum attempts must be between 1 and 7");
     }
     if (retryBackoffMs.length < maxAttempts - 1) {
       throw new Error("Named tunnel retry delays must cover every retry attempt");

@@ -204,7 +204,7 @@ update the ChatGPT connector manually if they differ. Do not generate a pairing
 code during runtime recovery.
 
 Named Tunnel startup retries only recognized transient DNS or network failures,
-for up to six attempts and a 75-second total deadline. Permanent, unknown, or
+for up to seven attempts and a 90-second total deadline. Permanent, unknown, or
 credential failures stop without retrying. The retry policy is independent of
 Quick Tunnel startup. A healthy Named Tunnel self-probe still reports only the
 Bridge `/health` endpoint, not a successful connector request.

@@ -131,9 +131,9 @@ invalid named credential is reported as an action needed. Quick URLs are marked
 unstable and are not restart-safe for an existing connector.
 
 Named startup retries only classified transient DNS or network failures, using
-up to six attempts and a 75-second total deadline (default delays: 2, 4, 8, 16,
-and 16 seconds). A permanent or unclassified failure stops immediately; this
-retry policy is independent of Quick Tunnel startup. The public self-probe
+up to seven attempts and a 90-second total deadline (default delays: 2, 4, 8,
+16, 16, and 16 seconds). A permanent or unclassified failure stops
+immediately; thisretry policy is independent of Quick Tunnel startup. The public self-probe
 checks the C2C `/health` response; it does not prove that ChatGPT can
 authenticate or complete a connector tool call. For a confirmed Named Tunnel,
 if Bridge/runtime identity, configured endpoint, and tunnel connection remain
