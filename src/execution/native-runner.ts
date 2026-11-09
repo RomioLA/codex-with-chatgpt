@@ -30,9 +30,20 @@ export class NativeRunnerOutputError extends Error {
     readonly helperResult: HelperResultFrame,
     readonly helperExitCode: number | null,
     readonly tempCleanupConfirmed: boolean,
+    readonly treeTerminationConfirmed: boolean = helperResult.treeTerminationConfirmed ?? helperResult.outcome !== 3,
   ) {
     super("OUTPUT_PERSISTENCE_FAILED", { cause });
     this.name = "NativeRunnerOutputError";
+  }
+}
+
+export class NativeRunnerCleanupError extends Error {
+  readonly treeTerminationConfirmed = true;
+  readonly tempCleanupConfirmed = false;
+
+  constructor(readonly helperResult: HelperResultFrame, readonly helperExitCode: number | null) {
+    super("EXECUTION_TEMP_CLEANUP_FAILED");
+    this.name = "NativeRunnerCleanupError";
   }
 }
 
@@ -202,6 +213,7 @@ export class WindowsNativeExecutionRunner {
       launcherPath?: string;
       moduleDirectory?: string;
       spawnImpl?: typeof spawn;
+      cleanupImpl?: typeof runExecutionTempCleanup;
       runtimeResolver?: typeof resolveTrustedRuntime;
       beforeHelperRequestWrite?: (runtime: TrustedRuntime) => void;
       launcherTestHoldMs?: number;
@@ -211,6 +223,7 @@ export class WindowsNativeExecutionRunner {
   ) {}
 
   start(request: NativeRunnerRequest, callbacks: NativeRunnerCallbacks): NativeRunnerHandle {
+    const cleanupTemp = this.options.cleanupImpl ?? runExecutionTempCleanup;
     const launcherPath = resolveExecutionLauncherPath({
       helperPath: this.options.helperPath,
       launcherPath: this.options.launcherPath,
@@ -362,7 +375,7 @@ export class WindowsNativeExecutionRunner {
       }
     } catch (error) {
       try {
-        runExecutionTempCleanup(request.tempLease, request.stateDirectory,
+        cleanupTemp(request.tempLease, request.stateDirectory,
           (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)), launcherPath);
       } catch {
         /* Keep the persisted ownership record for a later identity-checked recovery. */
@@ -435,11 +448,6 @@ export class WindowsNativeExecutionRunner {
       });
       child.once("close", (code) => {
         void stdoutPump.then(() => {
-          if (!runExecutionTempCleanup(request.tempLease, request.stateDirectory,
-            (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)), launcherPath)) {
-            reject(new Error("EXECUTION_TEMP_CLEANUP_FAILED"));
-            return;
-          }
           if (spawnError) {
             reject(spawnError);
             return;
@@ -463,12 +471,32 @@ export class WindowsNativeExecutionRunner {
             reject(new Error("EXECUTION_HELPER_RESULT_MISSING"));
             return;
           }
+          const treeTerminationConfirmed = frameResult.treeTerminationConfirmed ?? frameResult.outcome !== 3;
+          if (!treeTerminationConfirmed) {
+            if (diagnostics || frameResult.outcome === 3) {
+              const resultDiagnostic = `helper outcome=${frameResult.outcome}; treeTerminationConfirmed=false; ` +
+                `win32Error=${frameResult.win32Error}; exitCode=${frameResult.exitCode}`;
+              callbacks.onDiagnostic?.(redact([diagnostics, resultDiagnostic].filter(Boolean).join("\n")).slice(-512));
+            }
+            if (outputError) {
+              reject(new NativeRunnerOutputError(outputError, frameResult, code, false, false));
+            } else {
+              resolve({ result: frameResult, helperExitCode: code, tempCleanupConfirmed: false });
+            }
+            return;
+          }
+          if (!cleanupTemp(request.tempLease, request.stateDirectory,
+            (message) => callbacks.onDiagnostic?.(redact(message).slice(-512)), launcherPath)) {
+            reject(new NativeRunnerCleanupError(frameResult, code));
+            return;
+          }
           if (outputError) {
-            reject(new NativeRunnerOutputError(outputError, frameResult, code, true));
+            reject(new NativeRunnerOutputError(outputError, frameResult, code, true, true));
             return;
           }
           if (diagnostics || frameResult.outcome === 3) {
-            const resultDiagnostic = `helper outcome=${frameResult.outcome}; win32Error=${frameResult.win32Error}; ` +
+            const resultDiagnostic = `helper outcome=${frameResult.outcome}; treeTerminationConfirmed=true; ` +
+              `win32Error=${frameResult.win32Error}; ` +
               `exitCode=${frameResult.exitCode}`;
             callbacks.onDiagnostic?.(redact([diagnostics, resultDiagnostic].filter(Boolean).join("\n")).slice(-512));
           }

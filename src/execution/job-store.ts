@@ -8,6 +8,7 @@ import {
   archiveRecord,
   readArchivedRecord,
   jobCanBeArchived,
+  jobCanBeStoredInArchive,
   archivedIdempotencyKey,
   scanArchivedJobRecords,
   DEFAULT_ARCHIVE_RECORD_OPERATIONS,
@@ -171,6 +172,11 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     isValidFullAccessCommand(job.fullAccessCommand) &&
     (job.repositoryScope === undefined || isValidFullAccessRepositoryScope(job.repositoryScope));
   const gitResult = job.gitResult as Record<string, unknown> | undefined;
+  const recoveryEvidenceValid = job.recoveryEvidence === undefined ||
+    (job.state === "interrupted" && (
+      job.recoveryEvidence === "process_tree_exited" && isTempOwnership(job.tempOwnership) ||
+      job.recoveryEvidence === "process_tree_and_temp_cleaned" && job.tempOwnership === null
+    ));
   const validGitResult = gitResult === undefined || (
     ["confirmed", "changed", "identity_changed", "unavailable"].includes(String(gitResult.confirmation)) &&
     (gitResult.integrity === undefined || ["verified", "unexpected", "not_verified"].includes(String(gitResult.integrity))) &&
@@ -183,7 +189,7 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
   return job.workspaceId === workspaceId &&
     typeof job.jobId === "string" && /^[A-Za-z0-9_-]{24,64}$/.test(job.jobId) &&
     typeof job.oauthClientId === "string" && job.oauthClientId.length > 0 && job.oauthClientId.length <= 200 &&
-    (validRepositoryFields || validHostFields) && validGitResult &&
+    (validRepositoryFields || validHostFields) && validGitResult && recoveryEvidenceValid &&
     isExecutionJobState(job.state) &&
     typeof job.createdAt === "string" &&
     (job.startedAt === null || typeof job.startedAt === "string") &&
@@ -204,6 +210,7 @@ function sameLogicalJob(active: ExecutionJob, archived: ExecutionJob): boolean {
     requestHash(active) === requestHash(archived) && active.executionContext === archived.executionContext &&
     active.repositoryIdentity === archived.repositoryIdentity && active.repositoryPath === archived.repositoryPath &&
     active.timeoutSeconds === archived.timeoutSeconds && active.state === archived.state &&
+    active.recoveryEvidence === archived.recoveryEvidence &&
     active.startedAt === archived.startedAt && active.finishedAt === archived.finishedAt &&
     active.exitCode === archived.exitCode && active.failureCode === archived.failureCode;
 }
@@ -537,7 +544,7 @@ export class ExecutionJobStore {
     const keep: ExecutionJob[] = [];
     for (const job of ordered) {
       const age = now - Date.parse(job.createdAt);
-      const expired = Number.isFinite(age) && age > JOB_RETENTION_MS && jobCanBeArchived(job);
+      const expired = Number.isFinite(age) && age > JOB_RETENTION_MS && jobCanBeStoredInArchive(job);
       if (expired) {
         this.archiveJob(job);
       } else {
@@ -545,7 +552,9 @@ export class ExecutionJobStore {
       }
     }
     while (keep.length > MAX_JOBS_PER_WORKSPACE - (reserveSlot ? 1 : 0)) {
-      const index = keep.findIndex(jobCanBeArchived);
+      const index = keep.findIndex((job) => jobCanBeArchived(job) ||
+        (Number.isFinite(now - Date.parse(job.createdAt)) && now - Date.parse(job.createdAt) > JOB_RETENTION_MS &&
+          jobCanBeStoredInArchive(job)));
       if (index < 0) break;
       const [dropped] = keep.splice(index, 1);
       this.archiveJob(dropped);
@@ -578,7 +587,7 @@ export class ExecutionJobStore {
     if (active) return active;
     if (!/^[A-Za-z0-9_-]{24,64}$/.test(jobId)) return null;
     const archived = readArchivedRecord<ExecutionJob>(this.directory, "jobs", jobId);
-    if (archived && (!isValidJob(archived, this.workspaceId) || archived.jobId !== jobId || !jobCanBeArchived(archived))) throw new Error("ARCHIVE_CORRUPT");
+    if (archived && (!isValidJob(archived, this.workspaceId) || archived.jobId !== jobId || !jobCanBeStoredInArchive(archived))) throw new Error("ARCHIVE_CORRUPT");
     return archived;
   }
 
@@ -662,7 +671,7 @@ export class ExecutionJobStore {
     let activeArchiveMismatch = false;
     const pointedJob: { value: ExecutionJob | null } = { value: null };
     const scan = scanArchivedJobRecords<unknown>(this.directory, (jobId, value) => {
-      if (!isValidJob(value, this.workspaceId) || value.jobId !== jobId || !jobCanBeArchived(value)) {
+      if (!isValidJob(value, this.workspaceId) || value.jobId !== jobId || !jobCanBeStoredInArchive(value)) {
         throw new Error("ARCHIVE_CORRUPT");
       }
       const job = value as ExecutionJob;

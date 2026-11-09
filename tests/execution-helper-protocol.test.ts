@@ -101,7 +101,7 @@ function writeIntegrityMetadata(root: string, helperBytes: Buffer, launcherBytes
   fs.mkdirSync(path.dirname(metadata), { recursive: true });
   fs.writeFileSync(metadata, JSON.stringify({
     version: 2,
-    protocolVersion: 8,
+    protocolVersion: 9,
     helperPath: "build/native/c2c-execution-helper.exe",
     sha256: createHash("sha256").update(helperBytes).digest("hex"),
     launcherPath: "build/native/c2c-execution-launcher.exe",
@@ -148,10 +148,36 @@ describe("execution helper build and protocol contract", () => {
       .toThrow("HELPER_PROTOCOL_BAD_HEADER");
   });
 
+  it("decodes V9 process-tree confirmation independently from the helper outcome", () => {
+    const encodeResult = (outcome: number, treeConfirmed: number) => {
+      const payload = Buffer.alloc(10);
+      payload.writeUInt8(outcome, 0);
+      payload.writeUInt32LE(7, 1);
+      payload.writeUInt32LE(1460, 5);
+      payload.writeUInt8(treeConfirmed, 9);
+      const header = Buffer.alloc(5);
+      header.writeUInt8(3, 0);
+      header.writeUInt32LE(payload.byteLength, 1);
+      return Buffer.concat([Buffer.from("C2COUT9\0", "ascii"), header, payload]);
+    };
+    const unconfirmed = new HelperOutputDecoder(9);
+    const unconfirmedFrame = unconfirmed.push(encodeResult(3, 0))[0];
+    unconfirmed.finish();
+    expect(unconfirmedFrame).toMatchObject({ type: "result", result: { outcome: 3, treeTerminationConfirmed: false } });
+
+    const confirmed = new HelperOutputDecoder(9);
+    const confirmedFrame = confirmed.push(encodeResult(3, 1))[0];
+    confirmed.finish();
+    expect(confirmedFrame).toMatchObject({ type: "result", result: { outcome: 3, treeTerminationConfirmed: true } });
+
+    const invalid = new HelperOutputDecoder(9);
+    expect(() => invalid.push(encodeResult(0, 2))).toThrow("HELPER_PROTOCOL_BAD_RESULT");
+  });
+
   it("serializes bound Full Access Git as V8 with the existing plan materials and snapshots", () => {
     const request = fullAccessGitRequest();
     const bytes = serializeFullAccessGitHelperRequest(request);
-    expect(EXECUTION_HELPER_PROTOCOL_VERSION).toBe(8);
+    expect(EXECUTION_HELPER_PROTOCOL_VERSION).toBe(9);
     expect(bytes.subarray(0, 8)).toEqual(Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x38, 0x00]));
     expect(bytes.readUInt16LE(8)).toBe(8);
     expect(bytes.readUInt8(10)).toBe(2);
@@ -171,7 +197,7 @@ describe("execution helper build and protocol contract", () => {
     fs.mkdirSync(path.join(root, "dist", "execution"), { recursive: true });
     fs.writeFileSync(helper, fakePe());
     fs.writeFileSync(path.join(root, "dist", "execution", "c2c-execution-helper-integrity.json"), JSON.stringify({
-      version: 2, protocolVersion: 8, helperPath: "build/native/c2c-execution-helper.exe", sha256: "0".repeat(64),
+      version: 2, protocolVersion: 9, helperPath: "build/native/c2c-execution-helper.exe", sha256: "0".repeat(64),
       launcherPath: "build/native/c2c-execution-launcher.exe",
       launcherSha256: createHash("sha256").update(fakePe()).digest("hex"),
     }));
@@ -200,7 +226,7 @@ describe("execution helper build and protocol contract", () => {
 
     fs.writeFileSync(path.join(root, "dist", "execution", "c2c-execution-helper-integrity.json"), JSON.stringify({
       version: 2,
-      protocolVersion: 8,
+      protocolVersion: 9,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: createHash("sha256").update(fakePe()).digest("hex"),
       launcherPath: "build/native/c2c-execution-launcher.exe",
@@ -228,7 +254,7 @@ describe("execution helper build and protocol contract", () => {
     fs.writeFileSync(launcher, launcherBytes);
     fs.writeFileSync(metadata, JSON.stringify({
       version: 2,
-      protocolVersion: 8,
+      protocolVersion: 9,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: createHash("sha256").update(corrupt).digest("hex"),
       launcherPath: "build/native/c2c-execution-launcher.exe",

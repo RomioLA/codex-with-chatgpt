@@ -314,6 +314,87 @@ describe("ExecutionJobStore", () => {
     });
   });
 
+  it("keeps interrupted jobs without confirmed cleanup evidence out of history", () => {
+    const directory = makeTmpDir("execution-interrupted-not-archived");
+    const workspaceId = "execution-interrupted-not-archived";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const job = makeJob(workspaceId, "interrupted");
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    job.createdAt = oldAt;
+    job.startedAt = oldAt;
+    job.finishedAt = oldAt;
+    job.failureCode = "TREE_TERMINATION_UNCONFIRMED";
+    job.tempOwnership = {
+      rootFileIdentity: "1:2",
+      directoryFileIdentity: "3:4",
+      nonce: "a".repeat(64),
+      createdAtMs: 1,
+    };
+    store.create(job);
+    store.prepareCapacity();
+
+    expect(fs.existsSync(archivePath(directory, "jobs", job.jobId))).toBe(false);
+    expect(store.get(job.jobId)).toMatchObject({ state: "interrupted", tempOwnership: job.tempOwnership });
+  });
+
+  it("archives a safely recovered interrupted job after the seven-day retention period", () => {
+    const directory = makeTmpDir("execution-interrupted-recovered-archive");
+    const workspaceId = "execution-interrupted-recovered-archive";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const job = makeJob(workspaceId, "interrupted");
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    job.createdAt = oldAt;
+    job.startedAt = oldAt;
+    job.finishedAt = oldAt;
+    job.failureCode = "OUTPUT_PERSISTENCE_FAILED";
+    job.tempOwnership = null;
+    job.recoveryEvidence = "process_tree_and_temp_cleaned";
+    store.create(job);
+    store.prepareCapacity();
+
+    expect(fs.existsSync(archivePath(directory, "jobs", job.jobId))).toBe(true);
+    expect(store.get(job.jobId)).toMatchObject({
+      state: "interrupted",
+      tempOwnership: null,
+      recoveryEvidence: "process_tree_and_temp_cleaned",
+    });
+    expect(store.lookupIdempotentForReconciliation(job.oauthClientId, job.idempotencyKeyHash))
+      .toMatchObject({ kind: "found", job: { jobId: job.jobId, state: "interrupted" } });
+  });
+
+  it("preserves recovered interrupted Git jobs with an unknown remote outcome", () => {
+    const directory = makeTmpDir("execution-interrupted-git-unknown");
+    const workspaceId = "execution-interrupted-git-unknown";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const job = makeJob(workspaceId, "interrupted");
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    job.createdAt = oldAt;
+    job.startedAt = oldAt;
+    job.finishedAt = oldAt;
+    job.tempOwnership = null;
+    job.recoveryEvidence = "process_tree_and_temp_cleaned";
+    job.authorization = { type: "git", requestId: "git-recovery-0001", digest: "b".repeat(64) };
+    job.gitResult = {
+      confirmation: "confirmed",
+      confirmationScope: "local_repository",
+      remoteOutcome: "unknown",
+      partialSuccessPossible: true,
+      headBefore: null,
+      headAfter: null,
+      branchBefore: null,
+      branchAfter: null,
+    };
+    store.create(job);
+    store.prepareCapacity();
+
+    expect(fs.existsSync(archivePath(directory, "jobs", job.jobId))).toBe(false);
+    expect(store.get(job.jobId)).toMatchObject({
+      state: "interrupted",
+      recoveryEvidence: "process_tree_and_temp_cleaned",
+      gitResult: { remoteOutcome: "unknown", partialSuccessPossible: true },
+    });
+  });
+
   it("persists only committed output metadata when a state transition races a pending tail", async () => {
     const directory = makeTmpDir("execution-pending-output-restart");
     const store = new ExecutionJobStore("pending-output-restart", { directory });

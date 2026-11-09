@@ -59,7 +59,11 @@ export class ExecutionTempOwner {
   private readonly canonicalParent: string;
   private establishedRootIdentity: string | null = null;
 
-  constructor(stateDirectory: string, readonly workspaceId: string) {
+  constructor(
+    stateDirectory: string,
+    readonly workspaceId: string,
+    private readonly cleanupImpl: typeof runExecutionTempCleanup = runExecutionTempCleanup,
+  ) {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(workspaceId)) throw new Error("TEMP_OWNER_INVALID");
     this.canonicalParent = fs.realpathSync.native(stateDirectory);
     this.root = path.join(this.canonicalParent, "execution-temp");
@@ -221,12 +225,34 @@ export class ExecutionTempOwner {
     return `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
   }
 
-  cleanup(jobId: string, ownership: ExecutionTempOwnership, afterValidation?: () => void): boolean {
-    if (!this.validate(jobId, ownership)) return false;
+  cleanup(
+    jobId: string,
+    ownership: ExecutionTempOwnership,
+    afterValidation?: () => void,
+    allowMissingTarget = false,
+  ): boolean {
+    let validated = this.validate(jobId, ownership);
+    if (!validated && allowMissingTarget) {
+      let lease: ExecutionTempLease;
+      try {
+        this.ensureRoot();
+        lease = this.lease(jobId, ownership);
+      } catch {
+        return false;
+      }
+      try {
+        fs.lstatSync(lease.directoryPath);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        validated = true;
+      }
+    }
+    if (!validated) return false;
     try {
       afterValidation?.();
-      if (process.platform !== "win32") return false;
-      return runExecutionTempCleanup(this.lease(jobId, ownership), this.canonicalParent);
+      if (process.platform !== "win32" && this.cleanupImpl === runExecutionTempCleanup) return false;
+      return this.cleanupImpl(this.lease(jobId, ownership), this.canonicalParent);
     } catch {
       return false;
     }
@@ -235,11 +261,24 @@ export class ExecutionTempOwner {
   reconcileStaleTemps(
     records: readonly ExecutionTempRecord[],
     activeJobIds: ReadonlySet<string> = new Set(),
-  ): { removed: number; skipped: number } {
+    allowMissingTargets = false,
+  ): { removed: number; skipped: number; removedJobIds: string[] } {
     this.ensureRoot();
     const ownership = new Map(records.map((record) => [record.jobId, record.ownership]));
     let removed = 0;
     let skipped = 0;
+    const removedJobIds: string[] = [];
+    const attempted = new Set<string>();
+    for (const [jobId, record] of ownership) {
+      if (activeJobIds.has(jobId)) continue;
+      attempted.add(jobId);
+      if (this.cleanup(jobId, record, undefined, allowMissingTargets)) {
+        removed += 1;
+        removedJobIds.push(jobId);
+      } else {
+        skipped += 1;
+      }
+    }
     for (const name of fs.readdirSync(this.root)) {
       if (!name.startsWith("tmp-")) continue;
       const jobId = name.slice(4);
@@ -247,12 +286,10 @@ export class ExecutionTempOwner {
         skipped += 1;
         continue;
       }
-      if (activeJobIds.has(jobId)) continue;
-      const record = ownership.get(jobId);
-      if (record && this.cleanup(jobId, record)) removed += 1;
-      else skipped += 1;
+      if (activeJobIds.has(jobId) || attempted.has(jobId)) continue;
+      skipped += 1;
     }
-    return { removed, skipped };
+    return { removed, skipped, removedJobIds };
   }
 }
 

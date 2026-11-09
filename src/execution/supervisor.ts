@@ -7,6 +7,7 @@ import type { Workspace } from "../workspace/manager.js";
 import type {
   ExecutionJob,
   ExecutionKind,
+  ExecutionRecoveryEvidence,
   FullAccessExecutionJob,
   FullAccessGitExecutionAuthorization,
   OutputStream,
@@ -21,8 +22,9 @@ import { resolveRepositoryIdentity, RepositoryIdentityError, type RepositoryIden
 import { findTrustedCommand, CommandNotApprovedError, type TrustedCommand } from "./trusted-registry.js";
 import { ExecutionJobStore, MAX_JOBS_PER_WORKSPACE, type ReadJobOutputResult } from "./job-store.js";
 import { transitionExecutionJob } from "./state-machine.js";
-import { NativeRunnerOutputError, WindowsNativeExecutionRunner, type NativeRunnerHandle, type NativeRunnerRequest } from "./native-runner.js";
+import { NativeRunnerCleanupError, NativeRunnerOutputError, WindowsNativeExecutionRunner, type NativeRunnerHandle, type NativeRunnerRequest } from "./native-runner.js";
 import { ExecutionTempOwner } from "./execution-temp.js";
+import type { runExecutionTempCleanup } from "./execution-temp-cleanup.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
@@ -43,6 +45,11 @@ export const MAX_WORKSPACE_EXECUTIONS = 2;
 export const MAX_REPOSITORY_EXECUTIONS = 1;
 export const EXECUTION_CANCEL_GRACE_MS = 10_000;
 export const EXECUTION_PERMISSION_POLL_MS = 250;
+
+function recoveryEvidence(treeConfirmed: boolean, cleanupConfirmed: boolean): ExecutionRecoveryEvidence | undefined {
+  if (!treeConfirmed) return undefined;
+  return cleanupConfirmed ? "process_tree_and_temp_cleaned" : "process_tree_exited";
+}
 
 interface StartExecutionInput {
   repositoryPath: string;
@@ -105,7 +112,7 @@ interface ActiveExecution {
   decoders: Record<OutputStream, StringDecoder>;
   finished: Promise<void>;
   releaseWriteLock?: () => void;
-  treeConfirmed?: boolean;
+  treeConfirmed: boolean;
   tempCleanupConfirmed: boolean;
   outputTail: Promise<void>;
   outputFailure: unknown | null;
@@ -199,6 +206,7 @@ export class ExecutionSupervisor {
     options: {
       store?: ExecutionJobStore;
       runner?: ExecutionRunner;
+      tempCleanupImpl?: typeof runExecutionTempCleanup;
       permissionPollMs?: number;
       cancelGraceMs?: number;
       now?: () => number;
@@ -207,19 +215,8 @@ export class ExecutionSupervisor {
   ) {
     this.logger = options.logger ?? nullLogger;
     this.store = options.store ?? new ExecutionJobStore(workspace.id);
-    this.tempOwner = new ExecutionTempOwner(this.store.directory, workspace.id);
-    if (!this.store.corruption) {
-      const records = this.store.listAll().flatMap((job) => job.tempOwnership
-        ? [{ jobId: job.jobId, ownership: job.tempOwnership }]
-        : []);
-      const recovery = this.tempOwner.reconcileStaleTemps(records);
-      if (recovery.skipped > 0) {
-        this.logger.warn("Execution temp recovery preserved unknown or unverified directories", {
-          workspaceId: workspace.id,
-          skipped: recovery.skipped,
-        });
-      }
-    }
+    this.tempOwner = new ExecutionTempOwner(this.store.directory, workspace.id, options.tempCleanupImpl);
+    this.reconcileRecoveredTemps();
     this.runner = options.runner ?? new WindowsNativeExecutionRunner();
     this.permissionPollMs = options.permissionPollMs ?? EXECUTION_PERMISSION_POLL_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? EXECUTION_CANCEL_GRACE_MS;
@@ -262,7 +259,7 @@ export class ExecutionSupervisor {
       return { ok: false, error: "IDEMPOTENCY_CONFLICT" };
     }
     try {
-      this.store.prepareCapacity();
+      this.prepareCapacity();
       const authorization = consumeLevel3Request(this.workspace, input.requestId, input.oauthClientId, input.digest);
       return this.enqueueControlled(authorization.repository, { type: "level3", requestId: input.requestId, digest: input.digest },
         authorization.request.spec.timeoutSeconds, hash, input.oauthClientId);
@@ -325,7 +322,7 @@ export class ExecutionSupervisor {
       }
     }
     try {
-      this.store.prepareCapacity();
+      this.prepareCapacity();
       if (hasGitReviewHold(this.workspace, input.repositoryPath)) return { ok: false, error: "GIT_REVIEW_REQUIRED" };
       const created = createGitJobPlan(this.workspace, input.repositoryPath, input.operation, planAuthorization);
       const authorization: RepositoryExecutionAuthorization = grant
@@ -476,6 +473,7 @@ export class ExecutionSupervisor {
       stderr: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
     };
     try {
+      this.prepareCapacity();
       this.store.create(job);
     } catch (error) {
       return { ok: false, error: (error as Error).message === "JOB_STORE_FULL" ? "JOB_STORE_FULL" : "INVALID_ARGUMENTS" };
@@ -573,7 +571,7 @@ export class ExecutionSupervisor {
     // before a new child job becomes durable and eligible for dispatch.
     if (beforeCreate && !beforeCreate()) return { ok: false, error: "TASK_STATE_CONFLICT" };
 
-    try { this.store.prepareCapacity(); } catch (error) {
+    try { this.prepareCapacity(); } catch (error) {
       return { ok: false, error: cleanCode((error as Error).message) };
     }
     const job: FullAccessExecutionJob = {
@@ -948,17 +946,28 @@ export class ExecutionSupervisor {
       this.active.set(job.jobId, active);
       active.finished = handle.completion
         .then(async (completion) => {
-          active.treeConfirmed = completion.result.outcome !== 3;
+          active.treeConfirmed = completion.result.treeTerminationConfirmed ?? completion.result.outcome !== 3;
           active.tempCleanupConfirmed = completion.tempCleanupConfirmed === true;
           await this.completeJob(job.jobId, active, completion.result, completion.tempCleanupConfirmed === true);
         })
         .catch((error: unknown) => {
           if (error instanceof NativeRunnerOutputError) {
-            active.treeConfirmed = error.helperResult.outcome !== 3;
+            active.treeConfirmed = error.treeTerminationConfirmed;
+            active.tempCleanupConfirmed = error.tempCleanupConfirmed;
+          } else if (error instanceof NativeRunnerCleanupError) {
+            active.treeConfirmed = error.treeTerminationConfirmed;
             active.tempCleanupConfirmed = error.tempCleanupConfirmed;
           }
-          return this.failUnconfirmed(job.jobId, active,
-            error instanceof Error && error.message === "OUTPUT_PERSISTENCE_FAILED" ? "OUTPUT_PERSISTENCE_FAILED" : "HELPER_UNCONFIRMED");
+          const code = error instanceof NativeRunnerCleanupError
+            ? "HELPER_CLEANUP_UNCONFIRMED"
+            : error instanceof NativeRunnerOutputError
+              ? error.treeTerminationConfirmed ? "OUTPUT_PERSISTENCE_FAILED" : "TREE_TERMINATION_UNCONFIRMED"
+              : error instanceof Error && error.message === "OUTPUT_PERSISTENCE_FAILED"
+                ? active.treeConfirmed && active.tempCleanupConfirmed
+                  ? "OUTPUT_PERSISTENCE_FAILED"
+                  : active.treeConfirmed ? "HELPER_CLEANUP_UNCONFIRMED" : "TREE_TERMINATION_UNCONFIRMED"
+                : "HELPER_UNCONFIRMED";
+          return this.failUnconfirmed(job.jobId, active, code);
         })
         .finally(() => this.releaseActive(job.jobId, active));
     } catch (error) {
@@ -1031,14 +1040,32 @@ export class ExecutionSupervisor {
     return active.outputFinalization;
   }
 
-  private async completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3 | 4 | 5; exitCode: number; win32Error: number }, tempCleanupConfirmed: boolean): Promise<void> {
+  private async completeJob(jobId: string, active: ActiveExecution, result: { outcome: 0 | 1 | 2 | 3 | 4 | 5; exitCode: number; win32Error: number; treeTerminationConfirmed?: boolean }, tempCleanupConfirmed: boolean): Promise<void> {
     await this.finalizeOutput(jobId, active);
     const job = this.store.get(jobId);
-    if (!job || job.state === "interrupted" || job.finishedAt) return;
+    if (!job) return;
+    const treeConfirmed = active.treeConfirmed && (result.treeTerminationConfirmed ?? result.outcome !== 3);
+    const cleanupConfirmed = treeConfirmed && tempCleanupConfirmed;
+    if (job.state === "interrupted" || job.finishedAt) {
+      const evidence = recoveryEvidence(treeConfirmed, cleanupConfirmed);
+      if (job.state === "interrupted" && evidence &&
+          (job.recoveryEvidence !== evidence || cleanupConfirmed && job.tempOwnership !== null)) {
+        this.store.replace({
+          ...job,
+          ...(cleanupConfirmed ? { tempOwnership: null } : {}),
+          recoveryEvidence: evidence,
+        });
+      }
+      return;
+    }
     let terminal: ExecutionJob["state"];
     let failureCode: string | null = null;
     let exitCode: number | null = result.outcome === 0 ? result.exitCode : null;
-    if (result.outcome === 3) {
+    if (!treeConfirmed) {
+      terminal = "interrupted";
+      failureCode = "TREE_TERMINATION_UNCONFIRMED";
+      exitCode = null;
+    } else if (result.outcome === 3) {
       terminal = "interrupted";
       failureCode = "HELPER_CLEANUP_UNCONFIRMED";
       exitCode = null;
@@ -1066,7 +1093,10 @@ export class ExecutionSupervisor {
     }
     const final = transitionExecutionJob({
       ...job,
-      tempOwnership: tempCleanupConfirmed ? null : job.tempOwnership,
+      tempOwnership: cleanupConfirmed ? null : job.tempOwnership,
+      ...(terminal === "interrupted" && recoveryEvidence(treeConfirmed, cleanupConfirmed)
+        ? { recoveryEvidence: recoveryEvidence(treeConfirmed, cleanupConfirmed) }
+        : {}),
     }, terminal, { exitCode, failureCode });
     this.store.replace(final);
     if (isFullAccessExecutionJob(final)) {
@@ -1085,13 +1115,16 @@ export class ExecutionSupervisor {
     try {
       await this.finalizeOutput(jobId, active);
     } catch (error) {
-      if (error instanceof Error && error.message === "OUTPUT_PERSISTENCE_FAILED") code = "OUTPUT_PERSISTENCE_FAILED";
+      if (error instanceof Error && error.message === "OUTPUT_PERSISTENCE_FAILED" &&
+          active.treeConfirmed && active.tempCleanupConfirmed) code = "OUTPUT_PERSISTENCE_FAILED";
     }
     const job = this.store.get(jobId);
     if (!job || job.finishedAt) return;
+    const evidence = recoveryEvidence(active.treeConfirmed, active.treeConfirmed && active.tempCleanupConfirmed);
     this.store.replace(transitionExecutionJob({
       ...job,
-      tempOwnership: active.tempCleanupConfirmed ? null : job.tempOwnership,
+      ...(active.treeConfirmed && active.tempCleanupConfirmed ? { tempOwnership: null } : {}),
+      ...(evidence ? { recoveryEvidence: evidence } : {}),
     }, "interrupted", { exitCode: null, failureCode: cleanCode(code) }));
   }
 
@@ -1100,11 +1133,47 @@ export class ExecutionSupervisor {
     try {
       await this.finalizeOutput(jobId, active);
     } catch {
-      failureCode = "OUTPUT_PERSISTENCE_FAILED";
+      if (active.treeConfirmed && active.tempCleanupConfirmed) failureCode = "OUTPUT_PERSISTENCE_FAILED";
     }
     const job = this.store.get(jobId);
     if (!job || job.finishedAt) return;
-    this.store.replace(transitionExecutionJob(job, "interrupted", { failureCode }));
+    const evidence = recoveryEvidence(active.treeConfirmed, active.treeConfirmed && active.tempCleanupConfirmed);
+    this.store.replace(transitionExecutionJob({
+      ...job,
+      ...(active.treeConfirmed && active.tempCleanupConfirmed ? { tempOwnership: null } : {}),
+      ...(evidence ? { recoveryEvidence: evidence } : {}),
+    }, "interrupted", { failureCode }));
+  }
+
+  private prepareCapacity(): void {
+    this.reconcileRecoveredTemps();
+    this.store.prepareCapacity();
+  }
+
+  private reconcileRecoveredTemps(): void {
+    if (this.store.corruption) return;
+    const records = this.store.listAll().flatMap((job) =>
+      job.state === "interrupted" && job.recoveryEvidence === "process_tree_exited" && job.tempOwnership
+        ? [{ jobId: job.jobId, ownership: job.tempOwnership }]
+        : []);
+    if (records.length === 0) return;
+    const recovery = this.tempOwner.reconcileStaleTemps(records, new Set(this.active.keys()), true);
+    for (const jobId of recovery.removedJobIds) {
+      const job = this.store.get(jobId);
+      if (!job || job.state !== "interrupted" || job.recoveryEvidence !== "process_tree_exited" ||
+          !job.tempOwnership || this.active.has(jobId)) continue;
+      this.store.replace({
+        ...job,
+        tempOwnership: null,
+        recoveryEvidence: "process_tree_and_temp_cleaned",
+      });
+    }
+    if (recovery.skipped > 0) {
+      this.logger.warn("Execution temp recovery preserved unknown or unverified directories", {
+        workspaceId: this.workspace.id,
+        skipped: recovery.skipped,
+      });
+    }
   }
 
   private releaseActive(jobId: string, active: ActiveExecution): void {
@@ -1257,16 +1326,7 @@ export class ExecutionSupervisor {
     }
     if (!this.store.corruption) {
       try {
-        const records = this.store.listAll().flatMap((job) => job.tempOwnership
-          ? [{ jobId: job.jobId, ownership: job.tempOwnership }]
-          : []);
-        const recovery = this.tempOwner.reconcileStaleTemps(records, new Set(this.active.keys()));
-        if (recovery.skipped > 0) {
-          this.logger.warn("Execution temp cleanup preserved unknown or unverified directories", {
-            workspaceId: this.workspace.id,
-            skipped: recovery.skipped,
-          });
-        }
+        this.reconcileRecoveredTemps();
       } catch {
         /* unknown or replaced temp roots are preserved for conservative recovery */
       }

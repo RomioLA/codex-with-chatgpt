@@ -36,7 +36,7 @@ if ($helperHash -notmatch '^[a-f0-9]{64}$' -or $launcherHash -notmatch '^[a-f0-9
 
 $metadata = [ordered]@{
     version = 2
-    protocolVersion = 8
+    protocolVersion = 9
     helperPath = 'build/native/c2c-execution-helper.exe'
     sha256 = $helperHash
     launcherPath = 'build/native/c2c-execution-launcher.exe'

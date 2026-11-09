@@ -1,14 +1,17 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { Logger } from "../src/logger/index.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supervisor.js";
-import { resolveExecutionHelperPath, resolveExecutionLauncherPath, WindowsNativeExecutionRunner } from "../src/execution/native-runner.js";
+import { NativeRunnerCleanupError, resolveExecutionHelperPath, resolveExecutionLauncherPath, WindowsNativeExecutionRunner } from "../src/execution/native-runner.js";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { ExecutionTempOwner } from "../src/execution/execution-temp.js";
 import { resolveTrustedRuntime } from "../src/execution/runtime-discovery.js";
 import { resolveRepositoryIdentity } from "../src/execution/repository-identity.js";
@@ -265,13 +268,90 @@ function makeExecutionDistributionFixture(root: string): {
   const launcherHash = sha256File(launcherPath);
   fs.writeFileSync(path.join(moduleDirectory, "c2c-execution-helper-integrity.json"), JSON.stringify({
     version: 2,
-    protocolVersion: 8,
+    protocolVersion: 9,
     helperPath: "build/native/c2c-execution-helper.exe",
     sha256: helperHash,
     launcherPath: "build/native/c2c-execution-launcher.exe",
     launcherSha256: launcherHash,
   }));
   return { moduleDirectory, helperPath, launcherPath, helperHash };
+}
+
+function makeMockExecutionDistributionFixture(root: string): { moduleDirectory: string } {
+  const moduleDirectory = path.join(root, "dist", "execution");
+  const nativeDirectory = path.join(root, "build", "native");
+  const helperPath = path.join(nativeDirectory, "c2c-execution-helper.exe");
+  const launcherPath = path.join(nativeDirectory, "c2c-execution-launcher.exe");
+  const whereExe = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "where.exe");
+  fs.mkdirSync(moduleDirectory, { recursive: true });
+  fs.mkdirSync(nativeDirectory, { recursive: true });
+  fs.copyFileSync(whereExe, helperPath);
+  fs.copyFileSync(whereExe, launcherPath);
+  fs.writeFileSync(path.join(moduleDirectory, "c2c-execution-helper-integrity.json"), JSON.stringify({
+    version: 2,
+    protocolVersion: 9,
+    helperPath: "build/native/c2c-execution-helper.exe",
+    sha256: sha256File(helperPath),
+    launcherPath: "build/native/c2c-execution-launcher.exe",
+    launcherSha256: sha256File(launcherPath),
+  }));
+  return { moduleDirectory };
+}
+
+function encodeNativeResult(outcome: number, treeConfirmed: boolean): Buffer {
+  const payload = Buffer.alloc(10);
+  payload.writeUInt8(outcome, 0);
+  payload.writeUInt32LE(0, 1);
+  payload.writeUInt32LE(0, 5);
+  payload.writeUInt8(treeConfirmed ? 1 : 0, 9);
+  const frame = Buffer.alloc(5);
+  frame.writeUInt8(3, 0);
+  frame.writeUInt32LE(payload.byteLength, 1);
+  return Buffer.concat([Buffer.from("C2COUT9\0", "ascii"), frame, payload]);
+}
+
+function makeFakeNativeChild(result: Buffer): ChildProcessWithoutNullStreams {
+  const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  Object.assign(child, { stdin, stdout, stderr });
+  setImmediate(() => {
+    stdout.end(result);
+    stderr.end();
+    stdin.end();
+    child.emit("close", 0);
+  });
+  return child;
+}
+
+function makeNativeRunnerRequest(root: string, stateRoot: string, owner: ExecutionTempOwner, jobId: string) {
+  const stateDirectory = path.join(stateRoot, "execution-jobs", owner.workspaceId);
+  const tempLease = owner.create(jobId);
+  return {
+    jobId,
+    timeoutSeconds: 10,
+    stateDirectory,
+    tempLease,
+    fullAccess: {
+      workspaceId: owner.workspaceId,
+      oauthClientId: "native-runner-order-client",
+      permissionMode: "level2" as const,
+      sessionGrantFingerprint: "d".repeat(64),
+      sessionGrantId: "e".repeat(64),
+      idempotencyKeyHash: "f".repeat(64),
+      requestHash: "a".repeat(64),
+      command: {
+        engine: "program" as const,
+        executable: process.execPath,
+        executableFileIdentity: "1:2",
+        executableHash: "b".repeat(64),
+        args: [],
+        cwd: root,
+        cwdFileIdentity: "3:4",
+      },
+    },
+  };
 }
 
 function buildUntrustedHelperFixture(outputPath: string): void {
@@ -356,6 +436,73 @@ async function runNativeTreeOutcome(name: string, outcome: "cancelled" | "timed_
 }
 
 describe("Windows execution lifecycle acceptance", () => {
+  it.skipIf(process.platform !== "win32")("cleans temp only after a valid helper result confirms the process tree", async () => {
+    const root = makeSystemTempDir("windows-cleanup-after-tree-result");
+    const stateRoot = makeSystemTempDir("windows-cleanup-after-tree-state");
+    const workspaceId = "native-runner-order-workspace";
+    const stateDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(stateDirectory, { recursive: true });
+    const owner = new ExecutionTempOwner(stateDirectory, workspaceId);
+    const distribution = makeMockExecutionDistributionFixture(root);
+    let cleanupCalls = 0;
+    const runner = new WindowsNativeExecutionRunner({
+      moduleDirectory: distribution.moduleDirectory,
+      spawnImpl: (() => makeFakeNativeChild(encodeNativeResult(0, true))) as never,
+      cleanupImpl: () => { cleanupCalls += 1; return true; },
+    });
+    const request = makeNativeRunnerRequest(root, stateRoot, owner, "confirmed-tree-order-job-0001");
+    const completion = await runner.start(request, { onOutput: () => undefined }).completion;
+
+    expect(completion.result.treeTerminationConfirmed).toBe(true);
+    expect(completion.tempCleanupConfirmed).toBe(true);
+    expect(cleanupCalls).toBe(1);
+  }, 45_000);
+
+  it.skipIf(process.platform !== "win32")("preserves temp and skips cleanup when helper cannot confirm process-tree exit", async () => {
+    const root = makeSystemTempDir("windows-unconfirmed-tree-result");
+    const stateRoot = makeSystemTempDir("windows-unconfirmed-tree-state");
+    const workspaceId = "native-runner-unconfirmed-workspace";
+    const stateDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(stateDirectory, { recursive: true });
+    const owner = new ExecutionTempOwner(stateDirectory, workspaceId);
+    const distribution = makeMockExecutionDistributionFixture(root);
+    let cleanupCalls = 0;
+    const runner = new WindowsNativeExecutionRunner({
+      moduleDirectory: distribution.moduleDirectory,
+      spawnImpl: (() => makeFakeNativeChild(encodeNativeResult(3, false))) as never,
+      cleanupImpl: () => { cleanupCalls += 1; return true; },
+    });
+    const request = makeNativeRunnerRequest(root, stateRoot, owner, "unconfirmed-tree-order-job-001");
+    const completion = await runner.start(request, { onOutput: () => undefined }).completion;
+
+    expect(completion.result).toMatchObject({ outcome: 3, treeTerminationConfirmed: false });
+    expect(completion.tempCleanupConfirmed).toBe(false);
+    expect(cleanupCalls).toBe(0);
+    expect(fs.existsSync(request.tempLease.directoryPath)).toBe(true);
+  }, 45_000);
+
+  it.skipIf(process.platform !== "win32")("keeps temp ownership when a confirmed-tree cleanup fails", async () => {
+    const root = makeSystemTempDir("windows-cleanup-failure-after-tree");
+    const stateRoot = makeSystemTempDir("windows-cleanup-failure-state");
+    const workspaceId = "native-runner-cleanup-failure";
+    const stateDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(stateDirectory, { recursive: true });
+    const owner = new ExecutionTempOwner(stateDirectory, workspaceId);
+    const distribution = makeMockExecutionDistributionFixture(root);
+    let cleanupCalls = 0;
+    const runner = new WindowsNativeExecutionRunner({
+      moduleDirectory: distribution.moduleDirectory,
+      spawnImpl: (() => makeFakeNativeChild(encodeNativeResult(0, true))) as never,
+      cleanupImpl: () => { cleanupCalls += 1; return false; },
+    });
+    const request = makeNativeRunnerRequest(root, stateRoot, owner, "cleanup-failure-tree-job-0001");
+
+    await expect(runner.start(request, { onOutput: () => undefined }).completion)
+      .rejects.toBeInstanceOf(NativeRunnerCleanupError);
+    expect(cleanupCalls).toBe(1);
+    expect(fs.existsSync(request.tempLease.directoryPath)).toBe(true);
+  }, 45_000);
+
   it.skipIf(process.platform !== "win32")("A: owner process loss closes the full native Job tree", async () => {
     const helperPath = path.join(projectRoot, "build", "native", "c2c-execution-helper.exe");
     if (!fs.existsSync(helperPath)) throw new Error("Build the native helper before this acceptance test.");
@@ -562,7 +709,7 @@ describe("Windows execution lifecycle acceptance", () => {
     const launcherHash = sha256File(launcherCandidate);
     fs.writeFileSync(path.join(moduleDirectory, "c2c-execution-helper-integrity.json"), JSON.stringify({
       version: 2,
-      protocolVersion: 8,
+      protocolVersion: 9,
       helperPath: "build/native/c2c-execution-helper.exe",
       sha256: trustedHelperHash,
       launcherPath: "build/native/c2c-execution-launcher.exe",

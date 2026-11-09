@@ -54,7 +54,7 @@ constexpr BYTE kFrameResult = 3;
 constexpr BYTE kRequestMagicV5[8] = {'C', '2', 'C', 'J', 'O', 'B', '5', 0};
 constexpr BYTE kRequestMagicV7[8] = {'C', '2', 'C', 'J', 'O', 'B', '7', 0};
 constexpr BYTE kRequestMagicV8[8] = {'C', '2', 'C', 'J', 'O', 'B', '8', 0};
-constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '8', 0};
+constexpr BYTE kOutputMagic[8] = {'C', '2', 'C', 'O', 'U', 'T', '9', 0};
 constexpr BYTE kTempCleanupMagic[8] = {'C', '2', 'C', 'T', 'M', 'P', '1', 0};
 
 struct UniqueHandle {
@@ -382,8 +382,9 @@ bool WriteFrame(HANDLE output, BYTE type, const BYTE* payload, DWORD length, DWO
     return length == 0 || WriteAll(output, payload, length, error);
 }
 
-bool EmitResult(HANDLE output, Outcome outcome, DWORD childExitCode, DWORD win32Error) {
-    BYTE payload[9] = {
+bool EmitResult(HANDLE output, Outcome outcome, DWORD childExitCode, DWORD win32Error,
+                bool treeTerminationConfirmed) {
+    BYTE payload[10] = {
         static_cast<BYTE>(outcome),
         static_cast<BYTE>(childExitCode & 0xFF),
         static_cast<BYTE>((childExitCode >> 8) & 0xFF),
@@ -393,6 +394,7 @@ bool EmitResult(HANDLE output, Outcome outcome, DWORD childExitCode, DWORD win32
         static_cast<BYTE>((win32Error >> 8) & 0xFF),
         static_cast<BYTE>((win32Error >> 16) & 0xFF),
         static_cast<BYTE>((win32Error >> 24) & 0xFF),
+        static_cast<BYTE>(treeTerminationConfirmed ? 1 : 0),
     };
     DWORD error = ERROR_SUCCESS;
     return WriteFrame(output, kFrameResult, payload, static_cast<DWORD>(sizeof(payload)), error);
@@ -2527,16 +2529,46 @@ bool CleanupOwnedExecutionTemp(const TempCleanupRequest& request, DWORD& error) 
     const std::wstring authorityPath = storeDirectory + L"\\.c2c-execution-temp-job-" + request.jobId;
     const std::string expectedAuthority = "C2C-EXECUTION-TEMP-AUTHORITY-V1\n" + workspaceId + "\n" + jobId + "\n" +
         nonce + "\n" + rootIdentity + "\n" + directoryIdentity + "\n" + createdAt + "\n";
+    const std::wstring targetPath = canonicalRoot + L"\\tmp-" + request.jobId;
+    const DWORD targetAttributes = GetFileAttributesW(targetPath.c_str());
+    if (targetAttributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD attributeError = GetLastError();
+        if (attributeError != ERROR_FILE_NOT_FOUND && attributeError != ERROR_PATH_NOT_FOUND) {
+            error = attributeError;
+            return false;
+        }
+        UniqueHandle authority;
+        if (OpenMatchingMarkerFile(authorityPath, expectedAuthority, GENERIC_READ | DELETE, authority, error)) {
+            return MarkHandleForDeletion(authority.get(), error);
+        }
+        const DWORD authorityError = error;
+        const DWORD recheckAttributes = GetFileAttributesW(targetPath.c_str());
+        if ((authorityError == ERROR_FILE_NOT_FOUND || authorityError == ERROR_PATH_NOT_FOUND) &&
+            recheckAttributes == INVALID_FILE_ATTRIBUTES) {
+            const DWORD recheckError = GetLastError();
+            if (recheckError == ERROR_FILE_NOT_FOUND || recheckError == ERROR_PATH_NOT_FOUND) return true;
+        }
+        error = authorityError;
+        return false;
+    }
     UniqueHandle authority;
     if (!OpenMatchingMarkerFile(authorityPath, expectedAuthority, GENERIC_READ | DELETE, authority, error)) return false;
 
-    const std::wstring targetPath = canonicalRoot + L"\\tmp-" + request.jobId;
     UniqueHandle target(CreateFileW(targetPath.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | DELETE,
                                     FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                                     nullptr));
     if (!target.valid()) {
         const DWORD openError = GetLastError();
+        if (openError == ERROR_FILE_NOT_FOUND || openError == ERROR_PATH_NOT_FOUND) {
+            const DWORD recheckAttributes = GetFileAttributesW(targetPath.c_str());
+            if (recheckAttributes == INVALID_FILE_ATTRIBUTES) {
+                const DWORD recheckError = GetLastError();
+                if (recheckError == ERROR_FILE_NOT_FOUND || recheckError == ERROR_PATH_NOT_FOUND) {
+                    return MarkHandleForDeletion(authority.get(), error);
+                }
+            }
+        }
         error = openError;
         return false;
     }
@@ -2576,7 +2608,20 @@ bool CleanupOwnedExecutionTemp(const TempCleanupRequest& request, DWORD& error) 
 int RunTempCleanup(HANDLE input) {
     DWORD error = ERROR_SUCCESS;
     TempCleanupRequest request;
-    if (!ReadTempCleanupRequest(input, request, error) || !CleanupOwnedExecutionTemp(request, error)) {
+    bool cleaned = false;
+    if (ReadTempCleanupRequest(input, request, error)) {
+        constexpr DWORD retryDelaysMs[] = {100, 500};
+        for (std::size_t attempt = 0; attempt <= std::size(retryDelaysMs); ++attempt) {
+            error = ERROR_SUCCESS;
+            if (CleanupOwnedExecutionTemp(request, error)) {
+                cleaned = true;
+                break;
+            }
+            if (error != ERROR_PATH_NOT_FOUND || attempt == std::size(retryDelaysMs)) break;
+            Sleep(retryDelaysMs[attempt]);
+        }
+    }
+    if (!cleaned) {
         if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
         const std::string diagnostic = "EXECUTION_TEMP_CLEANUP_WIN32_ERROR:" + std::to_string(error) + "\n";
         DWORD written = 0;
@@ -4153,23 +4198,23 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     if (argc != 1) {
-        EmitResult(output, Outcome::HelperError, 0, ERROR_INVALID_PARAMETER);
+        EmitResult(output, Outcome::HelperError, 0, ERROR_INVALID_PARAMETER, true);
         return 0;
     }
     if (input == nullptr || input == INVALID_HANDLE_VALUE) {
-        EmitResult(output, Outcome::HelperError, 0, ERROR_INVALID_HANDLE);
+        EmitResult(output, Outcome::HelperError, 0, ERROR_INVALID_HANDLE, true);
         return 0;
     }
 
     Request request;
     if (!ReadRequest(input, request, error)) {
         EmitResult(output, Outcome::HelperError, 0,
-                   error == ERROR_SUCCESS ? ERROR_INVALID_DATA : error);
+                   error == ERROR_SUCCESS ? ERROR_INVALID_DATA : error, true);
         return 0;
     }
     ControlReader control(input);
     if (!control.Start()) {
-        EmitResult(output, Outcome::HelperError, 0, ERROR_NOT_ENOUGH_MEMORY);
+        EmitResult(output, Outcome::HelperError, 0, ERROR_NOT_ENOUGH_MEMORY, true);
         return 0;
     }
 
@@ -4518,7 +4563,7 @@ int wmain(int argc, wchar_t** argv) {
         resultError = ERROR_GEN_FAILURE;
     }
     if (outcome == Outcome::HelperError) WriteHelperFailureDiagnostic(failureStage, resultError);
-    const bool resultEmitted = EmitResult(output, outcome, childExitCode, resultError);
+    const bool resultEmitted = EmitResult(output, outcome, childExitCode, resultError, jobZeroConfirmed);
     if (!resultEmitted) {
         // This one-shot helper must exit even when the owner has already
         // closed its output channel. The OS closes the Job handle on exit.

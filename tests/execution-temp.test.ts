@@ -41,6 +41,70 @@ describe("ExecutionTempOwner", () => {
     expect(owner.cleanup("../outside", lease)).toBe(false);
   });
 
+  it.skipIf(process.platform !== "win32")("treats a missing temp target as idempotent only with its matching authority record", () => {
+    const workspaceId = "temp-missing-target-test";
+    const stateRoot = makeSystemTempDir("execution-temp-missing-target");
+    const storeDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(storeDirectory, { recursive: true });
+    const owner = new ExecutionTempOwner(storeDirectory, workspaceId);
+    const lease = owner.create(jobId("missing-target"));
+    fs.unlinkSync(path.join(lease.directoryPath, ".c2c-job-owner"));
+    fs.rmdirSync(lease.directoryPath);
+
+    expect(runExecutionTempCleanup(lease, storeDirectory)).toBe(true);
+    expect(runExecutionTempCleanup(lease, storeDirectory)).toBe(true);
+    expect(fs.existsSync(lease.directoryPath)).toBe(false);
+  }, 45_000);
+
+  it("requires explicit confirmed-recovery authority before accepting a missing temp target", () => {
+    const workspaceId = "temp-recovery-missing-target";
+    const stateRoot = makeSystemTempDir("execution-temp-recovery-missing");
+    const storeDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(storeDirectory, { recursive: true });
+    let cleanupCalls = 0;
+    const owner = new ExecutionTempOwner(storeDirectory, workspaceId, () => {
+      cleanupCalls += 1;
+      return true;
+    });
+    const lease = owner.create(jobId("recovery-missing"));
+    fs.unlinkSync(path.join(lease.directoryPath, ".c2c-job-owner"));
+    fs.rmdirSync(lease.directoryPath);
+
+    expect(owner.cleanup(lease.jobId, lease)).toBe(false);
+    expect(cleanupCalls).toBe(0);
+    expect(owner.cleanup(lease.jobId, lease, undefined, true)).toBe(true);
+    expect(cleanupCalls).toBe(1);
+  });
+
+  it("preserves an owned temp when the cleanup primitive reports a real failure", () => {
+    const workspaceId = "temp-recovery-cleanup-failure";
+    const stateRoot = makeSystemTempDir("execution-temp-cleanup-failure");
+    const storeDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(storeDirectory, { recursive: true });
+    const owner = new ExecutionTempOwner(storeDirectory, workspaceId, () => false);
+    const lease = owner.create(jobId("cleanup-failure"));
+    fs.writeFileSync(path.join(lease.directoryPath, "keep.txt"), "keep");
+
+    expect(owner.cleanup(lease.jobId, lease)).toBe(false);
+    expect(fs.readFileSync(path.join(lease.directoryPath, "keep.txt"), "utf8")).toBe("keep");
+  });
+
+  it.skipIf(process.platform !== "win32")("does not accept a missing target when the authority identity mismatches", () => {
+    const workspaceId = "temp-missing-target-mismatch";
+    const stateRoot = makeSystemTempDir("execution-temp-missing-mismatch");
+    const storeDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
+    fs.mkdirSync(storeDirectory, { recursive: true });
+    const owner = new ExecutionTempOwner(storeDirectory, workspaceId);
+    const lease = owner.create(jobId("missing-mismatch"));
+    fs.unlinkSync(path.join(lease.directoryPath, ".c2c-job-owner"));
+    fs.rmdirSync(lease.directoryPath);
+    const authority = path.join(storeDirectory, `.c2c-execution-temp-job-${lease.jobId}`);
+    fs.writeFileSync(authority, "mismatched owner marker", "utf8");
+
+    expect(runExecutionTempCleanup(lease, storeDirectory)).toBe(false);
+    expect(fs.existsSync(authority)).toBe(true);
+  }, 45_000);
+
   it.skipIf(process.platform === "win32")("fails closed on platforms without the identity-bound native cleanup primitive", () => {
     const owner = makeExecutionTempOwner("execution-temp-unsupported-cleanup", "temp-unsupported-test");
     const id = jobId("unsupported");
@@ -103,10 +167,10 @@ describe("ExecutionTempOwner", () => {
       : []);
     const result = restartedOwner.reconcileStaleTemps(records);
     if (process.platform === "win32") {
-      expect(result).toEqual({ removed: 1, skipped: 1 });
+      expect(result).toMatchObject({ removed: 1, skipped: 1, removedJobIds: [staleId] });
       expect(fs.existsSync(stale.directoryPath)).toBe(false);
     } else {
-      expect(result).toEqual({ removed: 0, skipped: 2 });
+      expect(result).toMatchObject({ removed: 0, skipped: 2, removedJobIds: [] });
       expect(fs.existsSync(stale.directoryPath)).toBe(true);
     }
     expect(fs.existsSync(unknown)).toBe(true);
@@ -182,7 +246,7 @@ describe("ExecutionTempOwner", () => {
       unknownSkipped: recovery.skipped,
     }));
     expect(fs.existsSync(legacyJob)).toBe(true);
-    expect(recovery).toEqual({ removed: 1, skipped: 1 });
+    expect(recovery).toMatchObject({ removed: 1, skipped: 1, removedJobIds: [lease.jobId] });
   }, 45_000);
 
   it.skipIf(process.platform !== "win32")("native cleanup preserves a job when its sidecar ownership record is missing", () => {

@@ -214,8 +214,21 @@ export function archiveRecord(
 export function jobCanBeArchived(job: ExecutionJob): boolean {
   if (!job.finishedAt || job.tempOwnership !== null || job.state === "interrupted") return false;
   if (!["succeeded", "cancelled", "timed_out"].includes(job.state) && !(job.state === "failed" && (job.startedAt === null || ["NONZERO_EXIT", "AUTHORIZATION_REVOKED"].includes(job.failureCode ?? "")))) return false;
-  if (job.authorization?.type === "git" && (!job.gitResult || job.gitResult.integrity === "unexpected" || job.gitResult.remoteOutcome === "unknown" || job.gitResult.partialSuccessPossible || ["identity_changed", "unavailable"].includes(job.gitResult.confirmation))) return false;
-  return true;
+  return gitOutcomeCanBeArchived(job);
+}
+
+/** JobStore may move only explicitly recovered interrupted jobs into history. */
+export function jobCanBeStoredInArchive(job: ExecutionJob): boolean {
+  if (job.state !== "interrupted") return jobCanBeArchived(job);
+  return !!job.finishedAt && job.tempOwnership === null &&
+    job.recoveryEvidence === "process_tree_and_temp_cleaned" && gitOutcomeCanBeArchived(job);
+}
+
+function gitOutcomeCanBeArchived(job: ExecutionJob): boolean {
+  if (job.authorization?.type !== "git") return true;
+  return !!job.gitResult && job.gitResult.integrity !== "unexpected" &&
+    job.gitResult.remoteOutcome !== "unknown" && !job.gitResult.partialSuccessPossible &&
+    !["identity_changed", "unavailable"].includes(job.gitResult.confirmation);
 }
 
 export const archivedIdempotencyKey = (clientId: string, keyHash: string) => hash(`${clientId}\0${keyHash}`);

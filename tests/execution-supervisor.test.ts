@@ -41,10 +41,21 @@ class ControlledRunner implements ExecutionRunner {
     await this.runs.get(jobId)?.callbacks.onOutput(stream, Buffer.from(value, "utf8"));
   }
 
-  finish(jobId: string, outcome: NativeRunnerCompletion["result"]["outcome"], exitCode = 0): void {
+  finish(
+    jobId: string,
+    outcome: NativeRunnerCompletion["result"]["outcome"],
+    exitCode = 0,
+    confirmation: { treeTerminationConfirmed?: boolean; tempCleanupConfirmed?: boolean } = {},
+  ): void {
     this.runs.get(jobId)?.resolve({
-      result: { outcome, exitCode, win32Error: 0 },
+      result: {
+        outcome,
+        exitCode,
+        win32Error: 0,
+        treeTerminationConfirmed: confirmation.treeTerminationConfirmed ?? outcome !== 3,
+      },
       helperExitCode: 0,
+      tempCleanupConfirmed: confirmation.tempCleanupConfirmed ?? outcome !== 3,
     });
   }
 }
@@ -52,6 +63,7 @@ class ControlledRunner implements ExecutionRunner {
 let workspace: Workspace;
 let supervisor: ExecutionSupervisor;
 let runner: ControlledRunner;
+let tempCleanupCalls = 0;
 
 function startInput(overrides: Partial<Parameters<ExecutionSupervisor["start"]>[0]> = {}) {
   return {
@@ -111,6 +123,7 @@ async function acquireRepositoryLockWhenAvailable(repository: ReturnType<typeof 
 }
 
 beforeEach(() => {
+  tempCleanupCalls = 0;
   isolateStateDir();
   const root = makeTmpDir("execution-supervisor");
   makeGitRepo(root);
@@ -118,7 +131,23 @@ beforeEach(() => {
   workspace = new Workspace(root);
   setPermission(workspace.id, "level1");
   runner = new ControlledRunner();
-  supervisor = new ExecutionSupervisor(workspace, { runner, permissionPollMs: 60_000, cancelGraceMs: 5_000 });
+  supervisor = new ExecutionSupervisor(workspace, {
+    runner,
+    permissionPollMs: 60_000,
+    cancelGraceMs: 5_000,
+    tempCleanupImpl: (lease) => {
+      tempCleanupCalls += 1;
+      for (const name of fs.readdirSync(lease.directoryPath)) {
+        const file = path.join(lease.directoryPath, name);
+        if (!fs.lstatSync(file).isFile()) return false;
+        fs.unlinkSync(file);
+      }
+      fs.rmdirSync(lease.directoryPath);
+      const authority = path.join(path.dirname(lease.rootPath), `.c2c-execution-temp-job-${lease.jobId}`);
+      if (fs.existsSync(authority)) fs.unlinkSync(authority);
+      return true;
+    },
+  });
 });
 
 afterEach(async () => {
@@ -142,6 +171,49 @@ function approveTestRecipe(): void {
 }
 
 describe("ExecutionSupervisor", () => {
+  it("keeps the lease and marks interrupted when the helper cannot confirm process-tree exit", async () => {
+    approveTestRecipe();
+    const started = await supervisor.start(startInput());
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await waitForState(started.job.jobId, "running");
+    runner.finish(started.job.jobId, 3, 0, { treeTerminationConfirmed: false, tempCleanupConfirmed: false });
+
+    const interrupted = await waitForState(started.job.jobId, "interrupted");
+    expect(interrupted.failureCode).toBe("TREE_TERMINATION_UNCONFIRMED");
+    expect(interrupted.recoveryEvidence).toBeUndefined();
+    expect(interrupted.tempOwnership).not.toBeNull();
+  });
+
+  it("recovers a confirmed stale lease and archives it after seven days", async () => {
+    approveTestRecipe();
+    const started = await supervisor.start(startInput({ idempotencyKey: "tree-confirmed-recovery-0001" }));
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await waitForState(started.job.jobId, "running");
+    runner.finish(started.job.jobId, 3, 0, { treeTerminationConfirmed: true, tempCleanupConfirmed: false });
+    let interrupted = await waitForState(started.job.jobId, "interrupted");
+    const activeRuns = (supervisor as unknown as { active: Map<string, unknown> }).active;
+    await waitUntil(() => activeRuns.size === 0, 10_000);
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    supervisor.store.replace({
+      ...interrupted,
+      createdAt: oldAt,
+      startedAt: oldAt,
+      finishedAt: oldAt,
+    });
+
+    const followup = await supervisor.start(startInput({ idempotencyKey: "tree-confirmed-recovery-0002" }));
+    expect(followup.ok).toBe(true);
+    expect(tempCleanupCalls).toBeGreaterThan(0);
+    interrupted = supervisor.store.get(started.job.jobId)!;
+    expect(interrupted).toMatchObject({
+      state: "interrupted",
+      tempOwnership: null,
+      recoveryEvidence: "process_tree_and_temp_cleaned",
+    });
+  }, 45_000);
+
   it("requires an existing level2 grant and does not promote readonly or level1", async () => {
     setPermission(workspace.id, "readonly");
     expect(await supervisor.startFullAccess(fullAccessInput({ idempotencyKey: "full-access-readonly-0001" })))

@@ -7,7 +7,8 @@ const REQUEST_MAGIC_V7 = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x37, 
 const REQUEST_MAGIC_V8 = Buffer.from([0x43, 0x32, 0x43, 0x4a, 0x4f, 0x42, 0x38, 0x00]); // C2CJOB8\0
 const RESPONSE_MAGIC_V7 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x37, 0x00]); // C2COUT7\0
 const RESPONSE_MAGIC_V8 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x38, 0x00]); // C2COUT8\0
-export const EXECUTION_HELPER_PROTOCOL_VERSION = 8;
+const RESPONSE_MAGIC_V9 = Buffer.from([0x43, 0x32, 0x43, 0x4f, 0x55, 0x54, 0x39, 0x00]); // C2COUT9\0
+export const EXECUTION_HELPER_PROTOCOL_VERSION = 9;
 export const HELPER_CANCEL_BYTE = 0x01;
 export const MAX_HELPER_STRING_BYTES = 128 * 1024;
 export const MAX_HELPER_FRAME_BYTES = 64 * 1024;
@@ -151,6 +152,8 @@ export interface HelperResultFrame {
   outcome: 0 | 1 | 2 | 3 | 4 | 5;
   exitCode: number;
   win32Error: number;
+  /** True only after the helper has confirmed that its process tree is empty. */
+  treeTerminationConfirmed?: boolean;
 }
 
 export type HelperFrame =
@@ -423,7 +426,9 @@ export function serializeFullAccessHelperRequest(request: FullAccessHelperReques
 }
 
 function isPrefix(buffer: Buffer, expected: Buffer): boolean {
-  return buffer.length <= expected.length && buffer.equals(expected.subarray(0, buffer.length));
+  if (buffer.length === 0) return false;
+  const length = Math.min(buffer.length, expected.length);
+  return buffer.subarray(0, length).equals(expected.subarray(0, length));
 }
 
 function outputStream(type: number): OutputStream | null {
@@ -437,8 +442,9 @@ export class HelperOutputDecoder {
   private pending = Buffer.alloc(0);
   private headerSeen = false;
   private resultSeen = false;
+  private responseV9 = false;
 
-  constructor(private readonly expectedProtocolVersion?: 5 | 7 | 8) {}
+  constructor(private readonly expectedProtocolVersion?: 5 | 7 | 8 | 9) {}
 
   push(chunk: Buffer): HelperFrame[] {
     if (this.resultSeen && chunk.byteLength > 0) throw new Error("HELPER_PROTOCOL_TRAILING_DATA");
@@ -448,10 +454,12 @@ export class HelperOutputDecoder {
       const candidates = this.expectedProtocolVersion === 5 ? [RESPONSE_MAGIC_V5]
         : this.expectedProtocolVersion === 7 ? [RESPONSE_MAGIC_V7]
           : this.expectedProtocolVersion === 8 ? [RESPONSE_MAGIC_V8]
-            : [RESPONSE_MAGIC_V5, RESPONSE_MAGIC_V7, RESPONSE_MAGIC_V8];
+            : this.expectedProtocolVersion === 9 ? [RESPONSE_MAGIC_V9]
+              : [RESPONSE_MAGIC_V5, RESPONSE_MAGIC_V7, RESPONSE_MAGIC_V8, RESPONSE_MAGIC_V9];
       const matched = candidates.find((magic) => isPrefix(this.pending, magic));
       if (!matched) throw new Error("HELPER_PROTOCOL_BAD_HEADER");
       if (this.pending.byteLength < matched.byteLength) return frames;
+      this.responseV9 = matched === RESPONSE_MAGIC_V9;
       this.pending = this.pending.subarray(matched.byteLength);
       this.headerSeen = true;
     }
@@ -467,9 +475,13 @@ export class HelperOutputDecoder {
       if (stream) {
         frames.push({ type: stream, data: Buffer.from(payload) });
       } else if (type === 3) {
-        if (this.resultSeen || payload.byteLength !== 9) throw new Error("HELPER_PROTOCOL_BAD_RESULT");
+        if (this.resultSeen || payload.byteLength !== (this.responseV9 ? 10 : 9)) {
+          throw new Error("HELPER_PROTOCOL_BAD_RESULT");
+        }
         const outcome = payload.readUInt8(0);
         if (outcome > 5) throw new Error("HELPER_PROTOCOL_BAD_RESULT");
+        const treeTerminationConfirmed = this.responseV9 ? payload.readUInt8(9) : outcome === 3 ? 0 : 1;
+        if (this.responseV9 && treeTerminationConfirmed > 1) throw new Error("HELPER_PROTOCOL_BAD_RESULT");
         this.resultSeen = true;
         frames.push({
           type: "result",
@@ -477,6 +489,7 @@ export class HelperOutputDecoder {
             outcome: outcome as HelperResultFrame["outcome"],
             exitCode: payload.readUInt32LE(1),
             win32Error: payload.readUInt32LE(5),
+            treeTerminationConfirmed: treeTerminationConfirmed === 1,
           },
         });
         if (this.pending.byteLength > 0) throw new Error("HELPER_PROTOCOL_TRAILING_DATA");

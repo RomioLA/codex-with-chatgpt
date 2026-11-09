@@ -83,6 +83,8 @@ export interface ExecutionTempOwnership {
   createdAtMs: number;
 }
 
+export type ExecutionRecoveryEvidence = "process_tree_exited" | "process_tree_and_temp_cleaned";
+
 interface ExecutionJobBase {
   jobId: string;
   workspaceId: string;
@@ -94,6 +96,8 @@ interface ExecutionJobBase {
   timeoutSeconds: number;
   idempotencyKeyHash: string;
   tempOwnership: ExecutionTempOwnership | null;
+  /** Persisted only for interrupted jobs whose native process-tree result is verified. */
+  recoveryEvidence?: ExecutionRecoveryEvidence;
   exitCode: number | null;
   failureCode: string | null;
   stdout: ExecutionStreamMeta;
