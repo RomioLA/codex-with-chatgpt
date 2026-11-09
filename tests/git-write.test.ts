@@ -171,6 +171,23 @@ describe("Git write planning", () => {
     expect(plan.args.slice(-2)).toEqual(["--", "new-file.txt"]);
   });
 
+  it("binds only relevant ancestor .gitattributes without scanning unrelated dependency trees", () => {
+    const { root, workspace, expectedHead } = makeApprovedRepo();
+    write(root, ".gitignore", "src/.gitattributes\nnode_modules/\n");
+    const relevantAttributes = write(root, "src/.gitattributes", "*.txt text eol=lf\n");
+    const unrelatedAttributes = write(root, "node_modules/example/.gitattributes", "*.bin binary\n");
+    write(root, "src/new.txt", "new source\n");
+
+    const plan = planGitWrite(workspace, ".", {
+      kind: "add",
+      paths: ["src/new.txt"],
+      expectedHead,
+      expectedBranch: "main",
+    });
+
+    expect(plan.materials.some((item) => item.path === relevantAttributes)).toBe(true);
+    expect(plan.materials.some((item) => item.path === unrelatedAttributes)).toBe(false);
+  });
   it("fails closed when committing staged sensitive files or unresolved conflicts", () => {
     const { root, workspace, expectedHead } = makeApprovedRepo();
     write(root, ".env", "SECRET=value\n");

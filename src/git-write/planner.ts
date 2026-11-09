@@ -725,48 +725,64 @@ function captureHeadMaterial(repository: ReturnType<typeof resolveRepositoryIden
 function collectAttributeMaterials(
   root: string,
   repository: ReturnType<typeof resolveRepositoryIdentity>,
+  executable: GitExecutable,
+  config: GitConfigEntry[],
+  sourcePaths: string[],
 ): GitWriteMaterial[] {
   const paths: string[] = [
     path.join(repository.gitDirectory, "info", "attributes"),
     path.join(repository.commonGitDirectory, "info", "attributes"),
   ];
-  const pending = [root];
-  let visited = 0;
-  while (pending.length > 0) {
-    const directory = pending.pop()!;
-    let handle: fs.Dir;
+  const canonicalRoot = path.resolve(root);
+  const directories = new Map<string, string>();
+
+  const addAncestors = (candidate: string): void => {
+    const absolute = path.resolve(candidate);
+    const relative = path.relative(canonicalRoot, absolute);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new GitWriteError("UNSAFE_GIT_CONFIG");
+    }
+    let current = path.dirname(absolute);
+    for (;;) {
+      directories.set(norm(current), current);
+      if (directories.size > 100_000) throw new GitWriteError("UNSAFE_GIT_CONFIG");
+      if (norm(current) === norm(canonicalRoot)) break;
+      const parent = path.dirname(current);
+      if (parent === current) throw new GitWriteError("UNSAFE_GIT_CONFIG");
+      current = parent;
+    }
+  };
+
+  const common = buildCommonGitArgs(config, null);
+  const tracked = decodeGitPaths(requireGitSuccess(runVerifiedGit(executable, root, [
+    ...common, "ls-files", "--cached", "-z",
+  ])));
+  for (const candidate of tracked) {
+    const relative = candidate.replace(/\\/g, "/");
+    if (relative.startsWith("/") || /^[A-Za-z]:/.test(relative) ||
+        relative.split("/").some((part) => part === ".." || part === "")) {
+      throw new GitWriteError("UNSAFE_GIT_CONFIG");
+    }
+    addAncestors(path.resolve(canonicalRoot, ...relative.split("/")));
+  }
+  for (const candidate of sourcePaths) addAncestors(candidate);
+  directories.set(norm(canonicalRoot), canonicalRoot);
+
+  for (const directory of directories.values()) {
+    const candidate = path.join(directory, ".gitattributes");
+    let stat: fs.Stats;
     try {
-      handle = fs.opendirSync(directory);
-    } catch {
+      stat = fs.lstatSync(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw new GitWriteError("STATE_UNAVAILABLE");
     }
-    try {
-      for (let entry = handle.readSync(); entry; entry = handle.readSync()) {
-        visited += 1;
-        if (visited > 100_000) throw new GitWriteError("UNSAFE_GIT_CONFIG");
-        if (entry.name.toLowerCase() === ".git") continue;
-        const candidate = path.join(directory, entry.name);
-        let stat: fs.Stats;
-        try {
-          stat = fs.lstatSync(candidate);
-        } catch {
-          throw new GitWriteError("STATE_UNAVAILABLE");
-        }
-        if (entry.name.toLowerCase() === ".gitattributes") {
-          if (stat.isSymbolicLink() || !stat.isFile()) throw new GitWriteError("REPARSE_POINT");
-          paths.push(candidate);
-          if (paths.length > MAX_GIT_MATERIALS) throw new GitWriteError("UNSAFE_GIT_CONFIG");
-          continue;
-        }
-        if (stat.isDirectory() && !stat.isSymbolicLink()) pending.push(candidate);
-      }
-    } finally {
-      try { handle.closeSync(); } catch { /* a completed read may close the handle */ }
-    }
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new GitWriteError("REPARSE_POINT");
+    paths.push(candidate);
+    if (paths.length > MAX_GIT_MATERIALS) throw new GitWriteError("UNSAFE_GIT_CONFIG");
   }
   return makeMaterials(paths);
 }
-
 function collectIndexMaterial(executable: GitExecutable, root: string, config: GitConfigEntry[]): GitWriteMaterial[] {
   const common = buildCommonGitArgs(config, null);
   const indexPath = runText(executable, root, ["rev-parse", "--git-path", "index"], common);
@@ -787,7 +803,7 @@ function collectMaterials(
 ): { materials: GitWriteMaterial[]; snapshotMaterials: GitWriteMaterial[] } {
   const materials = [
     ...configFilesAsMaterials(config, repository.canonicalPath),
-    ...collectAttributeMaterials(repository.canonicalPath, repository),
+    ...collectAttributeMaterials(repository.canonicalPath, repository, executable, config, sourcePaths),
     ...makeSourceMaterials(sourcePaths),
     ...approval.bundleMaterials,
     { path: executable.path, fileIdentity: executable.fileIdentity, hash: executable.hash },
