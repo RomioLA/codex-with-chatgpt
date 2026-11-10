@@ -22,7 +22,7 @@ constexpr wchar_t kHelperName[] = L"c2c-execution-helper.exe";
 constexpr wchar_t kLauncherName[] = L"c2c-execution-launcher.exe";
 constexpr wchar_t kMetadataRelative[] = L"..\\..\\dist\\execution\\c2c-execution-helper-integrity.json";
 constexpr char kMetadataPrefix[] =
-    "{\"version\":2,\"protocolVersion\":8,\"helperPath\":\"build/native/c2c-execution-helper.exe\",\"sha256\":\"";
+    "{\"version\":2,\"protocolVersion\":9,\"helperPath\":\"build/native/c2c-execution-helper.exe\",\"sha256\":\"";
 constexpr char kMetadataMiddle[] =
     "\",\"launcherPath\":\"build/native/c2c-execution-launcher.exe\",\"launcherSha256\":\"";
 

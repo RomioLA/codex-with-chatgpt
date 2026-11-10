@@ -41,19 +41,22 @@ describe("ExecutionTempOwner", () => {
     expect(owner.cleanup("../outside", lease)).toBe(false);
   });
 
-  it.skipIf(process.platform !== "win32")("treats a missing temp target as idempotent only with its matching authority record", () => {
+  it.skipIf(process.platform !== "win32")("fails closed for a missing temp target and preserves its authority", () => {
     const workspaceId = "temp-missing-target-test";
     const stateRoot = makeSystemTempDir("execution-temp-missing-target");
     const storeDirectory = path.join(stateRoot, "execution-jobs", workspaceId);
     fs.mkdirSync(storeDirectory, { recursive: true });
     const owner = new ExecutionTempOwner(storeDirectory, workspaceId);
     const lease = owner.create(jobId("missing-target"));
+    const authority = path.join(storeDirectory, `.c2c-execution-temp-job-${lease.jobId}`);
+    const originalAuthority = fs.readFileSync(authority, "utf8");
     fs.unlinkSync(path.join(lease.directoryPath, ".c2c-job-owner"));
     fs.rmdirSync(lease.directoryPath);
 
-    expect(runExecutionTempCleanup(lease, storeDirectory)).toBe(true);
-    expect(runExecutionTempCleanup(lease, storeDirectory)).toBe(true);
+    expect(runExecutionTempCleanup(lease, storeDirectory)).toBe(false);
+    expect(runExecutionTempCleanup(lease, storeDirectory)).toBe(false);
     expect(fs.existsSync(lease.directoryPath)).toBe(false);
+    expect(fs.readFileSync(authority, "utf8")).toBe(originalAuthority);
   }, 45_000);
 
   it("requires explicit confirmed-recovery authority before accepting a missing temp target", () => {

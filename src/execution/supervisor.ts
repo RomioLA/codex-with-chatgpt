@@ -1150,18 +1150,24 @@ export class ExecutionSupervisor {
     this.store.prepareCapacity();
   }
 
+  private static isRecoverableTempCandidate(job: ExecutionJob): boolean {
+    // Temp deletion cannot confirm an entire process tree exited. Only a
+    // persisted native-helper tree-exit confirmation permits recovery cleanup.
+    return job.state === "interrupted" && job.tempOwnership !== null &&
+      job.recoveryEvidence === "process_tree_exited";
+  }
+
   private reconcileRecoveredTemps(): void {
     if (this.store.corruption) return;
     const records = this.store.listAll().flatMap((job) =>
-      job.state === "interrupted" && job.recoveryEvidence === "process_tree_exited" && job.tempOwnership
-        ? [{ jobId: job.jobId, ownership: job.tempOwnership }]
+      ExecutionSupervisor.isRecoverableTempCandidate(job)
+        ? [{ jobId: job.jobId, ownership: job.tempOwnership! }]
         : []);
     if (records.length === 0) return;
     const recovery = this.tempOwner.reconcileStaleTemps(records, new Set(this.active.keys()), true);
     for (const jobId of recovery.removedJobIds) {
       const job = this.store.get(jobId);
-      if (!job || job.state !== "interrupted" || job.recoveryEvidence !== "process_tree_exited" ||
-          !job.tempOwnership || this.active.has(jobId)) continue;
+      if (!job || !ExecutionSupervisor.isRecoverableTempCandidate(job) || this.active.has(jobId)) continue;
       this.store.replace({
         ...job,
         tempOwnership: null,

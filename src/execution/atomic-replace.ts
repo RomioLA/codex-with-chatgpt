@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
+import { EXECUTION_HELPER_PROTOCOL_VERSION } from "./helper-protocol.js";
 
 export interface AtomicReplaceOptions {
   /** Use the fixed native FileRenameInfoEx operation and preserve target metadata. */
@@ -98,7 +99,7 @@ function verifiedExecutionHelperPath(): string {
       helperPath?: unknown;
       sha256?: unknown;
     };
-    if (metadata.version !== 2 || metadata.protocolVersion !== 8 ||
+    if (metadata.version !== 2 || metadata.protocolVersion !== EXECUTION_HELPER_PROTOCOL_VERSION ||
         metadata.helperPath !== "build/native/c2c-execution-helper.exe" ||
         typeof metadata.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.sha256)) {
       throw new Error("INVALID_HELPER_METADATA");

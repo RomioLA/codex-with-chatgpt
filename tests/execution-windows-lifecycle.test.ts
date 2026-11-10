@@ -13,6 +13,9 @@ import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supe
 import { NativeRunnerCleanupError, resolveExecutionHelperPath, resolveExecutionLauncherPath, WindowsNativeExecutionRunner } from "../src/execution/native-runner.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { ExecutionTempOwner } from "../src/execution/execution-temp.js";
+import { ExecutionJobStore } from "../src/execution/job-store.js";
+import { jobCanBeStoredInArchive } from "../src/execution/record-archive.js";
+import type { ExecutionJob } from "../src/execution/job-types.js";
 import { resolveTrustedRuntime } from "../src/execution/runtime-discovery.js";
 import { resolveRepositoryIdentity } from "../src/execution/repository-identity.js";
 import { approveTrustedCommand } from "../src/execution/trusted-registry.js";
@@ -542,8 +545,15 @@ describe("Windows execution lifecycle acceptance", () => {
       process.env.C2C_STATE_DIR = stateDirectory;
       const restarted = new ExecutionSupervisor(new Workspace(root));
       try {
-        expect(restarted.store.listAll().every((job) => job.state === "interrupted")).toBe(true);
-        expectNoOwnedJobTemps(restarted);
+        const recoveredJobs = restarted.store.listAll();
+        expect(recoveredJobs).toHaveLength(1);
+        const recoveredJob = recoveredJobs[0]!;
+        expect(recoveredJob.state).toBe("interrupted");
+        expect(recoveredJob.failureCode).toBe("BRIDGE_RESTARTED");
+        expect(recoveredJob.tempOwnership).not.toBeNull();
+        expect(recoveredJob.recoveryEvidence).toBeUndefined();
+        expect(jobCanBeStoredInArchive(recoveredJob)).toBe(false);
+        expect(fs.existsSync(path.join(restarted.store.directory, "execution-temp", `tmp-${recoveredJob.jobId}`))).toBe(true);
       } finally {
         await restarted.shutdown();
         if (priorStateDirectory === undefined) delete process.env.C2C_STATE_DIR;
@@ -551,6 +561,103 @@ describe("Windows execution lifecycle acceptance", () => {
       }
     } finally {
       if (owner.exitCode === null && owner.signalCode === null) owner.kill();
+    }
+  }, 90_000);
+
+  it.skipIf(process.platform !== "win32")("B: a Temp-independent survivor cannot certify a restarted Job tree", async () => {
+    isolateWindowsStateDir();
+    const root = makeSystemTempDir("windows-bridge-restart-temp");
+    const workspace = new Workspace(root);
+    setPermission(workspace.id, "level1");
+    const storeDirectory = new ExecutionJobStore(workspace.id).directory;
+    const owner = new ExecutionTempOwner(storeDirectory, workspace.id);
+    const jobId = "recovery-bridge-restart-temp-0001";
+    const lease = owner.create(jobId);
+    fs.writeFileSync(path.join(lease.directoryPath, "job-output.txt"), "leftover");
+    const job: ExecutionJob = {
+      jobId,
+      workspaceId: workspace.id,
+      repositoryIdentity: "a".repeat(64),
+      repositoryPath: ".",
+      oauthClientId: "bridge-restart-client",
+      recipe: { kind: "test", target: "test", packageManager: "npm", scriptHash: "b".repeat(64) },
+      state: "interrupted",
+      createdAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      timeoutSeconds: 60,
+      idempotencyKeyHash: "c".repeat(64),
+      tempOwnership: {
+        rootFileIdentity: lease.rootFileIdentity,
+        directoryFileIdentity: lease.directoryFileIdentity,
+        nonce: lease.nonce,
+        createdAtMs: lease.createdAtMs,
+      },
+      // No recoveryEvidence: this is the owner-crash restart shape, not a
+      // helper-confirmed tree exit.
+      failureCode: "BRIDGE_RESTARTED",
+      exitCode: null,
+      stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+      stderr: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+    };
+    new ExecutionJobStore(workspace.id).create(job);
+
+    // This process runs outside Temp and holds no Temp path open. Mock cleanup
+    // would report success, but recovery must not call it without tree evidence.
+    let cleanupAttempts = 0;
+    const cleanupWouldSucceed = () => { cleanupAttempts += 1; return true; };
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      cwd: root,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    try {
+      await waitUntil(() => processExists(holder.pid ?? -1), 10_000, "The directory holder did not start.");
+      const guarded = new ExecutionSupervisor(workspace, { tempCleanupImpl: cleanupWouldSucceed });
+      try {
+        expect(guarded.store.get(jobId)?.state).toBe("interrupted");
+        expect(guarded.store.get(jobId)?.tempOwnership).not.toBeNull();
+        expect(guarded.store.get(jobId)?.recoveryEvidence).toBeUndefined();
+        expect(cleanupAttempts).toBe(0);
+        expect(fs.existsSync(lease.directoryPath)).toBe(true);
+      } finally {
+        await guarded.shutdown();
+      }
+    } finally {
+      holder.kill();
+      await new Promise<void>((resolve) => holder.once("exit", () => resolve()));
+    }
+
+    // Exiting later does not create durable process-tree evidence either.
+    await waitUntil(() => !processExists(holder.pid ?? -1), 10_000, "The directory holder did not exit.");
+    const recovered = new ExecutionSupervisor(workspace, { tempCleanupImpl: cleanupWouldSucceed });
+    try {
+      expect(fs.existsSync(lease.directoryPath)).toBe(true);
+      const recoveredJob = recovered.store.get(jobId);
+      expect(recoveredJob?.state).toBe("interrupted");
+      expect(recoveredJob?.tempOwnership).not.toBeNull();
+      expect(recoveredJob?.recoveryEvidence).toBeUndefined();
+      expect(jobCanBeStoredInArchive(recoveredJob!)).toBe(false);
+      expect(cleanupAttempts).toBe(0);
+    } finally {
+      await recovered.shutdown();
+    }
+
+    // Only an independently persisted native-helper exit result can unlock
+    // cleanup of this interrupted record; the previous marker was absent.
+    const confirmedStore = new ExecutionJobStore(workspace.id);
+    confirmedStore.replace({
+      ...confirmedStore.get(jobId)!,
+      failureCode: "HELPER_CLEANUP_UNCONFIRMED",
+      recoveryEvidence: "process_tree_exited",
+    });
+    const confirmed = new ExecutionSupervisor(workspace, { tempCleanupImpl: cleanupWouldSucceed });
+    try {
+      expect(confirmed.store.get(jobId)?.tempOwnership).toBeNull();
+      expect(confirmed.store.get(jobId)?.recoveryEvidence).toBe("process_tree_and_temp_cleaned");
+      expect(cleanupAttempts).toBe(1);
+    } finally {
+      await confirmed.shutdown();
     }
   }, 90_000);
 

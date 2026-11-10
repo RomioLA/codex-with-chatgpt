@@ -2532,23 +2532,9 @@ bool CleanupOwnedExecutionTemp(const TempCleanupRequest& request, DWORD& error) 
     const std::wstring targetPath = canonicalRoot + L"\\tmp-" + request.jobId;
     const DWORD targetAttributes = GetFileAttributesW(targetPath.c_str());
     if (targetAttributes == INVALID_FILE_ATTRIBUTES) {
-        const DWORD attributeError = GetLastError();
-        if (attributeError != ERROR_FILE_NOT_FOUND && attributeError != ERROR_PATH_NOT_FOUND) {
-            error = attributeError;
-            return false;
-        }
-        UniqueHandle authority;
-        if (OpenMatchingMarkerFile(authorityPath, expectedAuthority, GENERIC_READ | DELETE, authority, error)) {
-            return MarkHandleForDeletion(authority.get(), error);
-        }
-        const DWORD authorityError = error;
-        const DWORD recheckAttributes = GetFileAttributesW(targetPath.c_str());
-        if ((authorityError == ERROR_FILE_NOT_FOUND || authorityError == ERROR_PATH_NOT_FOUND) &&
-            recheckAttributes == INVALID_FILE_ATTRIBUTES) {
-            const DWORD recheckError = GetLastError();
-            if (recheckError == ERROR_FILE_NOT_FOUND || recheckError == ERROR_PATH_NOT_FOUND) return true;
-        }
-        error = authorityError;
+        // Rename racing with cleanup can temporarily hide the owned directory.
+        // Do not consume authority without proof of identity-bound deletion.
+        error = GetLastError();
         return false;
     }
     UniqueHandle authority;
@@ -2559,17 +2545,7 @@ bool CleanupOwnedExecutionTemp(const TempCleanupRequest& request, DWORD& error) 
                                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                                     nullptr));
     if (!target.valid()) {
-        const DWORD openError = GetLastError();
-        if (openError == ERROR_FILE_NOT_FOUND || openError == ERROR_PATH_NOT_FOUND) {
-            const DWORD recheckAttributes = GetFileAttributesW(targetPath.c_str());
-            if (recheckAttributes == INVALID_FILE_ATTRIBUTES) {
-                const DWORD recheckError = GetLastError();
-                if (recheckError == ERROR_FILE_NOT_FOUND || recheckError == ERROR_PATH_NOT_FOUND) {
-                    return MarkHandleForDeletion(authority.get(), error);
-                }
-            }
-        }
-        error = openError;
+        error = GetLastError();
         return false;
     }
     if (!DirectoryAttributes(target.get(), error)) return false;

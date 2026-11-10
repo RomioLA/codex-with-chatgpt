@@ -67,8 +67,21 @@ $installationOutput = & $vswhere -latest -products '*' `
 $vswhereExitCode = $LASTEXITCODE
 $installationPath = $installationOutput | Select-Object -First 1
 if ($vswhereExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
-    [Console]::Error.WriteLine('No Visual Studio installation with the MSVC x86/x64 tools was found.')
-    exit 1
+    # Installer metadata may omit the VC component even when its compiler is installed.
+    $fallbackOutput = & $vswhere -all -products '*' -property installationPath
+    $fallbackExitCode = $LASTEXITCODE
+    $fallbackPath = $fallbackOutput | Select-Object -First 1
+    $vcToolsDirectory = if ([string]::IsNullOrWhiteSpace($fallbackPath)) { $null } else { Join-Path $fallbackPath 'VC\Tools\MSVC' }
+    $compilers = if ($vcToolsDirectory -and (Test-Path -LiteralPath $vcToolsDirectory -PathType Container)) {
+        @(Get-ChildItem -LiteralPath $vcToolsDirectory -Directory | Where-Object {
+            Test-Path -LiteralPath (Join-Path $_.FullName 'bin\Hostx64\x64\cl.exe') -PathType Leaf
+        })
+    } else { @() }
+    if ($fallbackExitCode -ne 0 -or @($compilers).Count -eq 0) {
+        [Console]::Error.WriteLine('No Visual Studio installation with the MSVC x86/x64 tools was found.')
+        exit 1
+    }
+    $installationPath = $fallbackPath
 }
 
 $devCommand = Join-Path $installationPath 'Common7\Tools\VsDevCmd.bat'

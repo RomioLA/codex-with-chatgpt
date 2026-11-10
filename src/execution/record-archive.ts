@@ -220,6 +220,8 @@ export function jobCanBeArchived(job: ExecutionJob): boolean {
 /** JobStore may move only explicitly recovered interrupted jobs into history. */
 export function jobCanBeStoredInArchive(job: ExecutionJob): boolean {
   if (job.state !== "interrupted") return jobCanBeArchived(job);
+  // Pre-fix bridge restarts could gain false tree-exit evidence from Temp cleanup.
+  if (job.failureCode === "BRIDGE_RESTARTED") return false;
   return !!job.finishedAt && job.tempOwnership === null &&
     job.recoveryEvidence === "process_tree_and_temp_cleaned" && gitOutcomeCanBeArchived(job);
 }

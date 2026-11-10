@@ -6,6 +6,7 @@ import { ExecutionJobStore, MAX_OUTPUT_BYTES_PER_STREAM } from "../src/execution
 import {
   archivedIdempotencyKey,
   archiveRecord,
+  jobCanBeStoredInArchive,
   DEFAULT_ARCHIVE_RECORD_OPERATIONS,
   readArchivedRecord,
   scanArchivedJobRecords,
@@ -360,6 +361,114 @@ describe("ExecutionJobStore", () => {
     });
     expect(store.lookupIdempotentForReconciliation(job.oauthClientId, job.idempotencyKeyHash))
       .toMatchObject({ kind: "found", job: { jobId: job.jobId, state: "interrupted" } });
+  });
+
+  it("revokes legacy bridge-restarted cleanup evidence before retention or capacity pruning", () => {
+    const directory = makeTmpDir("execution-legacy-bridge-evidence");
+    const workspaceId = "execution-legacy-bridge-evidence";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const job = makeJob(workspaceId, "interrupted");
+    job.finishedAt = job.createdAt;
+    job.failureCode = "BRIDGE_RESTARTED";
+    job.recoveryEvidence = "process_tree_and_temp_cleaned";
+    store.create(job);
+
+    // Even an old on-disk record with this misleading marker cannot be archived.
+    expect(jobCanBeStoredInArchive(job)).toBe(false);
+    const recovered = new ExecutionJobStore(workspaceId, { directory });
+    const loaded = recovered.get(job.jobId);
+    expect(loaded?.state).toBe("interrupted");
+    expect(loaded?.failureCode).toBe("BRIDGE_RESTARTED");
+    expect(loaded?.tempOwnership).toBeNull();
+    expect(loaded?.recoveryEvidence).toBeUndefined();
+    expect(jobCanBeStoredInArchive(loaded!)).toBe(false);
+    recovered.prepareCapacity();
+    expect(recovered.listAll()).toHaveLength(1);
+    expect(fs.existsSync(archivePath(directory, "jobs", job.jobId))).toBe(false);
+  });
+
+  it("archives recent safely recovered interruptions only when the store needs capacity", () => {
+    const directory = makeTmpDir("execution-recovered-capacity-pressure");
+    const workspaceId = "execution-recovered-capacity-pressure";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const jobs: ExecutionJob[] = [];
+    for (let index = 0; index < 50; index += 1) {
+      const job = makeJob(workspaceId, "interrupted");
+      const at = new Date(Date.now() - (50 - index) * 1000).toISOString();
+      job.createdAt = at;
+      job.startedAt = at;
+      job.finishedAt = at;
+      job.failureCode = "HELPER_CLEANUP_UNCONFIRMED";
+      job.recoveryEvidence = "process_tree_and_temp_cleaned";
+      job.idempotencyKeyHash = randomBytes(32).toString("hex");
+      store.create(job);
+      jobs.push(job);
+    }
+
+    const oldest = jobs[0]!;
+    expect(store.listAll()).toHaveLength(50);
+    expect(fs.existsSync(archivePath(directory, "jobs", oldest.jobId))).toBe(false);
+    store.prepareCapacity();
+    expect(store.listAll()).toHaveLength(49);
+    expect(fs.existsSync(archivePath(directory, "jobs", oldest.jobId))).toBe(true);
+    expect(store.get(oldest.jobId)).toMatchObject({
+      jobId: oldest.jobId,
+      state: "interrupted",
+      recoveryEvidence: "process_tree_and_temp_cleaned",
+    });
+    expect(store.lookupIdempotentForReconciliation(oldest.oauthClientId, oldest.idempotencyKeyHash))
+      .toMatchObject({ kind: "found", job: { jobId: oldest.jobId } });
+
+    store.create(makeJob(workspaceId));
+    expect(store.listAll()).toHaveLength(50);
+  });
+
+  it("preserves unconfirmed ownership and uncertain Git outcomes even at full capacity", () => {
+    const directory = makeTmpDir("execution-unsafe-capacity-pressure");
+    const workspaceId = "execution-unsafe-capacity-pressure";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const uncertainJobIds: string[] = [];
+    for (let index = 0; index < 49; index += 1) {
+      const job = makeJob(workspaceId, "interrupted");
+      job.finishedAt = job.createdAt;
+      job.failureCode = "TREE_TERMINATION_UNCONFIRMED";
+      job.tempOwnership = {
+        rootFileIdentity: "1:2",
+        directoryFileIdentity: "3:4",
+        nonce: "a".repeat(64),
+        createdAtMs: 1,
+      };
+      store.create(job);
+      uncertainJobIds.push(job.jobId);
+    }
+    const gitJob = makeJob(workspaceId, "interrupted");
+    gitJob.finishedAt = gitJob.createdAt;
+    gitJob.recoveryEvidence = "process_tree_and_temp_cleaned";
+    gitJob.authorization = { type: "git", requestId: "git-capacity-unknown", digest: "b".repeat(64) };
+    gitJob.gitResult = {
+      confirmation: "confirmed",
+      confirmationScope: "local_repository",
+      remoteOutcome: "unknown",
+      partialSuccessPossible: true,
+      headBefore: null,
+      headAfter: null,
+      branchBefore: null,
+      branchAfter: null,
+    };
+    store.create(gitJob);
+
+    expect(() => store.prepareCapacity()).toThrow("JOB_STORE_FULL");
+    expect(() => store.create(makeJob(workspaceId))).toThrow("JOB_STORE_FULL");
+    expect(store.listAll()).toHaveLength(50);
+    expect(store.get(uncertainJobIds[0]!)).toMatchObject({
+      state: "interrupted",
+      tempOwnership: expect.any(Object),
+    });
+    expect(store.get(gitJob.jobId)).toMatchObject({
+      state: "interrupted",
+      gitResult: { remoteOutcome: "unknown", partialSuccessPossible: true },
+    });
+    expect(fs.existsSync(archivePath(directory, "jobs", gitJob.jobId))).toBe(false);
   });
 
   it("preserves recovered interrupted Git jobs with an unknown remote outcome", () => {

@@ -386,6 +386,11 @@ export class ExecutionJobStore {
           failureCode: "BRIDGE_RESTARTED",
           finishedAt: new Date().toISOString(),
         }));
+      } else if (job.state === "interrupted" && job.failureCode === "BRIDGE_RESTARTED" &&
+                 job.recoveryEvidence === "process_tree_and_temp_cleaned") {
+        // Previous restart recovery may have mistaken Temp deletion for tree exit.
+        // Preserve the interruption, but revoke evidence that cannot be verified.
+        loaded.set(jobId, { ...job, recoveryEvidence: undefined });
       }
     }
     const retained = this.prune(loaded);
@@ -552,9 +557,8 @@ export class ExecutionJobStore {
       }
     }
     while (keep.length > MAX_JOBS_PER_WORKSPACE - (reserveSlot ? 1 : 0)) {
-      const index = keep.findIndex((job) => jobCanBeArchived(job) ||
-        (Number.isFinite(now - Date.parse(job.createdAt)) && now - Date.parse(job.createdAt) > JOB_RETENTION_MS &&
-          jobCanBeStoredInArchive(job)));
+      // Capacity pressure may archive safely recovered interruptions before retention expires.
+      const index = keep.findIndex(jobCanBeStoredInArchive);
       if (index < 0) break;
       const [dropped] = keep.splice(index, 1);
       this.archiveJob(dropped);
