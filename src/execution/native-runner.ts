@@ -473,7 +473,7 @@ export class WindowsNativeExecutionRunner {
           }
           const treeTerminationConfirmed = frameResult.treeTerminationConfirmed ?? frameResult.outcome !== 3;
           if (!treeTerminationConfirmed) {
-            if (diagnostics || frameResult.outcome === 3) {
+            if (diagnostics || frameResult.outcome >= 3) {
               const resultDiagnostic = `helper outcome=${frameResult.outcome}; treeTerminationConfirmed=false; ` +
                 `win32Error=${frameResult.win32Error}; exitCode=${frameResult.exitCode}`;
               callbacks.onDiagnostic?.(redact([diagnostics, resultDiagnostic].filter(Boolean).join("\n")).slice(-512));
@@ -494,7 +494,7 @@ export class WindowsNativeExecutionRunner {
             reject(new NativeRunnerOutputError(outputError, frameResult, code, true, true));
             return;
           }
-          if (diagnostics || frameResult.outcome === 3) {
+          if (diagnostics || frameResult.outcome >= 3) {
             const resultDiagnostic = `helper outcome=${frameResult.outcome}; treeTerminationConfirmed=true; ` +
               `win32Error=${frameResult.win32Error}; ` +
               `exitCode=${frameResult.exitCode}`;

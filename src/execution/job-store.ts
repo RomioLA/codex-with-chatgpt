@@ -144,6 +144,12 @@ const EMPTY_STREAM: ExecutionStreamMeta = {
   restrictedReason: null,
 };
 
+const BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isValidBootId(value: unknown): value is string {
+  return typeof value === "string" && BOOT_ID_PATTERN.test(value);
+}
+
 function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const job = value as Record<string, unknown>;
@@ -175,7 +181,8 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
   const recoveryEvidenceValid = job.recoveryEvidence === undefined ||
     (job.state === "interrupted" && (
       job.recoveryEvidence === "process_tree_exited" && isTempOwnership(job.tempOwnership) ||
-      job.recoveryEvidence === "process_tree_and_temp_cleaned" && job.tempOwnership === null
+      job.recoveryEvidence === "process_tree_and_temp_cleaned" && job.tempOwnership === null ||
+      job.recoveryEvidence === "boot_boundary_and_temp_cleaned" && job.tempOwnership === null
     ));
   const validGitResult = gitResult === undefined || (
     ["confirmed", "changed", "identity_changed", "unavailable"].includes(String(gitResult.confirmation)) &&
@@ -197,6 +204,7 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     Number.isSafeInteger(job.timeoutSeconds) && Number(job.timeoutSeconds) >= 1 && Number(job.timeoutSeconds) <= 3600 &&
     typeof job.idempotencyKeyHash === "string" && /^[a-f0-9]{64}$/.test(job.idempotencyKeyHash) &&
     (job.tempOwnership === undefined || job.tempOwnership === null || isTempOwnership(job.tempOwnership)) &&
+    (job.bootId === undefined || isValidBootId(job.bootId)) &&
     (job.exitCode === null || Number.isInteger(job.exitCode)) &&
     (job.failureCode === null || typeof job.failureCode === "string") &&
     isStreamMeta(job.stdout) && isStreamMeta(job.stderr);
@@ -259,7 +267,8 @@ function isTempOwnership(value: unknown): value is NonNullable<ExecutionJob["tem
   return typeof ownership.rootFileIdentity === "string" && /^[a-f0-9]+:[a-f0-9]+$/i.test(ownership.rootFileIdentity) &&
     typeof ownership.directoryFileIdentity === "string" && /^[a-f0-9]+:[a-f0-9]+$/i.test(ownership.directoryFileIdentity) &&
     typeof ownership.nonce === "string" && /^[a-f0-9]{64}$/i.test(ownership.nonce) &&
-    Number.isSafeInteger(ownership.createdAtMs) && ownership.createdAtMs! >= 0;
+    Number.isSafeInteger(ownership.createdAtMs) && ownership.createdAtMs! >= 0 &&
+    (ownership.bootId === undefined || isValidBootId(ownership.bootId));
 }
 
 function serializeAtomic(file: string, value: unknown, publish: typeof atomicReplace = atomicReplace): void {
@@ -281,6 +290,14 @@ export interface ExecutionJobStoreOptions {
   archiveScanLimits?: Readonly<ArchiveScanLimits>;
   archiveScanClock?: ArchiveScanClock;
   archiveScanReader?: ArchiveJobRecordReader;
+}
+
+export interface JobStoreCapacitySummary {
+  activeCount: number;
+  maxActive: number;
+  archivableCount: number;
+  pinnedInterruptedCount: number;
+  pinnedWithTempLeaseCount: number;
 }
 
 function isOutputStream(value: string): value is OutputStream {
@@ -608,6 +625,25 @@ export class ExecutionJobStore {
     return [...this.jobs.values()]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, bounded);
+  }
+
+  capacitySummary(): JobStoreCapacitySummary {
+    let archivableCount = 0;
+    let pinnedInterruptedCount = 0;
+    let pinnedWithTempLeaseCount = 0;
+    for (const job of this.jobs.values()) {
+      const archivable = jobCanBeStoredInArchive(job);
+      if (archivable) archivableCount += 1;
+      if (job.state === "interrupted" && !archivable) pinnedInterruptedCount += 1;
+      if (job.tempOwnership !== null) pinnedWithTempLeaseCount += 1;
+    }
+    return {
+      activeCount: this.jobs.size,
+      maxActive: MAX_JOBS_PER_WORKSPACE,
+      archivableCount,
+      pinnedInterruptedCount,
+      pinnedWithTempLeaseCount,
+    };
   }
 
   findIdempotent(clientId: string, idempotencyKeyHash: string): ExecutionJob | null {

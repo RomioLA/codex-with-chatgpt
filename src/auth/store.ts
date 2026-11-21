@@ -30,11 +30,15 @@ export const SUPPORTED_SCOPES = [
 
 export type Scope = (typeof SUPPORTED_SCOPES)[number];
 
+export type TokenEndpointAuthMethod = "none" | "client_secret_post" | "client_secret_basic";
+
 export interface ClientRegistration {
   clientId: string;
   clientName?: string;
   redirectUris: string[];
   createdAt: string;
+  clientSecretHash?: string;
+  tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
 }
 
 export interface AuthorizationCodeRecord {
@@ -129,20 +133,53 @@ export class AuthStore {
 
   // ---- Dynamic Client Registration -------------------------------------
 
-  registerClient(input: { clientName?: string; redirectUris: string[] }): ClientRegistration {
+  registerClient(input: {
+    clientName?: string;
+    redirectUris: string[];
+    tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
+    clientSecret?: string;
+  }): ClientRegistration & { clientSecret?: string } {
+    const authMethod = input.tokenEndpointAuthMethod;
+    const isConfidential = authMethod === "client_secret_post" || authMethod === "client_secret_basic";
+    const plainSecret = isConfidential
+      ? (input.clientSecret && input.clientSecret.length > 0
+          ? input.clientSecret
+          : `c2c_cs_${randomBytes(24).toString("base64url")}`)
+      : undefined;
+
     const client: ClientRegistration = {
       clientId: `c2c_client_${randomBytes(12).toString("base64url")}`,
       clientName: input.clientName,
       redirectUris: input.redirectUris,
       createdAt: new Date().toISOString(),
+      ...(authMethod !== undefined ? { tokenEndpointAuthMethod: authMethod } : {}),
+      ...(plainSecret !== undefined ? { clientSecretHash: sha256hex(plainSecret) } : {}),
     };
     this.clients.set(client.clientId, client);
     this.save();
-    return client;
+    return plainSecret !== undefined ? { ...client, clientSecret: plainSecret } : { ...client };
   }
 
   getClient(clientId: string): ClientRegistration | undefined {
     return this.clients.get(clientId);
+  }
+
+  verifyClientCredentials(
+    clientId: string,
+    clientSecret?: string
+  ): { ok: true; client: ClientRegistration } | { ok: false; reason: "unknown_client" | "invalid_client" } {
+    const client = this.clients.get(clientId);
+    if (!client) return { ok: false, reason: "unknown_client" };
+    if (client.clientSecretHash) {
+      if (!clientSecret || !safeEqual(sha256hex(clientSecret), client.clientSecretHash)) {
+        return { ok: false, reason: "invalid_client" };
+      }
+      return { ok: true, client };
+    }
+    if (clientSecret !== undefined && clientSecret !== "") {
+      return { ok: false, reason: "invalid_client" };
+    }
+    return { ok: true, client };
   }
 
   // ---- Authorization codes ----------------------------------------------

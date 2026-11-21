@@ -5,6 +5,7 @@ import type { ExecutionTempOwnership } from "./job-types.js";
 import { runExecutionTempCleanup } from "./execution-temp-cleanup.js";
 
 const JOB_ID_PATTERN = /^[A-Za-z0-9_-]{24,64}$/;
+const BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ROOT_MARKER = ".c2c-execution-temp-owner";
 const JOB_MARKER = ".c2c-job-owner";
 const JOB_AUTHORITY_PREFIX = ".c2c-execution-temp-job-";
@@ -112,7 +113,7 @@ export class ExecutionTempOwner {
     return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
   }
 
-  create(jobId: string): ExecutionTempLease {
+  create(jobId: string, bootId?: string): ExecutionTempLease {
     if (!JOB_ID_PATTERN.test(jobId)) throw new Error("TEMP_JOB_ID_INVALID");
     const rootIdentity = this.ensureRoot();
     const directory = path.join(this.root, `tmp-${jobId}`);
@@ -126,11 +127,15 @@ export class ExecutionTempOwner {
     const directoryIdentity = `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
     const nonce = randomBytes(32).toString("hex");
     const createdAtMs = creationTimeMs(stat);
+    const normalizedBootId = typeof bootId === "string" && BOOT_ID_PATTERN.test(bootId)
+      ? bootId.toLowerCase()
+      : undefined;
     const ownership: ExecutionTempOwnership = {
       rootFileIdentity: rootIdentity,
       directoryFileIdentity: directoryIdentity,
       nonce,
       createdAtMs,
+      ...(normalizedBootId ? { bootId: normalizedBootId } : {}),
     };
     const markerText = this.jobMarkerText(jobId, ownership);
     fs.writeFileSync(path.join(directory, JOB_MARKER), markerText, { encoding: "utf8", mode: 0o600, flag: "wx" });

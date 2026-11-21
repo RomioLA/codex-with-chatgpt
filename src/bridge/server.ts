@@ -284,6 +284,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       pairingActive: pairing.hasActiveSession(),
       pid: process.pid,
       startedAt,
+      jobStore: executionSupervisor && !executionSupervisor.store.corruption
+        ? executionSupervisor.store.capacitySummary()
+        : null,
     });
   });
 
@@ -373,6 +376,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       return;
     }
     logger.info(`Permission control applied effectiveMode=${applied.effectiveMode} baseline=${applied.baselineMode}`);
+    try {
+      executionSupervisor?.reconcilePermission();
+    } catch {
+      /* reconcilePermission persists conservative downgrade decisions on failure */
+    }
     res.json({
       workspaceId: workspace.id,
       pid: process.pid,

@@ -89,9 +89,14 @@ export function installExecutionOAuthListing(server: McpServer): () => void {
   const register = original.bind(server.server);
   server.server.setRequestHandler = (schema, handler) => {
     if (!Object.is(schema, ListToolsRequestSchema)) return register(schema, handler);
+    let cachedUnpaginatedResult: ReturnType<typeof ListToolsResultSchema.parse> | null = null;
     register(schema, async (request, extra) => {
+      const cursor = (request as { params?: { cursor?: string } } | undefined)?.params?.cursor;
+      if (!cursor && cachedUnpaginatedResult) {
+        return cachedUnpaginatedResult;
+      }
       const result = ListToolsResultSchema.parse(await handler(request, extra));
-      return {
+      const transformed = {
         ...result,
         tools: result.tools.map((tool) => {
           const auth = authForTool(tool.name);
@@ -99,6 +104,10 @@ export function installExecutionOAuthListing(server: McpServer): () => void {
           return { ...tool, securitySchemes: auth.securitySchemes, _meta: { ...tool._meta, ...auth._meta } };
         }),
       };
+      if (!cursor && !transformed.nextCursor) {
+        cachedUnpaginatedResult = transformed;
+      }
+      return transformed;
     });
   };
   return () => { server.server.setRequestHandler = original; };

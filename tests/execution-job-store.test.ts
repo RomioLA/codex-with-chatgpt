@@ -3,6 +3,9 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { ExecutionJobStore, MAX_OUTPUT_BYTES_PER_STREAM } from "../src/execution/job-store.js";
+import { ExecutionTempOwner } from "../src/execution/execution-temp.js";
+import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supervisor.js";
+import { Workspace } from "../src/workspace/manager.js";
 import {
   archivedIdempotencyKey,
   archiveRecord,
@@ -15,7 +18,7 @@ import {
 import { atomicReplace } from "../src/execution/atomic-replace.js";
 import type { ExecutionJob, FullAccessExecutionJob } from "../src/execution/job-types.js";
 import { transitionExecutionJob } from "../src/execution/state-machine.js";
-import { makeTmpDir } from "./helpers.js";
+import { makeGitRepo, makeTmpDir } from "./helpers.js";
 
 function makeJob(workspaceId: string, state: ExecutionJob["state"] = "queued"): ExecutionJob {
   return {
@@ -773,5 +776,179 @@ describe("ExecutionJobStore", () => {
     });
     expect(reopened.lookupIdempotentForReconciliation("archive-scan-target", "0".repeat(64)))
       .toEqual({ kind: "unknown", reason: "ARCHIVE_SCAN_RECORD_LIMIT" });
+  });
+
+  it("archives queued jobs interrupted by bridge restart under capacity pressure", () => {
+    const directory = makeTmpDir("execution-queued-bridge-restart-archive");
+    const workspaceId = "queued-bridge-restart-archive";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const queuedJobs: ExecutionJob[] = [];
+    for (let index = 0; index < 50; index += 1) {
+      const job = makeJob(workspaceId, "queued");
+      job.createdAt = new Date(Date.now() - (50 - index) * 1000).toISOString();
+      job.startedAt = null;
+      job.idempotencyKeyHash = randomBytes(32).toString("hex");
+      store.create(job);
+      queuedJobs.push(job);
+    }
+
+    const reloaded = new ExecutionJobStore(workspaceId, { directory });
+    expect(reloaded.capacitySummary()).toEqual({
+      activeCount: 50,
+      maxActive: 50,
+      archivableCount: 50,
+      pinnedInterruptedCount: 0,
+      pinnedWithTempLeaseCount: 0,
+    });
+
+    const oldest = reloaded.get(queuedJobs[0]!.jobId)!;
+    expect(oldest).toMatchObject({
+      state: "interrupted",
+      failureCode: "BRIDGE_RESTARTED",
+      startedAt: null,
+      tempOwnership: null,
+    });
+
+    reloaded.prepareCapacity();
+    expect(reloaded.listAll()).toHaveLength(49);
+    expect(fs.existsSync(archivePath(directory, "jobs", oldest.jobId))).toBe(true);
+    expect(reloaded.lookupIdempotentForReconciliation(oldest.oauthClientId, oldest.idempotencyKeyHash))
+      .toMatchObject({ kind: "found", job: { jobId: oldest.jobId, state: "interrupted" } });
+
+    reloaded.create(makeJob(workspaceId));
+    expect(reloaded.listAll()).toHaveLength(50);
+  });
+
+  it("keeps same-boot started BRIDGE_RESTARTED interruptions pinned under capacity pressure", () => {
+    const directory = makeTmpDir("execution-started-bridge-restart-pinned");
+    const workspaceId = "started-bridge-restart-pinned";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    for (let index = 0; index < 50; index += 1) {
+      const queued = makeJob(workspaceId, "queued");
+      queued.createdAt = new Date(Date.now() - (50 - index) * 1000).toISOString();
+      queued.idempotencyKeyHash = randomBytes(32).toString("hex");
+      store.create(queued);
+      store.replace(transitionExecutionJob(queued, "running", {}, queued.createdAt));
+    }
+
+    const reloaded = new ExecutionJobStore(workspaceId, { directory });
+    expect(reloaded.capacitySummary()).toEqual({
+      activeCount: 50,
+      maxActive: 50,
+      archivableCount: 0,
+      pinnedInterruptedCount: 50,
+      pinnedWithTempLeaseCount: 0,
+    });
+
+    expect(() => reloaded.prepareCapacity()).toThrow("JOB_STORE_FULL");
+    expect(() => reloaded.create(makeJob(workspaceId))).toThrow("JOB_STORE_FULL");
+    expect(reloaded.listAll()).toHaveLength(50);
+    expect(fs.existsSync(path.join(directory, ".archive", "jobs"))).toBe(false);
+  });
+
+  it("cleans temp and archives prior-boot interrupted jobs across a Windows boot boundary", async () => {
+    const root = makeTmpDir("execution-cross-boot-workspace");
+    makeGitRepo(root);
+    const workspace = new Workspace(root);
+    const directory = makeTmpDir("execution-cross-boot-store");
+    const store = new ExecutionJobStore(workspace.id, { directory });
+    const oldBootId = "11111111-1111-4111-8111-111111111111";
+    const newBootId = "22222222-2222-4222-8222-222222222222";
+
+    let cleanupCalls = 0;
+    const tempCleanupImpl = (lease: { directoryPath: string; rootPath: string; jobId: string }): boolean => {
+      cleanupCalls += 1;
+      for (const name of fs.readdirSync(lease.directoryPath)) {
+        const file = path.join(lease.directoryPath, name);
+        if (!fs.lstatSync(file).isFile()) return false;
+        fs.unlinkSync(file);
+      }
+      fs.rmdirSync(lease.directoryPath);
+      const authority = path.join(path.dirname(lease.rootPath), `.c2c-execution-temp-job-${lease.jobId}`);
+      if (fs.existsSync(authority)) fs.unlinkSync(authority);
+      return true;
+    };
+
+    const tempOwner = new ExecutionTempOwner(directory, workspace.id, tempCleanupImpl);
+    const oldest = makeJob(workspace.id, "interrupted");
+    const oldAt = new Date(Date.now() - 100_000).toISOString();
+    oldest.createdAt = oldAt;
+    oldest.startedAt = oldAt;
+    oldest.finishedAt = oldAt;
+    oldest.failureCode = "BRIDGE_RESTARTED";
+    oldest.bootId = oldBootId;
+    oldest.idempotencyKeyHash = randomBytes(32).toString("hex");
+    const lease = tempOwner.create(oldest.jobId, oldBootId);
+    oldest.tempOwnership = {
+      rootFileIdentity: lease.rootFileIdentity,
+      directoryFileIdentity: lease.directoryFileIdentity,
+      nonce: lease.nonce,
+      createdAtMs: lease.createdAtMs,
+      bootId: lease.bootId,
+    };
+    store.create(oldest);
+
+    for (let index = 1; index < 50; index += 1) {
+      const filler = makeJob(workspace.id, "succeeded");
+      const at = new Date(Date.now() - (50 - index) * 1000).toISOString();
+      filler.createdAt = at;
+      filler.startedAt = at;
+      filler.finishedAt = at;
+      filler.exitCode = 0;
+      filler.idempotencyKeyHash = randomBytes(32).toString("hex");
+      store.create(filler);
+    }
+
+    expect(store.capacitySummary()).toEqual({
+      activeCount: 50,
+      maxActive: 50,
+      archivableCount: 49,
+      pinnedInterruptedCount: 1,
+      pinnedWithTempLeaseCount: 1,
+    });
+    expect(fs.existsSync(lease.directoryPath)).toBe(true);
+
+    const runner = {
+      start: () => { throw new Error("unexpected execution start"); },
+    } as unknown as ExecutionRunner;
+    const supervisor = new ExecutionSupervisor(workspace, {
+      store,
+      runner,
+      tempCleanupImpl,
+      currentBootId: newBootId,
+    });
+    try {
+      expect(cleanupCalls).toBe(1);
+      expect(fs.existsSync(lease.directoryPath)).toBe(false);
+      expect(supervisor.store.get(oldest.jobId)).toMatchObject({
+        jobId: oldest.jobId,
+        state: "interrupted",
+        tempOwnership: null,
+        recoveryEvidence: "boot_boundary_and_temp_cleaned",
+      });
+      expect(supervisor.store.capacitySummary()).toEqual({
+        activeCount: 50,
+        maxActive: 50,
+        archivableCount: 50,
+        pinnedInterruptedCount: 0,
+        pinnedWithTempLeaseCount: 0,
+      });
+
+      supervisor.store.prepareCapacity();
+      expect(supervisor.store.listAll()).toHaveLength(49);
+      expect(fs.existsSync(archivePath(directory, "jobs", oldest.jobId))).toBe(true);
+      expect(supervisor.store.lookupIdempotentForReconciliation(oldest.oauthClientId, oldest.idempotencyKeyHash))
+        .toMatchObject({
+          kind: "found",
+          job: {
+            jobId: oldest.jobId,
+            state: "interrupted",
+            tempOwnership: null,
+            recoveryEvidence: "boot_boundary_and_temp_cleaned",
+          },
+        });
+    } finally {
+      await supervisor.shutdown();
+    }
   });
 });

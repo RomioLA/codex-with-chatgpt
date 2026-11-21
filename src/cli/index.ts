@@ -236,6 +236,13 @@ interface AdminInfo {
   pid: number;
   startedAt: string;
   permissionMode: PermissionMode;
+  jobStore?: {
+    activeCount: number;
+    maxActive: number;
+    archivableCount: number;
+    pinnedInterruptedCount: number;
+    pinnedWithTempLeaseCount: number;
+  } | null;
 }
 
 type AutostartDiagnostics = {
@@ -780,6 +787,12 @@ program
     else if (diagnostics.tunnelPreference === "unset") say("· 安全连接：未启用（本地模式）");
     else say(`· 安全连接：${diagnostics.tunnel.status}（已配置 ${diagnostics.tunnelPreference} Tunnel）`);
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+    if (info.jobStore) {
+      say(
+        `· JobStore 槽位：${info.jobStore.activeCount}/${info.jobStore.maxActive}` +
+        `（可归档=${info.jobStore.archivableCount}, 冻结中断=${info.jobStore.pinnedInterruptedCount}, 含Temp租约=${info.jobStore.pinnedWithTempLeaseCount}）`
+      );
+    }
     printRuntimeDiagnostics(diagnostics, autostart);
   });
 
@@ -1682,6 +1695,95 @@ program
       new AuthStore(workspace.id).revokeAll();
     }
     check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
+  });
+
+// ---------------------------------------------------------------- oauth-client (pre-registered / Gemini Web)
+
+const oauthClientCmd = program
+  .command("oauth-client")
+  .description("Manage pre-registered OAuth clients for this workspace");
+
+function collectRepeatableOption(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
+function isAllowedCliRedirectUri(uri: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  return parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+}
+
+oauthClientCmd
+  .command("create")
+  .description("Pre-register a confidential (or public) OAuth client for static connectors such as Gemini Web")
+  .option("-w, --workspace <path>")
+  .option("--name <name>", "client display name", "Gemini Web")
+  .option("--redirect-uri <uri>", "HTTPS or localhost callback URL (repeatable)", collectRepeatableOption, [])
+  .option("--public", "register as PKCE-only public client (no client_secret)", false)
+  .option("--auth-method <method>", "client_secret_basic, client_secret_post, or none")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    workspace?: string;
+    name: string;
+    redirectUri: string[];
+    public: boolean;
+    authMethod?: string;
+    json: boolean;
+  }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const redirectUris = opts.redirectUri.length > 0
+        ? opts.redirectUri
+        : ["https://gemini.google.com/callback"];
+      if (!redirectUris.every(isAllowedCliRedirectUri)) {
+        throw new Error("All --redirect-uri values must be valid https:// URLs or http://localhost / http://127.0.0.1 URLs.");
+      }
+      const requestedMethod = opts.authMethod?.trim();
+      const tokenEndpointAuthMethod = opts.public
+        ? "none"
+        : requestedMethod === "none" || requestedMethod === "client_secret_post" || requestedMethod === "client_secret_basic"
+          ? requestedMethod
+          : requestedMethod
+            ? (() => { throw new Error("auth-method must be client_secret_basic, client_secret_post, or none"); })()
+            : "client_secret_basic";
+
+      const store = new AuthStore(workspace.id);
+      const client = store.registerClient({
+        clientName: opts.name.slice(0, 200),
+        redirectUris,
+        tokenEndpointAuthMethod,
+      });
+      const liveBridge = await findLiveBridge(workspace.id);
+      const payload = {
+        ok: true,
+        workspaceId: workspace.id,
+        clientId: client.clientId,
+        clientName: client.clientName ?? null,
+        clientSecret: client.clientSecret ?? null,
+        redirectUris: client.redirectUris,
+        tokenEndpointAuthMethod,
+        restartRequired: Boolean(liveBridge),
+      };
+      if (opts.json) {
+        say(JSON.stringify(payload));
+        return;
+      }
+      check(`已创建 OAuth 客户端：${client.clientName ?? client.clientId}`);
+      say(`client_id: ${client.clientId}`);
+      if (client.clientSecret) say(`client_secret: ${client.clientSecret}`);
+      say(`auth_method: ${tokenEndpointAuthMethod}`);
+      say(`redirect_uris: ${client.redirectUris.join(", ")}`);
+      if (liveBridge) {
+        say(`提示：检测到 Bridge 正在运行，请运行 \`c2c restart -w "${workspace.root}"\` 让运行中的 Bridge 加载新客户端凭据。`);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
   });
 
 // ---------------------------------------------------------------- logs / workspace / record

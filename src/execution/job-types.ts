@@ -81,9 +81,13 @@ export interface ExecutionTempOwnership {
   directoryFileIdentity: string;
   nonce: string;
   createdAtMs: number;
+  bootId?: string;
 }
 
-export type ExecutionRecoveryEvidence = "process_tree_exited" | "process_tree_and_temp_cleaned";
+export type ExecutionRecoveryEvidence =
+  | "process_tree_exited"
+  | "process_tree_and_temp_cleaned"
+  | "boot_boundary_and_temp_cleaned";
 
 interface ExecutionJobBase {
   jobId: string;
@@ -98,6 +102,7 @@ interface ExecutionJobBase {
   tempOwnership: ExecutionTempOwnership | null;
   /** Persisted only for interrupted jobs whose native process-tree result is verified. */
   recoveryEvidence?: ExecutionRecoveryEvidence;
+  bootId?: string;
   exitCode: number | null;
   failureCode: string | null;
   stdout: ExecutionStreamMeta;

@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { StringDecoder } from "node:string_decoder";
@@ -69,6 +70,30 @@ const SEARCH_MAX_DIRECTORY_ENTRIES = 20_000;
 const SEARCH_MAX_ENUMERATED_PATHS = 100_000;
 const SEARCH_MAX_PENDING_DIRECTORIES = 20_000;
 
+const WINDOWS_RG_CANDIDATES = process.platform === "win32"
+  ? [
+      process.env.LOCALAPPDATA
+        ? path.join(process.env.LOCALAPPDATA, "Microsoft", "WinGet", "Links", "rg.exe")
+        : "",
+      path.join(os.homedir(), "scoop", "shims", "rg.exe"),
+      "C:\\ProgramData\\chocolatey\\bin\\rg.exe",
+      path.join(os.homedir(), ".cargo", "bin", "rg.exe"),
+      process.env.LOCALAPPDATA
+        ? path.join(process.env.LOCALAPPDATA, "Programs", "Microsoft VS Code", "resources", "app", "node_modules", "@vscode", "ripgrep", "bin", "rg.exe")
+        : "",
+      process.env.LOCALAPPDATA
+        ? path.join(process.env.LOCALAPPDATA, "Programs", "cursor", "resources", "app", "node_modules", "@vscode", "ripgrep", "bin", "rg.exe")
+        : "",
+      process.env.ProgramFiles
+        ? path.join(process.env.ProgramFiles, "Microsoft VS Code", "resources", "app", "node_modules", "@vscode", "ripgrep", "bin", "rg.exe")
+        : "",
+      process.env.ProgramFiles
+        ? path.join(process.env.ProgramFiles, "Git", "usr", "bin", "rg.exe")
+        : "",
+      path.join(os.homedir(), ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "native", "ripgrep", "rg.exe"),
+    ].filter(Boolean)
+  : [];
+
 const RG_CANDIDATES = [
   "rg",
   "/opt/homebrew/bin/rg",
@@ -76,6 +101,7 @@ const RG_CANDIDATES = [
   "/usr/bin/rg",
   "/Applications/Cursor.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg",
   "/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg",
+  ...WINDOWS_RG_CANDIDATES,
 ];
 
 let cachedRg: string | null | undefined;

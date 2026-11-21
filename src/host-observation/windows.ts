@@ -130,31 +130,28 @@ public static class C2CSessionIdentity {
   object[] extended = TryExtendedEnvironment();
   long? timeOfDayBoot = TryTimeOfDayBootTime();
   Guid bootIdentifier;
-  long bootTime;
   if (extended != null) {
    bootIdentifier = (Guid)extended[0];
-   bootTime = (long)extended[1];
-   result["bootSource"] = (string)extended[4];
+   long observedBoot = (long)extended[1];
+   result["bootSource"] = "environment-identifier";
    result["firmwareType"] = extended[2];
-   // Independent corroboration: when both sources answer they must agree exactly.
-   if (timeOfDayBoot.HasValue && timeOfDayBoot.Value != bootTime) throw new InvalidOperationException("Boot time sources disagree");
-   if (timeOfDayBoot.HasValue) result["bootTimeCorroborated"] = true;
-  } else if (timeOfDayBoot.HasValue) {
-   bootIdentifier = ReadBootIdentifier();
-   bootTime = timeOfDayBoot.Value;
-   result["bootSource"] = "time-of-day-information";
-   result["bootTimeCorroborated"] = false;
+   result["observedBootTime"] = FormatFileTime(observedBoot);
+   result["bootTimeFileTime"] = observedBoot;
   } else {
-   throw new InvalidOperationException("Boot time unavailable");
+   bootIdentifier = ReadBootIdentifier();
+   result["bootSource"] = "boot-identifier";
+   if (timeOfDayBoot.HasValue) {
+    result["observedBootTime"] = FormatFileTime(timeOfDayBoot.Value);
+    result["bootTimeFileTime"] = timeOfDayBoot.Value;
+   }
   }
   uint adjustment; uint increment; bool adjustmentDisabled;
   if (GetSystemTimeAdjustment(out adjustment, out increment, out adjustmentDisabled)) {
    result["interruptTimeAdjustment"] = (long)adjustment;
    result["interruptTimeIncrement"] = (long)increment;
   }
-  result["bootTimeFileTime"] = bootTime;
   result["bootId"] = bootIdentifier.ToString("D");
-  result["bootTime"] = FormatFileTime(bootTime);
+  result["bootTime"] = "1970-01-01T00:00:00.000Z";
   return result;
  }
 }

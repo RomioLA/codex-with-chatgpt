@@ -144,7 +144,11 @@ export function registerTaskTools(server: McpServer, input: {
       "Create an immutable, finite Task plan. Scope is checked from every step before persistence; execution steps require the existing Full Access authorization. " +
       "Tasks never add steps or run an autonomous model loop. Use task_status, task_result, task_output, task_list, or task_cancel for recovery.",
     inputSchema: {
-      plan: z.unknown(),
+      plan: z.object({
+        version: z.number().int().describe("Task plan schema version (use 1)"),
+        maxDurationMs: z.number().int().positive().describe("Maximum total Task wall-clock duration in milliseconds"),
+        steps: z.array(z.object({}).passthrough()).describe("Ordered finite steps (batch_read | batch_search | execution)"),
+      }).passthrough(),
       idempotency_key: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]{16,128}$/),
     },
     outputSchema: {

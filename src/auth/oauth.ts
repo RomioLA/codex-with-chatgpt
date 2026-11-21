@@ -17,6 +17,7 @@ export interface OAuthDeps {
 interface PendingAuthRequest {
   id: string;
   clientId: string;
+  clientName?: string;
   redirectUri: string;
   scopes: string[];
   state?: string;
@@ -50,7 +51,7 @@ function authorizationServerMetadata(base: string): Record<string, unknown> {
     response_modes_supported: ["query"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["none"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],
     scopes_supported: [...SUPPORTED_SCOPES],
   };
 }
@@ -69,6 +70,7 @@ function pairingPage(opts: {
   requestId: string;
   workspaceName: string;
   scopes: string[];
+  clientName?: string;
   error?: string;
 }): string {
   const scopeLabels: Record<string, string> = {
@@ -109,6 +111,10 @@ function pairingPage(opts: {
   const escapedProductName = escapeHtml(PRODUCT_NAME);
   const escapedWorkspaceName = escapeHtml(opts.workspaceName);
   const escapedRequestId = escapeHtml(opts.requestId);
+  const requesterName = opts.clientName && !opts.clientName.toLowerCase().includes("chatgpt")
+    ? opts.clientName
+    : "ChatGPT";
+  const escapedRequesterName = escapeHtml(requesterName);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -141,7 +147,7 @@ function pairingPage(opts: {
 <body>
 <div class="card">
   <h1>${escapedProductName}</h1>
-  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong>${accessLabel}:</p>
+  <p class="sub">${escapedRequesterName} is requesting access to workspace <strong>${escapedWorkspaceName}</strong>${accessLabel}:</p>
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">
@@ -156,9 +162,46 @@ function pairingPage(opts: {
 </html>`;
 }
 
+function extractClientCredentials(
+  req: Request,
+  body: Record<string, string | undefined>
+): { ok: true; clientId?: string; clientSecret?: string } | { ok: false } {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === "string" && /^basic(?:\s|$)/i.test(authHeader)) {
+    const match = /^basic\s+([A-Za-z0-9+/=]+)\s*$/i.exec(authHeader);
+    if (!match) return { ok: false };
+    let decoded: string;
+    try {
+      decoded = Buffer.from(match[1], "base64").toString("utf8");
+    } catch {
+      return { ok: false };
+    }
+    const separator = decoded.indexOf(":");
+    if (separator < 0) return { ok: false };
+    let basicId: string;
+    let basicSecret: string;
+    try {
+      basicId = decodeURIComponent(decoded.slice(0, separator));
+      basicSecret = decodeURIComponent(decoded.slice(separator + 1));
+    } catch {
+      return { ok: false };
+    }
+    if (body.client_id !== undefined && body.client_id !== basicId) {
+      return { ok: false };
+    }
+    if (body.client_secret !== undefined && body.client_secret !== basicSecret) {
+      return { ok: false };
+    }
+    return { ok: true, clientId: basicId, clientSecret: basicSecret };
+  }
+  return { ok: true, clientId: body.client_id, clientSecret: body.client_secret };
+}
+
 export function createOAuthRouter(deps: OAuthDeps): Router {
   const router = Router();
   const pendingRequests = new Map<string, PendingAuthRequest>();
+  type RefreshOutcome = ReturnType<AuthStore["refresh"]>;
+  const inflightRefreshes = new Map<string, Promise<RefreshOutcome>>();
 
   const prunePending = (): void => {
     const now = Date.now();
@@ -184,7 +227,11 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
   // ---- Dynamic Client Registration (RFC 7591) ------------------------------
 
   router.post("/oauth/register", json(), (req, res) => {
-    const body = req.body as { client_name?: string; redirect_uris?: unknown };
+    const body = req.body as {
+      client_name?: string;
+      redirect_uris?: unknown;
+      token_endpoint_auth_method?: unknown;
+    };
     const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
     if (
       redirectUris.length === 0 ||
@@ -196,16 +243,25 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       });
       return;
     }
+    const requestedAuthMethod = body.token_endpoint_auth_method;
+    const tokenEndpointAuthMethod =
+      requestedAuthMethod === "client_secret_basic" || requestedAuthMethod === "client_secret_post"
+        ? requestedAuthMethod
+        : "none";
     const client = deps.store.registerClient({
       clientName: typeof body.client_name === "string" ? body.client_name.slice(0, 200) : undefined,
       redirectUris: redirectUris as string[],
+      tokenEndpointAuthMethod,
     });
     deps.logger.info(`Registered OAuth client ${client.clientId} (${client.clientName ?? "unnamed"})`);
     res.status(201).json({
       client_id: client.clientId,
       client_name: client.clientName,
       redirect_uris: client.redirectUris,
-      token_endpoint_auth_method: "none",
+      token_endpoint_auth_method: tokenEndpointAuthMethod,
+      ...(client.clientSecret !== undefined
+        ? { client_secret: client.clientSecret, client_secret_expires_at: 0 }
+        : {}),
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
     });
@@ -219,7 +275,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     const client = query.client_id ? deps.store.getClient(query.client_id) : undefined;
     if (!client) {
       setAuthSecurityHeaders(res);
-      res.status(400).send("Unknown client. Please reconnect from ChatGPT.");
+      res.status(400).send("Unknown client. Please reconnect from ChatGPT or Gemini.");
       return;
     }
     const redirectUri = query.redirect_uri;
@@ -243,30 +299,36 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       fail("invalid_request", "PKCE with S256 is required");
       return;
     }
-    let scopes = filterScopes(query.scope);
-    if (scopes.length === 0) {
-      fail("invalid_scope", "No supported scopes were requested");
-      return;
+
+    let redirectProtocol = "";
+    let redirectHost = "";
+    try {
+      const parsedRedirect = new URL(redirectUri);
+      redirectProtocol = parsedRedirect.protocol;
+      redirectHost = parsedRedirect.hostname.toLowerCase();
+    } catch { /* validated above */ }
+    const isTrustedWebConnector = redirectProtocol === "https:" && (
+      (client.clientName === "ChatGPT" && redirectHost === "chatgpt.com") ||
+      redirectHost === "gemini.google.com" ||
+      redirectHost.endsWith(".google.com") ||
+      redirectHost.endsWith(".googleusercontent.com")
+    );
+
+    let scopes: string[];
+    if (isTrustedWebConnector) {
+      scopes = [...SUPPORTED_SCOPES];
+    } else {
+      scopes = filterScopes(query.scope);
+      if (scopes.length === 0) {
+        fail("invalid_scope", "No supported scopes were requested");
+        return;
+      }
     }
 
-    // ChatGPT's current browser linking UI can persist tool-specific incremental
-    // scopes one at a time and, for some app-backed connections, cannot reopen
-    // the browser settings flow for the next missing scope. This private bridge
-    // is intentionally provisioned as a full-capability ChatGPT connector; local
-    // permission gates still independently protect writes, Git, and Level 3.
-    //
-    // Bound the compatibility policy to the registered ChatGPT client plus a
-    // chatgpt.com redirect so unrelated OAuth clients keep exact requested-scope
-    // semantics. The consent page is rendered from this expanded set before any
-    // authorization code is issued.
-    let redirectHost = "";
-    try { redirectHost = new URL(redirectUri).hostname.toLowerCase(); } catch { /* validated above */ }
-    if (client.clientName === "ChatGPT" && redirectHost === "chatgpt.com") {
-      scopes = [...SUPPORTED_SCOPES];
-    }
     const request: PendingAuthRequest = {
       id: randomBytes(16).toString("hex"),
       clientId: client.clientId,
+      clientName: client.clientName,
       redirectUri,
       scopes,
       state: query.state,
@@ -279,7 +341,12 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     res
       .status(200)
       .type("html")
-      .send(pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, scopes }));
+      .send(pairingPage({
+        requestId: request.id,
+        workspaceName: deps.workspaceName,
+        scopes,
+        clientName: client.clientName,
+      }));
   });
 
   router.post("/oauth/authorize", urlencoded({ extended: false }), (req, res) => {
@@ -288,7 +355,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     const request = body.request_id ? pendingRequests.get(body.request_id) : undefined;
     if (!request) {
       setAuthSecurityHeaders(res);
-      res.status(400).send("This authorization request has expired. Please reconnect from ChatGPT.");
+      res.status(400).send("This authorization request has expired. Please reconnect from ChatGPT or Gemini.");
       return;
     }
     const verdict = deps.pairing.verify(body.pairing_code ?? "", req.ip);
@@ -310,6 +377,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
             requestId: request.id,
             workspaceName: deps.workspaceName,
             scopes: request.scopes,
+            clientName: request.clientName,
             error: messages[verdict.reason] ?? "Verification failed.",
           })
         );
@@ -333,64 +401,104 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   // ---- Token endpoint --------------------------------------------------------
 
-  router.post("/oauth/token", urlencoded({ extended: false }), json(), (req, res) => {
-    const body = req.body as Record<string, string | undefined>;
-    const grantType = body.grant_type;
-
-    if (grantType === "authorization_code") {
-      const { code, code_verifier: codeVerifier, client_id: clientId, redirect_uri: redirectUri } = body;
-      if (!code || !codeVerifier || !clientId) {
+  router.post("/oauth/token", urlencoded({ extended: false }), json(), async (req, res, next) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, string | undefined>;
+      const grantType = body.grant_type;
+      const extracted = extractClientCredentials(req, body);
+      if (!extracted.ok) {
         res.status(400).json({ error: "invalid_request" });
         return;
       }
-      const record = deps.store.consumeAuthorizationCode(code);
-      if (!record || record.clientId !== clientId) {
-        res.status(400).json({ error: "invalid_grant" });
-        return;
-      }
-      if (redirectUri && redirectUri !== record.redirectUri) {
-        res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch" });
-        return;
-      }
-      if (!safeEqual(base64UrlSha256(codeVerifier), record.codeChallenge)) {
-        deps.logger.warn("PKCE verification failed at token endpoint");
-        res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
-        return;
-      }
-      const tokens = deps.store.issueTokens({ clientId, scopes: record.scopes });
-      deps.logger.info(`Issued access token for client ${clientId}`);
-      res.json({
-        access_token: tokens.accessToken,
-        token_type: "Bearer",
-        expires_in: tokens.expiresIn,
-        refresh_token: tokens.refreshToken ?? undefined,
-        scope: tokens.scopes.join(" "),
-      });
-      return;
-    }
+      const { clientId, clientSecret } = extracted;
 
-    if (grantType === "refresh_token") {
-      const { refresh_token: refreshToken, client_id: clientId } = body;
-      if (!refreshToken || !clientId) {
-        res.status(400).json({ error: "invalid_request" });
+      if (grantType === "authorization_code") {
+        const { code, code_verifier: codeVerifier, redirect_uri: redirectUri } = body;
+        if (!code || !codeVerifier || !clientId) {
+          res.status(400).json({ error: "invalid_request" });
+          return;
+        }
+        const credCheck = deps.store.verifyClientCredentials(clientId, clientSecret);
+        if (!credCheck.ok && credCheck.reason === "invalid_client" && deps.store.getClient(clientId)?.clientSecretHash) {
+          res.status(401).json({ error: "invalid_client" });
+          return;
+        }
+        const record = deps.store.consumeAuthorizationCode(code);
+        if (!record || record.clientId !== clientId) {
+          res.status(400).json({ error: "invalid_grant" });
+          return;
+        }
+        if (redirectUri && redirectUri !== record.redirectUri) {
+          res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch" });
+          return;
+        }
+        if (!safeEqual(base64UrlSha256(codeVerifier), record.codeChallenge)) {
+          deps.logger.warn("PKCE verification failed at token endpoint");
+          res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+          return;
+        }
+        const tokens = deps.store.issueTokens({ clientId, scopes: record.scopes });
+        deps.logger.info(`Issued access token for client ${clientId}`);
+        res.json({
+          access_token: tokens.accessToken,
+          token_type: "Bearer",
+          expires_in: tokens.expiresIn,
+          refresh_token: tokens.refreshToken ?? undefined,
+          scope: tokens.scopes.join(" "),
+        });
         return;
       }
-      const result = deps.store.refresh(refreshToken, clientId);
-      if (!result.ok) {
-        res.status(400).json({ error: result.reason });
-        return;
-      }
-      res.json({
-        access_token: result.tokens.accessToken,
-        token_type: "Bearer",
-        expires_in: result.tokens.expiresIn,
-        refresh_token: result.tokens.refreshToken ?? undefined,
-        scope: result.tokens.scopes.join(" "),
-      });
-      return;
-    }
 
-    res.status(400).json({ error: "unsupported_grant_type" });
+      if (grantType === "refresh_token") {
+        const { refresh_token: refreshToken } = body;
+        if (!refreshToken || !clientId) {
+          res.status(400).json({ error: "invalid_request" });
+          return;
+        }
+        const credCheck = deps.store.verifyClientCredentials(clientId, clientSecret);
+        if (!credCheck.ok && credCheck.reason === "invalid_client" && deps.store.getClient(clientId)?.clientSecretHash) {
+          res.status(401).json({ error: "invalid_client" });
+          return;
+        }
+        const inflightKey = `${clientId}\0${refreshToken}`;
+        let refreshPromise = inflightRefreshes.get(inflightKey);
+        if (!refreshPromise) {
+          refreshPromise = Promise.resolve()
+            .then(() => deps.store.refresh(refreshToken, clientId))
+            .finally(() => {
+              if (inflightRefreshes.get(inflightKey) === refreshPromise) {
+                inflightRefreshes.delete(inflightKey);
+              }
+            });
+          inflightRefreshes.set(inflightKey, refreshPromise);
+        }
+        let result: RefreshOutcome;
+        try {
+          result = await refreshPromise;
+        } finally {
+          if (inflightRefreshes.get(inflightKey) === refreshPromise) {
+            inflightRefreshes.delete(inflightKey);
+          }
+        }
+        if (!result.ok) {
+          deps.logger.warn("OAuth token refresh failed", { reason: result.reason, clientId });
+          res.status(400).json({ error: result.reason });
+          return;
+        }
+        res.json({
+          access_token: result.tokens.accessToken,
+          token_type: "Bearer",
+          expires_in: result.tokens.expiresIn,
+          refresh_token: result.tokens.refreshToken ?? undefined,
+          scope: result.tokens.scopes.join(" "),
+        });
+        return;
+      }
+
+      res.status(400).json({ error: "unsupported_grant_type" });
+    } catch (error) {
+      next(error);
+    }
   });
 
   // ---- Revocation (RFC 7009) ---------------------------------------------------

@@ -1941,58 +1941,22 @@ bool CurrentWindowsSessionFingerprint(std::string& fingerprint, DWORD& error) {
     std::array<BYTE, 32> environment{};
     GUID bootIdentifier{};
     bool hasBootIdentifier = false;
-    bool hasExtendedEnvironment = false;
-    std::uint64_t bootTimeFileTicks = 0;
     for (ULONG informationClass : { 107u, 90u }) {
         environment.fill(0xAA);
         if (!queryExact(informationClass, environment.data(),
                         static_cast<ULONG>(environment.size()))) continue;
         GUID candidate{};
         std::memcpy(&candidate, environment.data(), sizeof(candidate));
-        std::uint64_t candidateBootTime = 0;
-        std::memcpy(&candidateBootTime, environment.data() + 24, sizeof(candidateBootTime));
         const bool emptyGuid = candidate.Data1 == 0 && candidate.Data2 == 0 && candidate.Data3 == 0 &&
             std::all_of(std::begin(candidate.Data4), std::end(candidate.Data4), [](BYTE value) { return value == 0; });
-        if (informationClass == 90u && !emptyGuid) {
-            bootIdentifier = candidate;
-            hasBootIdentifier = true;
-        }
-        if (emptyGuid || candidateBootTime == 0 || candidateBootTime >= 2650467743999999999ULL) continue;
+        if (emptyGuid) continue;
         bootIdentifier = candidate;
         hasBootIdentifier = true;
-        bootTimeFileTicks = candidateBootTime;
-        hasExtendedEnvironment = true;
         break;
     }
-
-    std::array<BYTE, 48> timeOfDay{};
-    timeOfDay.fill(0xAA);
-    bool hasTimeOfDayBoot = false;
-    std::uint64_t timeOfDayBootTicks = 0;
-    if (queryExact(3u, timeOfDay.data(), static_cast<ULONG>(timeOfDay.size()))) {
-        std::memcpy(&timeOfDayBootTicks, timeOfDay.data(), sizeof(timeOfDayBootTicks));
-        hasTimeOfDayBoot = timeOfDayBootTicks > 0 && timeOfDayBootTicks < 2650467743999999999ULL;
-    }
-    if (hasExtendedEnvironment) {
-        if (hasTimeOfDayBoot && timeOfDayBootTicks != bootTimeFileTicks) {
-            error = ERROR_INVALID_DATA;
-            return false;
-        }
-    } else {
-        if (!hasTimeOfDayBoot) { error = ERROR_NOT_SUPPORTED; return false; }
-        if (!hasBootIdentifier) {
-            environment.fill(0xAA);
-            if (!queryExact(90u, environment.data(), static_cast<ULONG>(environment.size()))) {
-                error = ERROR_NOT_SUPPORTED;
-                return false;
-            }
-            std::memcpy(&bootIdentifier, environment.data(), sizeof(bootIdentifier));
-            const bool emptyGuid = bootIdentifier.Data1 == 0 && bootIdentifier.Data2 == 0 && bootIdentifier.Data3 == 0 &&
-                std::all_of(std::begin(bootIdentifier.Data4), std::end(bootIdentifier.Data4), [](BYTE value) { return value == 0; });
-            if (emptyGuid) { error = ERROR_NOT_SUPPORTED; return false; }
-            hasBootIdentifier = true;
-        }
-        bootTimeFileTicks = timeOfDayBootTicks;
+    if (!hasBootIdentifier) {
+        error = ERROR_NOT_SUPPORTED;
+        return false;
     }
     std::ostringstream bootIdText;
     bootIdText << std::hex << std::nouppercase << std::setfill('0')
@@ -2004,23 +1968,6 @@ bool CurrentWindowsSessionFingerprint(std::string& fingerprint, DWORD& error) {
     for (size_t index = 2; index < 8; ++index) {
         bootIdText << std::setw(2) << static_cast<unsigned int>(bootIdentifier.Data4[index]);
     }
-
-    FILETIME bootFileTime{};
-    bootFileTime.dwLowDateTime = static_cast<DWORD>(bootTimeFileTicks & 0xFFFFFFFFULL);
-    bootFileTime.dwHighDateTime = static_cast<DWORD>(bootTimeFileTicks >> 32);
-    SYSTEMTIME bootSystemTime{};
-    if (!FileTimeToSystemTime(&bootFileTime, &bootSystemTime)) {
-        error = ERROR_INVALID_DATA;
-        return false;
-    }
-    const std::uint64_t subMillisecondTicks = (bootTimeFileTicks % 10000000ULL) % 10000ULL;
-    std::ostringstream bootTimeText;
-    bootTimeText << std::setfill('0') << std::setw(4) << bootSystemTime.wYear << '-'
-        << std::setw(2) << bootSystemTime.wMonth << '-' << std::setw(2) << bootSystemTime.wDay << 'T'
-        << std::setw(2) << bootSystemTime.wHour << ':' << std::setw(2) << bootSystemTime.wMinute << ':'
-        << std::setw(2) << bootSystemTime.wSecond << '.' << std::setw(3) << bootSystemTime.wMilliseconds;
-    if (subMillisecondTicks != 0) bootTimeText << std::setw(4) << subMillisecondTicks;
-    bootTimeText << 'Z';
 
     HANDLE rawToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) {
@@ -2070,7 +2017,7 @@ bool CurrentWindowsSessionFingerprint(std::string& fingerprint, DWORD& error) {
         << std::setw(8) << statistics.AuthenticationId.LowPart;
 
     const std::string canonical = "{\"bootId\":\"" + bootIdText.str() +
-        "\",\"bootTime\":\"" + bootTimeText.str() + "\",\"userSid\":\"" + userSid +
+        "\",\"bootTime\":\"1970-01-01T00:00:00.000Z\",\"userSid\":\"" + userSid +
         "\",\"sessionId\":" + std::to_string(sessionId) +
         ",\"logonId\":\"" + logonIdText.str() + "\"}";
     if (!Sha256Text(canonical, fingerprint)) { error = ERROR_GEN_FAILURE; return false; }

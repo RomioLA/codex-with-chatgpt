@@ -8,6 +8,7 @@ import type {
   ExecutionJob,
   ExecutionKind,
   ExecutionRecoveryEvidence,
+  ExecutionTempOwnership,
   FullAccessExecutionJob,
   FullAccessGitExecutionAuthorization,
   OutputStream,
@@ -23,8 +24,9 @@ import { findTrustedCommand, CommandNotApprovedError, type TrustedCommand } from
 import { ExecutionJobStore, MAX_JOBS_PER_WORKSPACE, type ReadJobOutputResult } from "./job-store.js";
 import { transitionExecutionJob } from "./state-machine.js";
 import { NativeRunnerCleanupError, NativeRunnerOutputError, WindowsNativeExecutionRunner, type NativeRunnerHandle, type NativeRunnerRequest } from "./native-runner.js";
-import { ExecutionTempOwner } from "./execution-temp.js";
+import { ExecutionTempOwner, type ExecutionTempLease } from "./execution-temp.js";
 import type { runExecutionTempCleanup } from "./execution-temp-cleanup.js";
+import { readWindowsSessionIdentitySync } from "../host-observation/windows.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
@@ -45,6 +47,32 @@ export const MAX_WORKSPACE_EXECUTIONS = 2;
 export const MAX_REPOSITORY_EXECUTIONS = 1;
 export const EXECUTION_CANCEL_GRACE_MS = 10_000;
 export const EXECUTION_PERMISSION_POLL_MS = 250;
+
+const BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function normalizeBootId(value: unknown): string | null {
+  return typeof value === "string" && BOOT_ID_PATTERN.test(value) ? value.toLowerCase() : null;
+}
+
+let cachedHostBootId: string | null = null;
+
+function getHostBootIdCached(): string | null {
+  if (cachedHostBootId !== null) return cachedHostBootId;
+  try {
+    const identity = readWindowsSessionIdentitySync();
+    const rawBootId = identity && typeof identity === "object"
+      ? (identity as Record<string, unknown>).bootId
+      : undefined;
+    const normalized = normalizeBootId(rawBootId);
+    if (normalized !== null) {
+      cachedHostBootId = normalized;
+      return normalized;
+    }
+  } catch {
+    // Do not cache transient/invalid reads.
+  }
+  return null;
+}
 
 function recoveryEvidence(treeConfirmed: boolean, cleanupConfirmed: boolean): ExecutionRecoveryEvidence | undefined {
   if (!treeConfirmed) return undefined;
@@ -197,9 +225,10 @@ export class ExecutionSupervisor {
   private readonly tempOwner: ExecutionTempOwner;
   private readonly logger: Logger;
   private readonly active = new Map<string, ActiveExecution>();
+  private readonly configuredBootId: string | null | undefined;
   private accepting = true;
   private closed = false;
-  private readonly permissionTimer: NodeJS.Timeout;
+  private permissionTimer: NodeJS.Timeout | null = null;
 
   constructor(
     readonly workspace: Workspace,
@@ -207,6 +236,7 @@ export class ExecutionSupervisor {
       store?: ExecutionJobStore;
       runner?: ExecutionRunner;
       tempCleanupImpl?: typeof runExecutionTempCleanup;
+      currentBootId?: string | null;
       permissionPollMs?: number;
       cancelGraceMs?: number;
       now?: () => number;
@@ -214,6 +244,7 @@ export class ExecutionSupervisor {
     } = {}
   ) {
     this.logger = options.logger ?? nullLogger;
+    this.configuredBootId = options.currentBootId;
     this.store = options.store ?? new ExecutionJobStore(workspace.id);
     this.tempOwner = new ExecutionTempOwner(this.store.directory, workspace.id, options.tempCleanupImpl);
     this.reconcileRecoveredTemps();
@@ -228,13 +259,36 @@ export class ExecutionSupervisor {
       }
     }
     supervisors.add(this);
-    this.permissionTimer = setInterval(() => this.reconcilePermission(), this.permissionPollMs);
-    this.permissionTimer.unref?.();
+    this.syncPermissionPolling();
   }
 
   private readonly permissionPollMs: number;
   private readonly cancelGraceMs: number;
   private readonly now: () => number;
+
+  private resolveCurrentBootId(): string | null {
+    if (this.configuredBootId !== undefined) {
+      return normalizeBootId(this.configuredBootId);
+    }
+    return getHostBootIdCached();
+  }
+
+  private syncPermissionPolling(): void {
+    const needsPolling = !this.closed && this.accepting && (
+      this.active.size > 0 ||
+      [...globalSlots.values()].some((slot) => slot.workspaceId === this.workspace.id) ||
+      this.store.listAll().some((job) => job.state === "queued" || job.state === "running" || job.state === "cancelling")
+    );
+    if (needsPolling) {
+      if (this.permissionTimer === null) {
+        this.permissionTimer = setInterval(() => this.reconcilePermission(), this.permissionPollMs);
+        this.permissionTimer.unref?.();
+      }
+    } else if (this.permissionTimer !== null) {
+      clearInterval(this.permissionTimer);
+      this.permissionTimer = null;
+    }
+  }
 
   private controlledGate(scopes: readonly string[], scope: string, clientId: string, idempotencyKey: string): string | null {
     if (!this.accepting) return "SUPERVISOR_CLOSING";
@@ -719,52 +773,57 @@ export class ExecutionSupervisor {
     if (this.closed || !this.accepting) return;
     if (readPermission(this.workspace.id) === "readonly") {
       this.cancelQueuedForDowngrade();
+      this.syncPermissionPolling();
       return;
     }
-    while (globalSlots.size < MAX_GLOBAL_EXECUTIONS) {
-      const workspaceActive = [...globalSlots.values()].filter((slot) => slot.workspaceId === this.workspace.id).length;
-      if (workspaceActive >= MAX_WORKSPACE_EXECUTIONS) break;
-      const busyRepositories = new Set([...globalSlots.values()]
-        .flatMap((slot) => slot.repositoryIdentity === null ? [] : [slot.repositoryIdentity]));
-      const next = this.allQueuedOldestFirst().find((job) => {
-        const repositoryIdentity = jobRepositoryIdentity(job);
-        return repositoryIdentity === null || !busyRepositories.has(repositoryIdentity);
-      });
-      if (!next) break;
-      const workspaceSlot = `${this.workspace.id}:${next.jobId}`;
-      if (globalSlots.has(workspaceSlot)) break;
-      const slotReservation: GlobalSlotReservation = {
-        workspaceId: this.workspace.id,
-        repositoryIdentity: jobRepositoryIdentity(next),
-      };
-      globalSlots.set(workspaceSlot, slotReservation);
-      void this.startQueued(next, workspaceSlot, slotReservation).catch((error: unknown) => {
-        try {
-          const current = this.store.get(next.jobId);
-          if (current?.state === "queued" || (current?.state === "running" && !this.active.has(next.jobId))) {
-            this.store.replace(transitionExecutionJob(current, "failed", { failureCode: cleanCode((error as Error).message) }));
-            if (!isFullAccessExecutionJob(current)) this.auditControlledCompletion(current.jobId);
-          }
-        } catch (persistError) {
-          this.logger.error("Failed to persist queued execution failure", {
-            workspaceId: this.workspace.id,
-            jobId: next.jobId,
-            startupFailureCode: cleanCode((error as Error).message),
-            persistenceFailureCode: cleanCode((persistError as Error).message),
-          });
-        } finally {
-          releaseGlobalSlot(workspaceSlot, slotReservation);
+    try {
+      while (globalSlots.size < MAX_GLOBAL_EXECUTIONS) {
+        const workspaceActive = [...globalSlots.values()].filter((slot) => slot.workspaceId === this.workspace.id).length;
+        if (workspaceActive >= MAX_WORKSPACE_EXECUTIONS) break;
+        const busyRepositories = new Set([...globalSlots.values()]
+          .flatMap((slot) => slot.repositoryIdentity === null ? [] : [slot.repositoryIdentity]));
+        const next = this.allQueuedOldestFirst().find((job) => {
+          const repositoryIdentity = jobRepositoryIdentity(job);
+          return repositoryIdentity === null || !busyRepositories.has(repositoryIdentity);
+        });
+        if (!next) break;
+        const workspaceSlot = `${this.workspace.id}:${next.jobId}`;
+        if (globalSlots.has(workspaceSlot)) break;
+        const slotReservation: GlobalSlotReservation = {
+          workspaceId: this.workspace.id,
+          repositoryIdentity: jobRepositoryIdentity(next),
+        };
+        globalSlots.set(workspaceSlot, slotReservation);
+        void this.startQueued(next, workspaceSlot, slotReservation).catch((error: unknown) => {
           try {
-            scheduleAll();
-          } catch (scheduleError) {
-            this.logger.error("Failed to schedule after queued execution cleanup", {
+            const current = this.store.get(next.jobId);
+            if (current?.state === "queued" || (current?.state === "running" && !this.active.has(next.jobId))) {
+              this.store.replace(transitionExecutionJob(current, "failed", { failureCode: cleanCode((error as Error).message) }));
+              if (!isFullAccessExecutionJob(current)) this.auditControlledCompletion(current.jobId);
+            }
+          } catch (persistError) {
+            this.logger.error("Failed to persist queued execution failure", {
               workspaceId: this.workspace.id,
               jobId: next.jobId,
-              failureCode: cleanCode((scheduleError as Error).message),
+              startupFailureCode: cleanCode((error as Error).message),
+              persistenceFailureCode: cleanCode((persistError as Error).message),
             });
+          } finally {
+            releaseGlobalSlot(workspaceSlot, slotReservation);
+            try {
+              scheduleAll();
+            } catch (scheduleError) {
+              this.logger.error("Failed to schedule after queued execution cleanup", {
+                workspaceId: this.workspace.id,
+                jobId: next.jobId,
+                failureCode: cleanCode((scheduleError as Error).message),
+              });
+            }
           }
-        }
-      });
+        });
+      }
+    } finally {
+      this.syncPermissionPolling();
     }
   }
 
@@ -865,14 +924,22 @@ export class ExecutionSupervisor {
     const sanitizers = { stdout: new StreamingSanitizer(), stderr: new StreamingSanitizer() };
     const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
     let active!: ActiveExecution;
+    let tempLease: ExecutionTempLease | undefined;
     try {
-      const tempLease = this.tempOwner.create(job.jobId);
-      this.store.replace({ ...running, tempOwnership: {
+      const currentBootId = this.resolveCurrentBootId() ?? undefined;
+      tempLease = this.tempOwner.create(job.jobId, currentBootId);
+      const tempOwnership: ExecutionTempOwnership = {
         rootFileIdentity: tempLease.rootFileIdentity,
         directoryFileIdentity: tempLease.directoryFileIdentity,
         nonce: tempLease.nonce,
         createdAtMs: tempLease.createdAtMs,
-      } });
+        ...(tempLease.bootId ? { bootId: tempLease.bootId } : {}),
+      };
+      this.store.replace({
+        ...running,
+        ...(currentBootId ? { bootId: currentBootId } : {}),
+        tempOwnership,
+      });
       const fullAccessGitAuthorization = isFullAccessGitAuthorization(job.authorization)
         ? job.authorization
         : undefined;
@@ -944,6 +1011,7 @@ export class ExecutionSupervisor {
         treeConfirmed: false,
       };
       this.active.set(job.jobId, active);
+      this.syncPermissionPolling();
       active.finished = handle.completion
         .then(async (completion) => {
           active.treeConfirmed = completion.result.treeTerminationConfirmed ?? completion.result.outcome !== 3;
@@ -972,17 +1040,38 @@ export class ExecutionSupervisor {
         .finally(() => this.releaseActive(job.jobId, active));
     } catch (error) {
       releaseWriteLock?.();
-      const failed = transitionExecutionJob(this.store.get(job.jobId) ?? running, "failed", {
-        failureCode: cleanCode((error as Error).message === "EXECUTION_HELPER_UNAVAILABLE"
-          ? "EXECUTION_HELPER_UNAVAILABLE"
-          : (error as Error).message === "EXECUTABLE_UNAVAILABLE"
-            ? "EXECUTABLE_UNAVAILABLE"
-            : "HELPER_START_FAILED"),
-      });
-      this.store.replace(failed);
+      const persisted = this.store.get(job.jobId) ?? running;
+      let tempCleaned = true;
+      if (tempLease) {
+        tempCleaned = !fs.existsSync(tempLease.directoryPath) ||
+          this.tempOwner.cleanup(job.jobId, tempLease, undefined, true);
+      }
+      if (tempCleaned) {
+        const failed = transitionExecutionJob({ ...persisted, tempOwnership: null }, "failed", {
+          failureCode: cleanCode((error as Error).message === "EXECUTION_HELPER_UNAVAILABLE"
+            ? "EXECUTION_HELPER_UNAVAILABLE"
+            : (error as Error).message === "EXECUTABLE_UNAVAILABLE"
+              ? "EXECUTABLE_UNAVAILABLE"
+              : "HELPER_START_FAILED"),
+        });
+        this.store.replace(failed);
+      } else {
+        const preservedOwnership: ExecutionTempOwnership | null = persisted.tempOwnership ?? (tempLease ? {
+          rootFileIdentity: tempLease.rootFileIdentity,
+          directoryFileIdentity: tempLease.directoryFileIdentity,
+          nonce: tempLease.nonce,
+          createdAtMs: tempLease.createdAtMs,
+          ...(tempLease.bootId ? { bootId: tempLease.bootId } : {}),
+        } : null);
+        const interrupted = transitionExecutionJob({ ...persisted, tempOwnership: preservedOwnership }, "interrupted", {
+          failureCode: "HELPER_CLEANUP_UNCONFIRMED",
+        });
+        this.store.replace(interrupted);
+      }
       if (!fullAccessJob) this.auditControlledCompletion(job.jobId);
       releaseGlobalSlot(workspaceSlot, slotReservation);
       scheduleAll();
+      this.syncPermissionPolling();
     }
   }
 
@@ -1150,35 +1239,65 @@ export class ExecutionSupervisor {
     this.store.prepareCapacity();
   }
 
-  private static isRecoverableTempCandidate(job: ExecutionJob): boolean {
+  private static isRecoverableTempCandidate(job: ExecutionJob, crossBoot = false): boolean {
     // Temp deletion cannot confirm an entire process tree exited. Only a
-    // persisted native-helper tree-exit confirmation permits recovery cleanup.
+    // persisted native-helper tree-exit confirmation or a verified Windows boot
+    // boundary permits recovery cleanup.
     return job.state === "interrupted" && job.tempOwnership !== null &&
-      job.recoveryEvidence === "process_tree_exited";
+      (job.recoveryEvidence === "process_tree_exited" || crossBoot);
   }
 
   private reconcileRecoveredTemps(): void {
     if (this.store.corruption) return;
-    const records = this.store.listAll().flatMap((job) =>
-      ExecutionSupervisor.isRecoverableTempCandidate(job)
-        ? [{ jobId: job.jobId, ownership: job.tempOwnership! }]
-        : []);
-    if (records.length === 0) return;
-    const recovery = this.tempOwner.reconcileStaleTemps(records, new Set(this.active.keys()), true);
-    for (const jobId of recovery.removedJobIds) {
-      const job = this.store.get(jobId);
-      if (!job || !ExecutionSupervisor.isRecoverableTempCandidate(job) || this.active.has(jobId)) continue;
-      this.store.replace({
-        ...job,
-        tempOwnership: null,
-        recoveryEvidence: "process_tree_and_temp_cleaned",
-      });
+    const interruptedJobs = this.store.listAll().filter((job) => job.state === "interrupted");
+    if (interruptedJobs.length === 0) return;
+
+    const recordedBootIdOf = (job: ExecutionJob): string | null =>
+      normalizeBootId(job.tempOwnership?.bootId) ?? normalizeBootId(job.bootId);
+    const hasRecordedBootId = interruptedJobs.some((job) => recordedBootIdOf(job) !== null);
+    const currentBootId = hasRecordedBootId ? this.resolveCurrentBootId() : null;
+
+    const crossBootByJobId = new Map<string, boolean>();
+    const records: Array<{ jobId: string; ownership: ExecutionTempOwnership }> = [];
+    for (const job of interruptedJobs) {
+      const recordedBootId = recordedBootIdOf(job);
+      const crossBoot = currentBootId !== null && recordedBootId !== null && recordedBootId !== currentBootId;
+      crossBootByJobId.set(job.jobId, crossBoot);
+      if (ExecutionSupervisor.isRecoverableTempCandidate(job, crossBoot)) {
+        records.push({ jobId: job.jobId, ownership: job.tempOwnership! });
+      }
     }
-    if (recovery.skipped > 0) {
-      this.logger.warn("Execution temp recovery preserved unknown or unverified directories", {
-        workspaceId: this.workspace.id,
-        skipped: recovery.skipped,
-      });
+
+    if (records.length > 0) {
+      const recovery = this.tempOwner.reconcileStaleTemps(records, new Set(this.active.keys()), true);
+      for (const jobId of recovery.removedJobIds) {
+        const job = this.store.get(jobId);
+        const crossBoot = crossBootByJobId.get(jobId) === true;
+        if (!job || !ExecutionSupervisor.isRecoverableTempCandidate(job, crossBoot) || this.active.has(jobId)) continue;
+        this.store.replace({
+          ...job,
+          tempOwnership: null,
+          recoveryEvidence: crossBoot ? "boot_boundary_and_temp_cleaned" : "process_tree_and_temp_cleaned",
+        });
+      }
+      if (recovery.skipped > 0) {
+        this.logger.warn("Execution temp recovery preserved unknown or unverified directories", {
+          workspaceId: this.workspace.id,
+          skipped: recovery.skipped,
+        });
+      }
+    }
+
+    for (const job of interruptedJobs) {
+      if (job.tempOwnership === null && job.recoveryEvidence === undefined && crossBootByJobId.get(job.jobId) === true) {
+        const current = this.store.get(job.jobId);
+        if (current && current.state === "interrupted" && current.tempOwnership === null && current.recoveryEvidence === undefined) {
+          this.store.replace({
+            ...current,
+            recoveryEvidence: "boot_boundary_and_temp_cleaned",
+          });
+        }
+      }
     }
   }
 
@@ -1190,6 +1309,7 @@ export class ExecutionSupervisor {
     this.auditControlledCompletion(jobId);
     if (active.treeConfirmed) active.releaseWriteLock?.();
     scheduleAll();
+    this.syncPermissionPolling();
   }
 
   private auditControlledCompletion(jobId: string): void {
@@ -1299,6 +1419,7 @@ export class ExecutionSupervisor {
       resultCategory = "failure";
       throw error;
     } finally {
+      this.syncPermissionPolling();
       span?.({ resultCategory });
     }
   }
@@ -1337,7 +1458,10 @@ export class ExecutionSupervisor {
         /* unknown or replaced temp roots are preserved for conservative recovery */
       }
     }
-    clearInterval(this.permissionTimer);
+    if (this.permissionTimer) {
+      clearInterval(this.permissionTimer);
+      this.permissionTimer = null;
+    }
     this.closed = true;
     supervisors.delete(this);
   }

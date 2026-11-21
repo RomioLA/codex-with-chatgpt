@@ -213,17 +213,32 @@ export function archiveRecord(
 
 export function jobCanBeArchived(job: ExecutionJob): boolean {
   if (!job.finishedAt || job.tempOwnership !== null || job.state === "interrupted") return false;
-  if (!["succeeded", "cancelled", "timed_out"].includes(job.state) && !(job.state === "failed" && (job.startedAt === null || ["NONZERO_EXIT", "AUTHORIZATION_REVOKED"].includes(job.failureCode ?? "")))) return false;
+  if (
+    !["succeeded", "cancelled", "timed_out"].includes(job.state) &&
+    !(job.state === "failed" && (
+      job.startedAt === null ||
+      [
+        "NONZERO_EXIT",
+        "AUTHORIZATION_REVOKED",
+        "HELPER_START_FAILED",
+        "EXECUTION_HELPER_UNAVAILABLE",
+        "EXECUTABLE_UNAVAILABLE",
+        "GIT_STATE_CHANGED",
+      ].includes(job.failureCode ?? "")
+    ))
+  ) return false;
   return gitOutcomeCanBeArchived(job);
 }
 
 /** JobStore may move only explicitly recovered interrupted jobs into history. */
 export function jobCanBeStoredInArchive(job: ExecutionJob): boolean {
   if (job.state !== "interrupted") return jobCanBeArchived(job);
+  if (!job.finishedAt || job.tempOwnership !== null || !gitOutcomeCanBeArchived(job)) return false;
+  if (job.failureCode === "BRIDGE_RESTARTED" && job.startedAt === null) return true;
+  if (job.recoveryEvidence === "boot_boundary_and_temp_cleaned") return true;
   // Pre-fix bridge restarts could gain false tree-exit evidence from Temp cleanup.
-  if (job.failureCode === "BRIDGE_RESTARTED") return false;
-  return !!job.finishedAt && job.tempOwnership === null &&
-    job.recoveryEvidence === "process_tree_and_temp_cleaned" && gitOutcomeCanBeArchived(job);
+  return job.failureCode !== "BRIDGE_RESTARTED" &&
+    job.recoveryEvidence === "process_tree_and_temp_cleaned";
 }
 
 function gitOutcomeCanBeArchived(job: ExecutionJob): boolean {
