@@ -19,6 +19,7 @@ export interface RuntimeState {
   adminToken: string;
   publicUrl: string | null;
   startedAt: string;
+  processStartTime?: string;
 }
 
 export function runtimeFile(workspaceId: string): string {
@@ -108,7 +109,11 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
   }
   if (pid === "missing") return { state: "stopped", runtime, reason: "pid_missing" };
   if (pid === "present") {
-    const owner = await observeBridgeProcessOwner(runtime.pid, runtime.workspaceRoot);
+    const owner = await observeBridgeProcessOwner(
+      runtime.pid,
+      runtime.workspaceRoot,
+      typeof runtime.processStartTime === "string" ? runtime.processStartTime : undefined,
+    );
     if (owner === "unrelated") return { state: "stopped", runtime, reason: "pid_reused" };
     if (owner === "missing") {
       const recheckedPid = observePid(runtime.pid);

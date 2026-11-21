@@ -530,7 +530,9 @@ export type PowerShellCandidateOutcome =
   | "identity-ok"
   /** Process creation was refused by the OS (EPERM/EACCES/ENOENT-at-exec, job object). */
   | "spawn-denied"
-  /** Started but failed: non-zero exit, crash, timeout, or unusable output. */
+  /** Timed out before completing; transient and never cached permanently. */
+  | "timeout"
+  /** Started but failed: non-zero exit, crash, or unusable output. */
   | "interpreter-failed";
 
 export interface SessionIdentityReadResult {
@@ -573,8 +575,10 @@ function classifySpawnError(error: unknown): PowerShellCandidateOutcome {
   const err = error as NodeJS.ErrnoException & { status?: number | null; signal?: string | null; killed?: boolean };
   const code = err?.code;
   if (code === "EPERM" || code === "EACCES" || code === "ENOEXEC" || code === "EFTYPE") return "spawn-denied";
-  // A killed child (timeout) produced no identity but the binary did run.
-  if (err?.killed || err?.signal) return "interpreter-failed";
+  // A timed-out child is a transient failure; never poison the interpreter cache.
+  if (err?.killed || code === "ETIMEDOUT") return "timeout";
+  // A signalled child produced no identity but the binary did run.
+  if (err?.signal) return "interpreter-failed";
   // Non-zero exit is an interpreter failure, not a transport refusal.
   if (typeof err?.status === "number") return "interpreter-failed";
   return "interpreter-failed";
@@ -668,7 +672,7 @@ export function readWindowsSessionIdentitySyncDetailed(): SessionIdentityReadRes
     const run = runPowerShell(executable, WINDOWS_SESSION_IDENTITY_SCRIPT);
     if (run.outcome !== "ok") {
       attempts.push({ executable, outcome: run.outcome });
-      // Do not cache a transport refusal as a property of this binary.
+      // Do not cache transport refusals or timeouts as a property of this binary.
       if (run.outcome === "interpreter-failed") candidateOutcomes.set(key, "interpreter-failed");
       if (run.outcome === "spawn-denied") spawnDenied += 1;
       lastReason = run.outcome === "spawn-denied" ? "SPAWN_DENIED_BY_ENVIRONMENT" : "INTERPRETER_FAILED";

@@ -181,8 +181,8 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
   const recoveryEvidenceValid = job.recoveryEvidence === undefined ||
     (job.state === "interrupted" && (
       job.recoveryEvidence === "process_tree_exited" && isTempOwnership(job.tempOwnership) ||
-      job.recoveryEvidence === "process_tree_and_temp_cleaned" && job.tempOwnership === null ||
-      job.recoveryEvidence === "boot_boundary_and_temp_cleaned" && job.tempOwnership === null
+      job.recoveryEvidence === "process_tree_and_temp_cleaned" && job.tempOwnership === null && job.tempOwnershipPending !== true ||
+      job.recoveryEvidence === "boot_boundary_and_temp_cleaned" && job.tempOwnership === null && job.tempOwnershipPending !== true
     ));
   const validGitResult = gitResult === undefined || (
     ["confirmed", "changed", "identity_changed", "unavailable"].includes(String(gitResult.confirmation)) &&
@@ -204,6 +204,7 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     Number.isSafeInteger(job.timeoutSeconds) && Number(job.timeoutSeconds) >= 1 && Number(job.timeoutSeconds) <= 3600 &&
     typeof job.idempotencyKeyHash === "string" && /^[a-f0-9]{64}$/.test(job.idempotencyKeyHash) &&
     (job.tempOwnership === undefined || job.tempOwnership === null || isTempOwnership(job.tempOwnership)) &&
+    (job.tempOwnershipPending === undefined || typeof job.tempOwnershipPending === "boolean") &&
     (job.bootId === undefined || isValidBootId(job.bootId)) &&
     (job.exitCode === null || Number.isInteger(job.exitCode)) &&
     (job.failureCode === null || typeof job.failureCode === "string") &&
@@ -766,14 +767,24 @@ export class ExecutionJobStore {
 
   replace(job: ExecutionJob): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
-    if (job.workspaceId !== this.workspaceId || !this.jobs.has(job.jobId)) throw new TypeError("Unknown execution job");
-    this.jobs.set(job.jobId, job);
-    this.persist();
-    const next = this.prune(this.jobs);
-    if (next.size !== this.jobs.size) {
-      this.persist(next);
-      this.commitJobs(next);
+    const previous = this.jobs.get(job.jobId);
+    if (job.workspaceId !== this.workspaceId || !previous) throw new TypeError("Unknown execution job");
+    const staged = new Map(this.jobs);
+    staged.set(job.jobId, job);
+    if (!sameLogicalJob(previous, job)) {
+      this.jobs.set(job.jobId, job);
+      this.persist();
     }
+    const next = this.prune(staged);
+    if (next.size === staged.size) {
+      if (this.jobs.get(job.jobId) !== job) {
+        this.jobs.set(job.jobId, job);
+        this.persist();
+      }
+      return;
+    }
+    this.persist(next);
+    this.commitJobs(next);
   }
 
   appendSanitized(jobId: string, stream: OutputStream, text: string): Promise<void> {

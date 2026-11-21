@@ -3,13 +3,24 @@ import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { observeBridgeProcessOwner } from "../process/bridge-process-identity.js";
+import { observeBridgeProcessOwner, readOwnWindowsProcessStartTime } from "../process/bridge-process-identity.js";
 
 const RECOVERY_PORT_START = 49_152;
 const RECOVERY_PORT_COUNT = 16_384;
 
 export interface BridgeInstanceLock {
   release(): Promise<void>;
+}
+
+/**
+ * Transient lock contention (a live owner or concurrent recovery in progress).
+ * Distinct from corrupt/unreadable lock files so CLI offline helpers can retry.
+ */
+export class BridgeInstanceLockBusyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BridgeInstanceLockBusyError";
+  }
 }
 
 function listen(server: net.Server, port: number): Promise<void> {
@@ -29,6 +40,7 @@ interface StateLockRecord {
   pid: number;
   token: string;
   createdAt: string;
+  processStartTime?: string;
 }
 
 export type BridgeInstanceLockStatus =
@@ -53,6 +65,14 @@ export function bridgeInstanceLockFile(workspaceId: string): string {
 function isStateLockRecord(value: unknown, workspaceId: string): value is StateLockRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Partial<StateLockRecord>;
+  if (
+    record.processStartTime !== undefined &&
+    (typeof record.processStartTime !== "string" ||
+      record.processStartTime.trim().length === 0 ||
+      record.processStartTime.length > 64)
+  ) {
+    return false;
+  }
   return record.version === 1 &&
     record.workspaceId === workspaceId &&
     Number.isInteger(record.pid) && Number(record.pid) > 0 &&
@@ -104,7 +124,7 @@ async function canRecoverLockOwner(
   const presence = processPresence(record.pid);
   if (presence === "dead") return true;
   if (presence !== "alive" || isLocallyOwnedLock(file, record)) return false;
-  const owner = await observeBridgeProcessOwner(record.pid, workspaceRoot);
+  const owner = await observeBridgeProcessOwner(record.pid, workspaceRoot, record.processStartTime);
   return owner === "unrelated";
 }
 
@@ -161,7 +181,7 @@ async function recoverDeadOwner(
     await listen(recoveryServer, recoveryPort);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
-      throw new Error("Cannot serialize Bridge lock recovery; refusing to start another Bridge.");
+      throw new BridgeInstanceLockBusyError("Cannot serialize Bridge lock recovery; refusing to start another Bridge.");
     }
     throw error;
   }
@@ -170,10 +190,21 @@ async function recoverDeadOwner(
     const current = readStateLock(file, workspaceId);
     if (!current || current.token !== observed.token) return;
     if (!await canRecoverLockOwner(file, current, workspaceRoot)) {
-      throw new Error("The Bridge instance lock owner cannot be safely verified; refusing to start another Bridge.");
+      const msg = "The Bridge instance lock owner cannot be safely verified; refusing to start another Bridge.";
+      if (processPresence(current.pid) === "alive") {
+        throw new BridgeInstanceLockBusyError(msg);
+      }
+      throw new Error(msg);
     }
     const latest = readStateLock(file, workspaceId);
-    if (!latest || latest.token !== current.token || latest.pid !== current.pid) return;
+    if (
+      !latest ||
+      latest.token !== current.token ||
+      latest.pid !== current.pid ||
+      latest.processStartTime !== current.processStartTime
+    ) {
+      return;
+    }
     fs.unlinkSync(file);
   } finally {
     await new Promise<void>((resolve) => recoveryServer.close(() => resolve()));
@@ -189,6 +220,7 @@ export async function acquireBridgeInstanceLock(workspaceId: string, workspaceRo
   const normalizedWorkspaceId = workspaceId.toLowerCase();
   const file = bridgeInstanceLockFile(normalizedWorkspaceId);
   ensureDir(path.dirname(file));
+  const processStartTime = await readOwnWindowsProcessStartTime();
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const token = randomBytes(16).toString("hex");
@@ -198,6 +230,7 @@ export async function acquireBridgeInstanceLock(workspaceId: string, workspaceRo
       pid: process.pid,
       token,
       createdAt: new Date().toISOString(),
+      ...(processStartTime ? { processStartTime } : {}),
     };
     const tempFile = `${file}.${process.pid}.${token}.tmp`;
     writeNewStateLock(tempFile, record);
@@ -218,7 +251,11 @@ export async function acquireBridgeInstanceLock(workspaceId: string, workspaceRo
             released = true;
             try {
               const current = readStateLock(file, normalizedWorkspaceId);
-              if (current?.token === token && current.pid === process.pid) {
+              if (
+                current?.token === token &&
+                current.pid === process.pid &&
+                current.processStartTime === (processStartTime ?? undefined)
+              ) {
                 fs.unlinkSync(file);
               }
             } finally {
@@ -245,12 +282,12 @@ export async function acquireBridgeInstanceLock(workspaceId: string, workspaceRo
     }
     if (!await canRecoverLockOwner(file, existing, workspaceRoot)) {
       if (presence === "alive") {
-        throw new Error("A Bridge instance lock has a live but unverified PID; refusing to start another Bridge.");
+        throw new BridgeInstanceLockBusyError("A Bridge instance lock has a live but unverified PID; refusing to start another Bridge.");
       }
       throw new Error("The Bridge instance lock owner cannot be verified; refusing to start another Bridge.");
     }
     await recoverDeadOwner(file, normalizedWorkspaceId, workspaceRoot, existing);
   }
 
-  throw new Error("Unable to acquire the per-workspace Bridge instance lock.");
+  throw new BridgeInstanceLockBusyError("Unable to acquire the per-workspace Bridge instance lock.");
 }

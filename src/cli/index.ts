@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
+import { acquireBridgeInstanceLock, BridgeInstanceLockBusyError, type BridgeInstanceLock } from "../bridge/instance-lock.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge, waitForBridgeProcessExit } from "../process/daemon.js";
 import { observeBridgeProcessLifecycle, type BridgeShutdownSource } from "../diagnostics/bridge-lifecycle.js";
@@ -1680,21 +1681,87 @@ program
     }
   });
 
+/**
+ * Serialize offline AuthStore mutations against a starting or running Bridge
+ * and concurrent offline CLI writers using the per-workspace instance lock.
+ */
+async function runWithLiveBridgeOrOfflineLock<T>(
+  workspace: Workspace,
+  actions: {
+    onLiveBridge: (runtime: RuntimeState) => Promise<T>;
+    onOfflineLocked: () => Promise<T> | T;
+  },
+): Promise<{ mode: "live" | "offline"; result: T }> {
+  const maxAttempts = 25;
+  const retryDelayMs = 100;
+  let lastContentionError: unknown;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const observation = await findBridgeObservation(workspace.id);
+    if (observation.state === "unknown") {
+      throw new Error(
+        `Bridge state is uncertain (${observation.reason}); refusing to modify OAuth store while Bridge ownership is unverified.`
+      );
+    }
+    if (observation.state === "healthy") {
+      return { mode: "live", result: await actions.onLiveBridge(observation.runtime) };
+    }
+
+    let lock: BridgeInstanceLock;
+    try {
+      lock = await acquireBridgeInstanceLock(workspace.id, workspace.root);
+    } catch (error) {
+      if (error instanceof BridgeInstanceLockBusyError) {
+        lastContentionError = error;
+        if (attempt + 1 < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+          continue;
+        }
+        throw error;
+      }
+      throw error;
+    }
+
+    try {
+      const rechecked = await findBridgeObservation(workspace.id);
+      if (rechecked.state === "unknown") {
+        throw new Error(
+          `Bridge state is uncertain (${rechecked.reason}); refusing to modify OAuth store while Bridge ownership is unverified.`
+        );
+      }
+      if (rechecked.state === "healthy") {
+        return { mode: "live", result: await actions.onLiveBridge(rechecked.runtime) };
+      }
+      return { mode: "offline", result: await actions.onOfflineLocked() };
+    } finally {
+      await lock.release().catch(() => undefined);
+    }
+  }
+
+  throw lastContentionError ?? new Error("Unable to coordinate OAuth store access with the workspace Bridge.");
+}
+
 program
   .command("unpair")
   .description("Revoke ChatGPT's access to this workspace immediately")
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
-    const root = resolveWorkspace(opts.workspace);
-    const workspace = new Workspace(root);
-    const runtime = await findLiveBridge(workspace.id);
-    if (runtime) {
-      await adminFetch(runtime, "POST", "/admin/revoke-all");
-    } else {
-      // bridge not running: revoke directly in the persisted store
-      new AuthStore(workspace.id).revokeAll();
+    try {
+      const root = resolveWorkspace(opts.workspace);
+      const workspace = new Workspace(root);
+      await runWithLiveBridgeOrOfflineLock(workspace, {
+        onLiveBridge: async (runtime) => {
+          await adminFetch(runtime, "POST", "/admin/revoke-all");
+        },
+        onOfflineLocked: () => {
+          // bridge not running: revoke directly in the persisted store under instance lock
+          new AuthStore(workspace.id).revokeAll();
+        },
+      });
+      check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
+    } catch (error) {
+      handleCliError(error, false);
     }
-    check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
   });
 
 // ---------------------------------------------------------------- oauth-client (pre-registered / Gemini Web)
@@ -1752,40 +1819,35 @@ oauthClientCmd
             ? (() => { throw new Error("auth-method must be client_secret_basic, client_secret_post, or none"); })()
             : "client_secret_basic";
 
-      const observation = await findBridgeObservation(workspace.id);
-      if (observation.state === "unknown") {
-        throw new Error(
-          `Bridge state is uncertain (${observation.reason}); refusing to modify OAuth store while Bridge ownership is unverified.`
-        );
-      }
-
-      const client = observation.state === "healthy"
-        ? await adminFetch<{
+      const { mode, result: client } = await runWithLiveBridgeOrOfflineLock(workspace, {
+        onLiveBridge: (runtime) =>
+          adminFetch<{
             clientId: string;
             clientName: string | null;
             clientSecret: string | null;
             redirectUris: string[];
             tokenEndpointAuthMethod: string;
-          }>(observation.runtime, "POST", "/admin/oauth-clients", 10_000, {
+          }>(runtime, "POST", "/admin/oauth-clients", 10_000, {
             clientName: opts.name.slice(0, 200),
             redirectUris,
             tokenEndpointAuthMethod,
-          })
-        : (() => {
-            const registered = new AuthStore(workspace.id).registerClient({
-              clientName: opts.name.slice(0, 200),
-              redirectUris,
-              tokenEndpointAuthMethod,
-              trustedLocalClient: true,
-            });
-            return {
-              clientId: registered.clientId,
-              clientName: registered.clientName ?? null,
-              clientSecret: registered.clientSecret ?? null,
-              redirectUris: registered.redirectUris,
-              tokenEndpointAuthMethod,
-            };
-          })();
+          }),
+        onOfflineLocked: () => {
+          const registered = new AuthStore(workspace.id).registerClient({
+            clientName: opts.name.slice(0, 200),
+            redirectUris,
+            tokenEndpointAuthMethod,
+            trustedLocalClient: true,
+          });
+          return {
+            clientId: registered.clientId,
+            clientName: registered.clientName ?? null,
+            clientSecret: registered.clientSecret ?? null,
+            redirectUris: registered.redirectUris,
+            tokenEndpointAuthMethod,
+          };
+        },
+      });
 
       const payload = {
         ok: true,
@@ -1806,7 +1868,7 @@ oauthClientCmd
       if (client.clientSecret) say(`client_secret: ${client.clientSecret}`);
       say(`auth_method: ${tokenEndpointAuthMethod}`);
       say(`redirect_uris: ${client.redirectUris.join(", ")}`);
-      if (observation.state === "healthy") {
+      if (mode === "live") {
         say("已同步写入运行中的 Bridge，即时生效，无需重启。");
       }
     } catch (error) {

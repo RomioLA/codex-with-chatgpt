@@ -3999,9 +3999,26 @@ bool ValidateDurablePublishPaths(const std::wstring& destination, const std::wst
     const std::wstring requestedParent = ParentDirectory(destination);
     std::wstring canonicalParent;
     if (!ValidateCanonicalPath(requestedParent, true, canonicalParent, error) ||
-        !ValidateCanonicalPath(source, false, canonicalSource, error) ||
-        !SameOrdinal(ParentDirectory(canonicalSource), canonicalParent)) {
+        !ValidateCanonicalPath(source, false, canonicalSource, error)) {
         if (error == ERROR_SUCCESS) error = ERROR_INVALID_NAME;
+        return false;
+    }
+    const std::wstring sourceParent = ParentDirectory(canonicalSource);
+    const bool sameParent = SameOrdinal(sourceParent, canonicalParent);
+    bool stagingSibling = false;
+    if (!sameParent && canonicalParent.size() > 3 && sourceParent.size() > 3) {
+        const std::wstring destKindDir = ParentDirectory(canonicalParent);
+        if (destKindDir.size() > 3) {
+            const std::wstring archiveRoot = ParentDirectory(destKindDir);
+            if (SameOrdinal(PathBasename(sourceParent), L".staging") &&
+                SameOrdinal(ParentDirectory(sourceParent), archiveRoot)) {
+                stagingSibling = CheckPathObject(archiveRoot, true, error);
+                if (!stagingSibling) return false;
+            }
+        }
+    }
+    if (!sameParent && !stagingSibling) {
+        error = ERROR_INVALID_NAME;
         return false;
     }
     canonicalDestination = canonicalParent;
@@ -4022,10 +4039,16 @@ bool ValidateDurablePublishPaths(const std::wstring& destination, const std::wst
     }
 
     wchar_t volumeRoot[MAX_PATH]{};
+    wchar_t destVolumeRoot[MAX_PATH]{};
     wchar_t fileSystem[MAX_PATH]{};
     if (!GetVolumePathNameW(canonicalSource.c_str(), volumeRoot, MAX_PATH) ||
+        !GetVolumePathNameW(canonicalParent.c_str(), destVolumeRoot, MAX_PATH) ||
         !GetVolumeInformationW(volumeRoot, nullptr, 0, nullptr, nullptr, nullptr, fileSystem, MAX_PATH)) {
         error = GetLastError();
+        return false;
+    }
+    if (!SameOrdinal(volumeRoot, destVolumeRoot)) {
+        error = ERROR_NOT_SAME_DEVICE;
         return false;
     }
     if (GetDriveTypeW(volumeRoot) != DRIVE_FIXED || !SameOrdinal(fileSystem, L"NTFS")) {

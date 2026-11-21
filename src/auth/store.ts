@@ -1,7 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { ensureDir, getStateDir } from "../config/paths.js";
+import { atomicReplace } from "../execution/atomic-replace.js";
 import { incrementAuthorizationEpoch } from "../permission/store.js";
 
 // Newly authorized connections receive only this explicitly approved scope set.
@@ -98,6 +99,46 @@ export function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(bufA, bufB);
 }
 
+export class AuthStoreCorruptError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthStoreCorruptError";
+  }
+}
+
+function isValidClientRegistration(value: unknown): value is ClientRegistration {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const client = value as Partial<ClientRegistration>;
+  if (typeof client.clientId !== "string" || client.clientId.length === 0) return false;
+  if (!Array.isArray(client.redirectUris) || !client.redirectUris.every((u) => typeof u === "string")) return false;
+  if (typeof client.createdAt !== "string") return false;
+  if (client.clientName !== undefined && typeof client.clientName !== "string") return false;
+  if (client.clientSecretHash !== undefined && typeof client.clientSecretHash !== "string") return false;
+  if (
+    client.tokenEndpointAuthMethod !== undefined &&
+    client.tokenEndpointAuthMethod !== "none" &&
+    client.tokenEndpointAuthMethod !== "client_secret_post" &&
+    client.tokenEndpointAuthMethod !== "client_secret_basic"
+  ) {
+    return false;
+  }
+  if (client.trustedLocalClient !== undefined && typeof client.trustedLocalClient !== "boolean") return false;
+  return true;
+}
+
+function isValidTokenRecord(value: unknown): value is TokenRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const token = value as Partial<TokenRecord>;
+  return typeof token.hash === "string" && token.hash.length > 0 &&
+    (token.kind === "access" || token.kind === "refresh") &&
+    typeof token.clientId === "string" && token.clientId.length > 0 &&
+    typeof token.workspaceId === "string" &&
+    Array.isArray(token.scopes) && token.scopes.every((s) => typeof s === "string") &&
+    typeof token.issuedAt === "number" && Number.isFinite(token.issuedAt) &&
+    typeof token.expiresAt === "number" && Number.isFinite(token.expiresAt) &&
+    typeof token.revoked === "boolean";
+}
+
 export class AuthStore {
   private clients = new Map<string, ClientRegistration>();
   private tokens = new Map<string, TokenRecord>();
@@ -114,11 +155,57 @@ export class AuthStore {
   }
 
   private load(): void {
-    const data = readJsonIfExists<PersistedAuthState>(this.file);
-    if (!data) return;
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(this.file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw new AuthStoreCorruptError("Cannot inspect OAuth store file.");
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new AuthStoreCorruptError("OAuth store path must be a regular file.");
+    }
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.file, "utf8");
+    } catch {
+      throw new AuthStoreCorruptError("Cannot read OAuth store file.");
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      throw new AuthStoreCorruptError("OAuth store file contains invalid JSON.");
+    }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new AuthStoreCorruptError("OAuth store file must contain a JSON object.");
+    }
+    const record = parsed as { clients?: unknown; tokens?: unknown };
+    if (!Array.isArray(record.clients) || !Array.isArray(record.tokens)) {
+      throw new AuthStoreCorruptError("OAuth store file must contain clients and tokens arrays.");
+    }
+
+    const clients: ClientRegistration[] = [];
+    for (const client of record.clients) {
+      if (!isValidClientRegistration(client)) {
+        throw new AuthStoreCorruptError("OAuth store file contains an invalid client record.");
+      }
+      clients.push(client);
+    }
+    const tokens: TokenRecord[] = [];
+    for (const token of record.tokens) {
+      if (!isValidTokenRecord(token)) {
+        throw new AuthStoreCorruptError("OAuth store file contains an invalid token record.");
+      }
+      tokens.push(token);
+    }
+
     const now = Date.now();
-    for (const client of data.clients ?? []) this.clients.set(client.clientId, client);
-    for (const token of data.tokens ?? []) {
+    for (const client of clients) this.clients.set(client.clientId, client);
+    for (const token of tokens) {
       if (!token.revoked && token.expiresAt > now) this.tokens.set(token.hash, token);
     }
   }
@@ -132,7 +219,45 @@ export class AuthStore {
       clients: [...clientsMap.values()],
       tokens: [...tokensMap.values()].filter((t) => !t.revoked && t.expiresAt > now),
     };
-    writeSecureJson(this.file, state);
+    ensureDir(path.dirname(this.file));
+    const bytes = Buffer.from(JSON.stringify(state, null, 2), "utf8");
+    const expectedNewHash = createHash("sha256").update(bytes).digest("hex");
+    const tempFile = `${this.file}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    let published = false;
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(tempFile, "wx", 0o600);
+      try {
+        // Keep fs.writeFileSync(fd, bytes) so existing disk-failure tests spying on fs.writeFileSync continue to intercept writes.
+        fs.writeFileSync(fd, bytes);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+        fd = undefined;
+      }
+      try {
+        fs.chmodSync(tempFile, 0o600);
+      } catch {
+        // best effort on platforms without POSIX chmod semantics
+      }
+      atomicReplace(tempFile, this.file, { expectedNewHash });
+      published = true;
+    } finally {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // ignore
+        }
+      }
+      if (!published) {
+        try {
+          fs.unlinkSync(tempFile);
+        } catch {
+          // ignore if temp file was not created or already moved
+        }
+      }
+    }
   }
 
   // ---- Dynamic Client Registration -------------------------------------

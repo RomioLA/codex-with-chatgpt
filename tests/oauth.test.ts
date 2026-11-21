@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { createServer, type Server as NetServer } from "node:net";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
-import { AuthStore, DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
+import { AuthStore, AuthStoreCorruptError, DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
 
 let root: string;
@@ -1299,10 +1299,40 @@ describe("Gemini and confidential client compatibility", () => {
       // Original tokens remain intact in memory and can still be refreshed after disk recovers
       expect(store.tokenCount()).toBe(beforeCount);
       expect(store.verifyAccessToken(issued.accessToken).ok).toBe(true);
+      expect(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+      const diskBeforeRetry = fs.readFileSync(path.join(dir, "store.json"), "utf8");
       const retry = store.refresh(issued.refreshToken!, client.clientId);
       expect(retry.ok).toBe(true);
       if (!retry.ok) throw new Error(retry.reason);
       expect(retry.tokens.refreshToken).not.toBe(issued.refreshToken);
+      expect(fs.readFileSync(path.join(dir, "store.json"), "utf8")).not.toBe(diskBeforeRetry);
+      expect(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("fails closed with AuthStoreCorruptError instead of treating corrupt auth files as empty", () => {
+    const dir = makeTmpDir("auth-corrupt-fail-closed");
+    try {
+      const file = path.join(dir, "store.json");
+      const truncated = '{"clients":[{"clientId":"c1","redirectUris":["http://127.0.0.1/cb"],"createdAt":"2026-01-01T00:00:00Z"}],"tokens":[';
+      fs.writeFileSync(file, truncated, "utf8");
+      expect(() => new AuthStore("corrupt-ws", { file })).toThrow(AuthStoreCorruptError);
+      expect(fs.readFileSync(file, "utf8")).toBe(truncated);
+
+      fs.writeFileSync(file, "[]", "utf8");
+      expect(() => new AuthStore("corrupt-ws", { file })).toThrow(AuthStoreCorruptError);
+
+      fs.writeFileSync(file, JSON.stringify({ clients: [] }), "utf8");
+      expect(() => new AuthStore("corrupt-ws", { file })).toThrow(AuthStoreCorruptError);
+
+      fs.writeFileSync(file, JSON.stringify({ clients: [{ bad: true }], tokens: [] }), "utf8");
+      expect(() => new AuthStore("corrupt-ws", { file })).toThrow(AuthStoreCorruptError);
+
+      const dirAsFile = path.join(dir, "dir-store.json");
+      fs.mkdirSync(dirAsFile);
+      expect(() => new AuthStore("corrupt-ws", { file: dirAsFile })).toThrow(AuthStoreCorruptError);
     } finally {
       cleanup(dir);
     }

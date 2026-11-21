@@ -59,6 +59,12 @@ function recoveryEvidence(treeConfirmed: boolean, cleanupConfirmed: boolean): Ex
   return cleanupConfirmed ? "process_tree_and_temp_cleaned" : "process_tree_exited";
 }
 
+function withoutTempOwnershipPending<T extends ExecutionJob>(job: T): T {
+  if (job.tempOwnershipPending === undefined) return job;
+  const { tempOwnershipPending: _pending, ...rest } = job;
+  return rest as T;
+}
+
 interface StartExecutionInput {
   repositoryPath: string;
   kind: ExecutionKind;
@@ -920,6 +926,7 @@ export class ExecutionSupervisor {
       running = transitionExecutionJob({
         ...job,
         ...(currentBootId ? { bootId: currentBootId } : {}),
+        tempOwnershipPending: true,
       }, "running", { failureCode: null });
       this.store.replace(running);
     } catch (error) {
@@ -942,7 +949,7 @@ export class ExecutionSupervisor {
         ...(tempLease.bootId ? { bootId: tempLease.bootId } : {}),
       };
       this.store.replace({
-        ...running,
+        ...withoutTempOwnershipPending(running),
         tempOwnership,
       });
       const fullAccessGitAuthorization = isFullAccessGitAuthorization(job.authorization)
@@ -1048,13 +1055,16 @@ export class ExecutionSupervisor {
       const persisted = this.store.get(job.jobId) ?? running;
       let tempCleaned = true;
       if (tempLease) {
-        tempCleaned = !fs.existsSync(tempLease.directoryPath) ||
+        tempCleaned = this.tempOwner.isConfirmedAbsent(job.jobId) ||
           this.tempOwner.cleanup(job.jobId, tempLease, undefined, true);
       } else if (tempCreateAttempted) {
-        tempCleaned = !fs.existsSync(path.join(this.tempOwner.root, `tmp-${job.jobId}`));
+        tempCleaned = this.tempOwner.isConfirmedAbsent(job.jobId);
       }
       if (tempCleaned) {
-        const failed = transitionExecutionJob({ ...persisted, tempOwnership: null }, "failed", {
+        const failed = transitionExecutionJob({
+          ...withoutTempOwnershipPending(persisted),
+          tempOwnership: null,
+        }, "failed", {
           failureCode: cleanCode((error as Error).message === "EXECUTION_HELPER_UNAVAILABLE"
             ? "EXECUTION_HELPER_UNAVAILABLE"
             : (error as Error).message === "EXECUTABLE_UNAVAILABLE"
@@ -1070,7 +1080,13 @@ export class ExecutionSupervisor {
           createdAtMs: tempLease.createdAtMs,
           ...(tempLease.bootId ? { bootId: tempLease.bootId } : {}),
         } : null);
-        const interrupted = transitionExecutionJob({ ...persisted, tempOwnership: preservedOwnership }, "interrupted", {
+        const interruptedBase = preservedOwnership !== null
+          ? withoutTempOwnershipPending(persisted)
+          : { ...persisted, tempOwnershipPending: true };
+        const interrupted = transitionExecutionJob({
+          ...interruptedBase,
+          tempOwnership: preservedOwnership,
+        }, "interrupted", {
           failureCode: "HELPER_CLEANUP_UNCONFIRMED",
         });
         this.store.replace(interrupted);
@@ -1300,7 +1316,7 @@ export class ExecutionSupervisor {
         const crossBoot = crossBootByJobId.get(jobId) === true;
         if (!job || !ExecutionSupervisor.isRecoverableTempCandidate(job, crossBoot) || this.active.has(jobId)) continue;
         this.store.replace({
-          ...job,
+          ...withoutTempOwnershipPending(job),
           tempOwnership: null,
           recoveryEvidence: crossBoot ? "boot_boundary_and_temp_cleaned" : "process_tree_and_temp_cleaned",
         });
@@ -1317,10 +1333,17 @@ export class ExecutionSupervisor {
       if (job.tempOwnership === null && job.recoveryEvidence === undefined && crossBootByJobId.get(job.jobId) === true) {
         const current = this.store.get(job.jobId);
         if (current && current.state === "interrupted" && current.tempOwnership === null && current.recoveryEvidence === undefined) {
-          this.store.replace({
-            ...current,
-            recoveryEvidence: "boot_boundary_and_temp_cleaned",
-          });
+          if (this.tempOwner.isConfirmedAbsent(current.jobId)) {
+            this.store.replace({
+              ...withoutTempOwnershipPending(current),
+              recoveryEvidence: "boot_boundary_and_temp_cleaned",
+            });
+          } else {
+            this.logger.warn("Execution temp recovery preserved unconfirmed temp directory across boot boundary", {
+              workspaceId: this.workspace.id,
+              jobId: current.jobId,
+            });
+          }
         }
       }
     }

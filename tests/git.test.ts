@@ -754,3 +754,63 @@ describe("gitDiff UTF-8 pagination and async git operations", () => {
     await expectDeadline(() => runGitAsync(isolated, ["status", "--porcelain=v2"], { deadlineAt: performance.now() + 0.001 }));
   });
 });
+
+describe("controlled Git view repository layouts", () => {
+  it("supports unborn repositories without an index file yet", async () => {
+    const unborn = makeTmpDir("git-unborn");
+    git(unborn, "init", "-b", "main");
+    write(unborn, "draft.txt", "initial untracked\n");
+
+    const info = gitInfo(unborn);
+    const status = gitStatus(unborn);
+    const statusAsync = await gitStatusAsync(unborn);
+    const diff = gitDiff(unborn, { mode: "unstaged" });
+
+    expect(info).toEqual({ isRepo: true, branch: null, commit: null, dirty: true });
+    expect(status).toMatchObject({ isRepo: true, branch: "main", untracked: ["draft.txt"] });
+    expect(statusAsync).toMatchObject({ isRepo: true, branch: "main", untracked: ["draft.txt"] });
+    expect(diff).toMatchObject({ isRepo: true, diff: "" });
+  });
+
+  it("supports linked worktrees created via git worktree add", async () => {
+    const mainRepo = makeTmpDir("git-worktree-main");
+    makeGitRepo(mainRepo);
+    const linked = path.join(makeTmpDir("git-worktree-linked-parent"), "linked");
+    git(mainRepo, "worktree", "add", "-b", "feature/wt", linked);
+    write(linked, "hello.txt", "linked worktree change\n");
+    write(linked, "wt-new.txt", "untracked in worktree\n");
+
+    const info = gitInfo(linked);
+    const status = gitStatus(linked);
+    const statusAsync = await gitStatusAsync(linked);
+    const diff = gitDiff(linked, { mode: "unstaged" });
+    const diffAsync = await gitDiffAsync(linked, { mode: "unstaged" });
+
+    expect(info).toMatchObject({ isRepo: true, branch: "feature/wt", dirty: true });
+    expect(status).toMatchObject({ isRepo: true, branch: "feature/wt" });
+    expect(status.unstaged.map((entry) => entry.path)).toContain("hello.txt");
+    expect(status.untracked).toContain("wt-new.txt");
+    expect(statusAsync.unstaged.map((entry) => entry.path)).toContain("hello.txt");
+    expect(diff.isRepo).toBe(true);
+    expect(diff.diff).toContain("linked worktree change");
+    expect(diffAsync.diff).toBe(diff.diff);
+  });
+
+  it("preserves upstream tracking and ahead/behind counts in gitStatus", async () => {
+    const local = makeTmpDir("git-upstream-local");
+    makeGitRepo(local);
+    const baseHead = git(local, "rev-parse", "HEAD").trim();
+    git(local, "remote", "add", "origin", "https://example.invalid/origin.git");
+    git(local, "update-ref", "refs/remotes/origin/main", baseHead);
+    git(local, "config", "branch.main.remote", "origin");
+    git(local, "config", "branch.main.merge", "refs/heads/main");
+    write(local, "ahead.txt", "ahead commit\n");
+    git(local, "add", "ahead.txt");
+    git(local, "commit", "-m", "ahead");
+
+    const status = gitStatus(local);
+    const statusAsync = await gitStatusAsync(local);
+    expect(status).toMatchObject({ isRepo: true, branch: "main", upstream: "origin/main", ahead: 1, behind: 0 });
+    expect(statusAsync).toMatchObject({ isRepo: true, branch: "main", upstream: "origin/main", ahead: 1, behind: 0 });
+  });
+});

@@ -259,6 +259,24 @@ export class ExecutionTempOwner {
     return `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
   }
 
+  isConfirmedAbsent(jobId: string): boolean {
+    if (!JOB_ID_PATTERN.test(jobId)) return false;
+    try {
+      this.ensureRoot();
+      for (const target of [path.join(this.root, `tmp-${jobId}`), this.jobAuthorityPath(jobId)]) {
+        try {
+          fs.lstatSync(target);
+          return false;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   cleanup(
     jobId: string,
     ownership: ExecutionTempOwnership,

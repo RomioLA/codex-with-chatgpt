@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ExecutionJobStore, MAX_OUTPUT_BYTES_PER_STREAM } from "../src/execution/job-store.js";
 import { ExecutionTempOwner } from "../src/execution/execution-temp.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supervisor.js";
@@ -9,6 +9,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import {
   archivedIdempotencyKey,
   archiveRecord,
+  jobCanBeArchived,
   jobCanBeStoredInArchive,
   DEFAULT_ARCHIVE_RECORD_OPERATIONS,
   readArchivedRecord,
@@ -1066,5 +1067,132 @@ describe("ExecutionJobStore", () => {
           recoveryEvidence: "boot_boundary_and_temp_cleaned",
         },
       });
+  });
+
+  it("stages archive writes in .archive/.staging and ignores only matching legacy shard temp files", () => {
+    const directory = makeTmpDir("execution-archive-staging");
+    const job = makeJob("archive-staging-workspace", "succeeded");
+    job.startedAt = job.createdAt;
+    job.finishedAt = job.createdAt;
+    job.exitCode = 0;
+
+    let capturedSource = "";
+    const customOperations: ArchiveRecordOperations = {
+      writeTemp: DEFAULT_ARCHIVE_RECORD_OPERATIONS.writeTemp,
+      flushTemp: DEFAULT_ARCHIVE_RECORD_OPERATIONS.flushTemp,
+      publish(source, destination) {
+        capturedSource = source;
+        fs.renameSync(source, destination);
+      },
+    };
+    archiveRecord(directory, "jobs", job.jobId, job, customOperations);
+
+    const stagingDir = path.join(path.resolve(directory), ".archive", ".staging");
+    expect(path.dirname(capturedSource)).toBe(stagingDir);
+    expect(path.basename(capturedSource)).toMatch(new RegExp(`^jobs-${job.jobId}\\.\\d+\\.[a-f0-9]{16}\\.tmp$`));
+    expect(fs.readdirSync(stagingDir)).toEqual([]);
+
+    const shardDir = path.join(directory, ".archive", "jobs", job.jobId.slice(0, 2));
+    const orphanLegacyTemp = path.join(shardDir, `${job.jobId}.json.4321.0123456789abcdef.tmp`);
+    fs.writeFileSync(orphanLegacyTemp, "partial", { mode: 0o600 });
+
+    const visited: string[] = [];
+    expect(scanArchivedJobRecords(directory, (id) => visited.push(id))).toMatchObject({
+      kind: "complete",
+      records: 1,
+    });
+    expect(visited).toEqual([job.jobId]);
+
+    // Non-matching or invalid temp files still fail closed.
+    const invalidTemp = path.join(shardDir, "unexpected.tmp");
+    fs.writeFileSync(invalidTemp, "partial", { mode: 0o600 });
+    expect(scanArchivedJobRecords(directory, () => undefined)).toMatchObject({
+      kind: "incomplete",
+      reason: "ARCHIVE_ENTRY_INVALID",
+    });
+    fs.unlinkSync(invalidTemp);
+
+    const wrongShardTemp = path.join(shardDir, `${"z".repeat(24)}.json.4321.0123456789abcdef.tmp`);
+    if (!job.jobId.startsWith("zz")) {
+      fs.writeFileSync(wrongShardTemp, "partial", { mode: 0o600 });
+      expect(scanArchivedJobRecords(directory, () => undefined)).toMatchObject({
+        kind: "incomplete",
+        reason: "ARCHIVE_ENTRY_INVALID",
+      });
+      fs.unlinkSync(wrongShardTemp);
+    }
+
+    // Unsafe .staging path (regular file instead of directory) is rejected.
+    const unsafeDir = makeTmpDir("execution-archive-unsafe-staging");
+    fs.mkdirSync(path.join(unsafeDir, ".archive"), { mode: 0o700 });
+    fs.writeFileSync(path.join(unsafeDir, ".archive", ".staging"), "not-a-dir");
+    expect(() => archiveRecord(unsafeDir, "jobs", job.jobId, job, customOperations)).toThrow("ARCHIVE_INVALID_PATH");
+  });
+
+  it("blocks archiving and rejects recovery evidence when tempOwnershipPending is true", () => {
+    const directory = makeTmpDir("execution-pending-temp-ownership");
+    const workspaceId = "pending-temp-ownership";
+
+    const succeededPending = makeJob(workspaceId, "succeeded");
+    succeededPending.startedAt = succeededPending.createdAt;
+    succeededPending.finishedAt = succeededPending.createdAt;
+    succeededPending.exitCode = 0;
+    succeededPending.tempOwnershipPending = true;
+    expect(jobCanBeArchived(succeededPending)).toBe(false);
+    expect(jobCanBeStoredInArchive(succeededPending)).toBe(false);
+
+    const interruptedPending = makeJob(workspaceId, "interrupted");
+    interruptedPending.startedAt = null;
+    interruptedPending.finishedAt = interruptedPending.createdAt;
+    interruptedPending.failureCode = "BRIDGE_RESTARTED";
+    interruptedPending.tempOwnershipPending = true;
+    expect(jobCanBeStoredInArchive(interruptedPending)).toBe(false);
+
+    fs.writeFileSync(path.join(directory, "jobs.json"), JSON.stringify({
+      version: 1,
+      workspaceId,
+      jobs: [{
+        ...interruptedPending,
+        startedAt: interruptedPending.createdAt,
+        recoveryEvidence: "boot_boundary_and_temp_cleaned",
+      }],
+    }), { mode: 0o600 });
+    const corruptStore = new ExecutionJobStore(workspaceId, { directory });
+    expect(corruptStore.corruption).toEqual({ code: "STORE_CORRUPT", reason: "invalid_record" });
+  });
+
+  it("confirms temp absence only when both temp directory and authority file return ENOENT", () => {
+    const directory = makeTmpDir("execution-temp-confirmed-absent");
+    const workspaceId = "temp-confirmed-absent";
+    const owner = new ExecutionTempOwner(directory, workspaceId);
+    const jobId = randomBytes(24).toString("base64url");
+
+    expect(owner.isConfirmedAbsent("invalid-id")).toBe(false);
+    expect(owner.isConfirmedAbsent(jobId)).toBe(true);
+
+    const tempDir = path.join(owner.root, `tmp-${jobId}`);
+    fs.mkdirSync(tempDir);
+    expect(owner.isConfirmedAbsent(jobId)).toBe(false);
+    fs.rmdirSync(tempDir);
+    expect(owner.isConfirmedAbsent(jobId)).toBe(true);
+
+    const authority = path.join(fs.realpathSync.native(directory), `.c2c-execution-temp-job-${jobId}`);
+    fs.writeFileSync(authority, "authority");
+    expect(owner.isConfirmedAbsent(jobId)).toBe(false);
+    fs.unlinkSync(authority);
+    expect(owner.isConfirmedAbsent(jobId)).toBe(true);
+
+    const originalLstat = fs.lstatSync.bind(fs);
+    const lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation((targetPath, ...args) => {
+      if (String(targetPath).includes(jobId)) {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      }
+      return originalLstat(targetPath, ...(args as []));
+    });
+    try {
+      expect(owner.isConfirmedAbsent(jobId)).toBe(false);
+    } finally {
+      lstatSpy.mockRestore();
+    }
   });
 });

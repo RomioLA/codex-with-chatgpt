@@ -57,6 +57,26 @@ function requireSafeDirectory(directory: string): void {
   }
 }
 
+function ensureSafeArchiveStagingDir(root: string): string {
+  const resolvedRoot = path.resolve(root);
+  requireSafeDirectory(resolvedRoot);
+  const archiveRoot = path.join(resolvedRoot, ".archive");
+  try {
+    fs.mkdirSync(archiveRoot, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  requireSafeDirectory(archiveRoot);
+  const stagingDir = path.join(archiveRoot, ".staging");
+  try {
+    fs.mkdirSync(stagingDir, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  requireSafeDirectory(stagingDir);
+  return stagingDir;
+}
+
 function scanErrorReason(error: unknown): string {
   const code = (error as NodeJS.ErrnoException | null)?.code;
   if (code === "ENOENT") return "ARCHIVE_DIRECTORY_MISSING";
@@ -116,7 +136,21 @@ export function scanArchivedJobRecords<T>(
             if (expired()) return incomplete("ARCHIVE_SCAN_DEADLINE");
             const entry = entries.readSync();
             if (entry === null) break;
-            if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith(".json")) {
+            if (!entry.isFile() || entry.isSymbolicLink()) {
+              return incomplete("ARCHIVE_ENTRY_INVALID");
+            }
+            const legacyTempMatch = /^([A-Za-z0-9_-]{24,64})\.json\.[1-9]\d*\.[a-f0-9]{16}\.tmp$/.exec(entry.name);
+            if (legacyTempMatch) {
+              if (!legacyTempMatch[1]!.startsWith(shard.name)) {
+                return incomplete("ARCHIVE_ENTRY_INVALID");
+              }
+              const tempStat = fs.lstatSync(path.join(shardPath, entry.name));
+              if (!tempStat.isFile() || tempStat.isSymbolicLink()) {
+                return incomplete("ARCHIVE_ENTRY_INVALID");
+              }
+              continue;
+            }
+            if (!entry.name.endsWith(".json")) {
               return incomplete("ARCHIVE_ENTRY_INVALID");
             }
             const jobId = entry.name.slice(0, -5);
@@ -189,7 +223,8 @@ export function archiveRecord(
   const serialized = Buffer.from(bytes, "utf8");
   if (serialized.byteLength > MAX_ARCHIVE_BYTES) throw new Error("ARCHIVE_TOO_LARGE");
   const destination = archivePath(root, kind, key, true);
-  const temporary = `${destination}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  const stagingDir = ensureSafeArchiveStagingDir(root);
+  const temporary = path.join(stagingDir, `${kind}-${key}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
   const expectedHash = hash(bytes);
   let fd: number | undefined;
   let published = false;
@@ -212,7 +247,7 @@ export function archiveRecord(
 }
 
 export function jobCanBeArchived(job: ExecutionJob): boolean {
-  if (!job.finishedAt || job.tempOwnership !== null || job.state === "interrupted") return false;
+  if (!job.finishedAt || job.tempOwnership !== null || job.tempOwnershipPending === true || job.state === "interrupted") return false;
   if (
     !["succeeded", "cancelled", "timed_out"].includes(job.state) &&
     !(job.state === "failed" && (
@@ -232,6 +267,7 @@ export function jobCanBeArchived(job: ExecutionJob): boolean {
 
 /** JobStore may move only explicitly recovered interrupted jobs into history. */
 export function jobCanBeStoredInArchive(job: ExecutionJob): boolean {
+  if (job.tempOwnershipPending === true) return false;
   if (job.state !== "interrupted") return jobCanBeArchived(job);
   if (!job.finishedAt || job.tempOwnership !== null || !gitOutcomeCanBeArchived(job)) return false;
   if (job.failureCode === "BRIDGE_RESTARTED" && job.startedAt === null) return true;

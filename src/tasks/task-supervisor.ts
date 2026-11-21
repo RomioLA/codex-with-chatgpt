@@ -442,7 +442,7 @@ export class TaskSupervisor {
             return;
           }
           if (lookup.kind === "found") {
-            task = bindTaskExecutionChild(task, currentStep.stepId, lookup.job.jobId, this.isoNow());
+            task = bindTaskExecutionChild(task, currentStep.stepId, lookup.job.jobId, this.isoNow(task.updatedAt));
             this.store.replace(task);
             if (lookup.job.state === "interrupted") {
               this.waitForModel(task, "CHILD_OUTCOME_UNKNOWN");
@@ -460,7 +460,7 @@ export class TaskSupervisor {
             this.waitForModel(task, "CHILD_NOT_FOUND");
             return;
           }
-          task = transitionTask(task, "CANCELLING", {}, this.isoNow());
+          task = transitionTask(task, "CANCELLING", {}, this.isoNow(task.updatedAt));
           this.store.replace(task);
           return;
         }
@@ -497,7 +497,7 @@ export class TaskSupervisor {
         return;
       }
       if (lookup.kind === "trusted_absent") return;
-      task = bindTaskExecutionChild(task, step.stepId, lookup.job.jobId, this.isoNow());
+      task = bindTaskExecutionChild(task, step.stepId, lookup.job.jobId, this.isoNow(task.updatedAt));
       this.store.replace(task);
       if (lookup.job.state === "interrupted") {
         this.waitForModel(task, "CHILD_OUTCOME_UNKNOWN");
@@ -509,7 +509,7 @@ export class TaskSupervisor {
           exitCode: lookup.job.exitCode,
           failureCode: lookup.job.failureCode,
           finishedAt: lookup.job.finishedAt,
-        }, this.isoNow());
+        }, this.isoNow(task.updatedAt));
         this.store.replace(observed);
         this.checkpointObservedChild(observed, step.stepId, getTaskDispatchJournalEntry(observed, step.stepId)!);
       }
@@ -531,7 +531,7 @@ export class TaskSupervisor {
           exitCode: child.exitCode,
           failureCode: child.failureCode,
           finishedAt: child.finishedAt,
-        }, this.isoNow());
+        }, this.isoNow(task.updatedAt));
         this.store.replace(observed);
         this.checkpointObservedChild(observed, step.stepId, getTaskDispatchJournalEntry(observed, step.stepId)!);
       }
@@ -565,7 +565,7 @@ export class TaskSupervisor {
       stepStates,
       failureReason: null,
       waitingReason: reason.slice(0, FAILURE_REASON_MAX_LENGTH),
-    }, this.isoNow());
+    }, this.isoNow(task.updatedAt));
     this.store.replace(next);
     return next;
   }
@@ -577,7 +577,7 @@ export class TaskSupervisor {
       const failed = transitionTask(task, "FAILED", {
         failureReason: "AUTHORIZATION_REVOKED",
         waitingReason: null,
-      }, this.isoNow());
+      }, this.isoNow(task.updatedAt));
       this.store.replace(failed);
       return failed;
     }
@@ -617,11 +617,11 @@ export class TaskSupervisor {
 
     if (task.state === "QUEUED") {
       if (task.plan.steps.length === 0) {
-        task = transitionTask(task, "COMPLETED", { currentStep: null }, this.isoNow());
+        task = transitionTask(task, "COMPLETED", { currentStep: null }, this.isoNow(task.updatedAt));
         this.store.replace(task);
         return task;
       }
-      task = transitionTask(task, "RUNNING", { currentStep: 0 }, this.isoNow());
+      task = transitionTask(task, "RUNNING", { currentStep: 0 }, this.isoNow(task.updatedAt));
       this.store.replace(task);
     }
 
@@ -635,14 +635,14 @@ export class TaskSupervisor {
         throw taskFailure("TASK_NOT_RUNNABLE", "Task current step is invalid");
       }
       if (task.currentStep === task.plan.steps.length) {
-        task = transitionTask(task, "COMPLETED", { currentStep: null }, this.isoNow());
+        task = transitionTask(task, "COMPLETED", { currentStep: null }, this.isoNow(task.updatedAt));
         this.store.replace(task);
         return task;
       }
 
       const step = task.plan.steps[task.currentStep];
       if (!step) throw taskFailure("TASK_NOT_RUNNABLE", "Task current step is missing");
-      if (Date.parse(this.isoNow()) >= Date.parse(task.deadlineAt)) {
+      if (this.now() >= Date.parse(task.deadlineAt)) {
         task = this.failRunningTask(task, step.stepId, "TASK_DEADLINE_EXCEEDED");
         return task;
       }
@@ -689,7 +689,7 @@ export class TaskSupervisor {
       stepStates: task.stepStates.map((item) => item.stepId === step.stepId
         ? { ...item, state: "running" as const, attemptCount }
         : item),
-      updatedAt: this.isoNow(),
+      updatedAt: this.isoNow(task.updatedAt),
     };
     this.store.replace(task);
 
@@ -725,7 +725,7 @@ export class TaskSupervisor {
         stepStates: latest.stepStates.map((item) => item.stepId === step.stepId
           ? { ...item, state: "running" as const, attemptCount }
           : item),
-        updatedAt: this.isoNow(),
+        updatedAt: this.isoNow(latest.updatedAt),
       };
       this.store.replace(latest);
       try {
@@ -762,7 +762,7 @@ export class TaskSupervisor {
     cancelled: boolean,
   ): PersistentTask {
 
-    const at = this.isoNow();
+    const at = this.isoNow(task.updatedAt);
     let canonical: Omit<TaskStepCheckpoint, "stepId" | "completedAt">;
     try {
       canonical = sanitizedCheckpoint(result);
@@ -779,7 +779,7 @@ export class TaskSupervisor {
       persistCheckpoint = checkpointBytes(task) + canonical.resultBytes <= MAX_TASK_RESULTS_BYTES;
     }
     const index = task.plan.steps.findIndex((item) => item.stepId === stepId);
-    const completedAtDeadline = Date.parse(at) >= Date.parse(task.deadlineAt);
+    const completedAtDeadline = this.now() >= Date.parse(task.deadlineAt);
     const stepSucceeded = success && persistCheckpoint;
     const nextStep = stepSucceeded ? index + 1 : index;
     const checkpoint: TaskStepCheckpoint = { stepId, completedAt: at, ...canonical };
@@ -871,7 +871,7 @@ export class TaskSupervisor {
         const currentEntry = getTaskDispatchJournalEntry(latest, step.stepId);
         let bound = latest;
         if (currentEntry?.phase === "PREPARED") {
-          bound = bindTaskExecutionChild(latest, step.stepId, lookup.job.jobId, this.isoNow());
+          bound = bindTaskExecutionChild(latest, step.stepId, lookup.job.jobId, this.isoNow(latest.updatedAt));
           this.store.replace(bound);
         } else if (currentEntry?.childJobId !== lookup.job.jobId) {
           return this.waitForModel(latest, "CONFLICTING_CHILD_RECORDS");
@@ -896,7 +896,7 @@ export class TaskSupervisor {
       return this.failRunningTask(task, step.stepId, error instanceof TaskSupervisorError ? error.code : "FULL_ACCESS_REQUIRED");
     }
     if (!prior) {
-      const prepared = prepareTaskExecutionDispatch(task, step.stepId, 1, this.isoNow());
+      const prepared = prepareTaskExecutionDispatch(task, step.stepId, 1, this.isoNow(task.updatedAt));
       this.store.replace(prepared.task);
       task = prepared.task;
       prior = prepared.entry;
@@ -932,7 +932,7 @@ export class TaskSupervisor {
     const latestEntry = getTaskDispatchJournalEntry(latest, step.stepId);
     let bound = latest;
     if (latestEntry?.phase === "PREPARED") {
-      bound = bindTaskExecutionChild(latest, step.stepId, started.job.jobId, this.isoNow());
+      bound = bindTaskExecutionChild(latest, step.stepId, started.job.jobId, this.isoNow(latest.updatedAt));
       this.store.replace(bound);
     } else if (latestEntry?.childJobId !== started.job.jobId) {
       return this.waitForModel(latest, "DISPATCH_JOURNAL_CONFLICT");
@@ -998,7 +998,7 @@ export class TaskSupervisor {
     if (!task) throw taskFailure("TASK_NOT_FOUND_OR_NOT_OWNED", "Task was not found or is not owned by this client");
     if (isTerminalTaskState(task.state)) return task;
     if (task.state !== "CANCELLING") {
-      task = transitionTask(task, "CANCELLING", {}, this.isoNow());
+      task = transitionTask(task, "CANCELLING", {}, this.isoNow(task.updatedAt));
       this.store.replace(task);
     }
 
@@ -1018,7 +1018,7 @@ export class TaskSupervisor {
           if (lookup.kind === "found") {
             const currentJournal = getTaskDispatchJournalEntry(task, step.stepId);
             if (currentJournal?.phase === "PREPARED") {
-              task = bindTaskExecutionChild(task, step.stepId, lookup.job.jobId, this.isoNow());
+              task = bindTaskExecutionChild(task, step.stepId, lookup.job.jobId, this.isoNow(task.updatedAt));
               this.store.replace(task);
             } else if (currentJournal?.childJobId !== lookup.job.jobId) {
               return this.interruptUnknownDispatch(task, step.stepId, "CONFLICTING_CHILD_RECORDS");
@@ -1050,7 +1050,7 @@ export class TaskSupervisor {
     const stepStates = stepId && stepState && (stepState.state === "pending" || stepState.state === "running")
       ? changedStepState(task, stepId, "failed")
       : task.stepStates;
-    const next = transitionTask(task, "CANCELLED", { stepStates }, this.isoNow());
+    const next = transitionTask(task, "CANCELLED", { stepStates }, this.isoNow(task.updatedAt));
     this.store.replace(next);
     return next;
   }
@@ -1060,7 +1060,7 @@ export class TaskSupervisor {
     if (!latest) return this.interruptUnknownDispatch(task, entry.stepId, "TASK_MISSING_DURING_REVOCATION");
     task = latest;
     if (task.state === "RUNNING" || task.state === "QUEUED") {
-      task = transitionTask(task, "CANCELLING", {}, this.isoNow());
+      task = transitionTask(task, "CANCELLING", {}, this.isoNow(task.updatedAt));
       this.store.replace(task);
     }
     return this.cancelBoundChild(task, entry);
@@ -1088,7 +1088,7 @@ export class TaskSupervisor {
             exitCode: job.exitCode,
             failureCode: job.failureCode,
             finishedAt: job.finishedAt,
-          }, this.isoNow());
+          }, this.isoNow(task.updatedAt));
           this.store.replace(observed);
           task = observed;
         }
@@ -1160,7 +1160,7 @@ export class TaskSupervisor {
       if (isTerminalTaskState(task.state)) return task;
       if (task.state === "CANCELLING") taskCancelRequested = true;
       if (task.state === "RUNNING" && !this.authorizationIsCurrent(task)) {
-        task = transitionTask(task, "CANCELLING", {}, this.isoNow());
+        task = transitionTask(task, "CANCELLING", {}, this.isoNow(task.updatedAt));
         this.store.replace(task);
         taskCancelRequested = true;
       }
@@ -1180,7 +1180,7 @@ export class TaskSupervisor {
           exitCode: job.exitCode,
           failureCode: job.failureCode,
           finishedAt: job.finishedAt,
-        }, this.isoNow());
+        }, this.isoNow(task.updatedAt));
         this.store.replace(observed);
         const journal = getTaskDispatchJournalEntry(observed, stepId);
         if (!journal) throw taskFailure("TASK_NOT_RUNNABLE", "Observed child journal disappeared");
@@ -1242,15 +1242,15 @@ export class TaskSupervisor {
         stepStates: changedStepState(task, stepId, "failed"),
       };
       const stopped = task.state === "CANCELLING"
-        ? transitionTask(task, "CANCELLED", patch, this.isoNow())
+        ? transitionTask(task, "CANCELLED", patch, this.isoNow(task.updatedAt))
         : task.state === "RUNNING"
-          ? transitionTask(task, "FAILED", { ...patch, failureReason: "TASK_RESULT_TOO_LARGE", waitingReason: null }, this.isoNow())
+          ? transitionTask(task, "FAILED", { ...patch, failureReason: "TASK_RESULT_TOO_LARGE", waitingReason: null }, this.isoNow(task.updatedAt))
           : task;
       this.store.replace(stopped);
       return stopped;
     }
     const cancellationPending = task.state === "CANCELLING";
-    let next = checkpointTaskExecution(task, stepId, result, this.isoNow(), outcome.state === "succeeded");
+    let next = checkpointTaskExecution(task, stepId, result, this.isoNow(task.updatedAt), outcome.state === "succeeded");
     if (!success && outcome.state === "succeeded") {
       next = {
         ...next,
@@ -1258,21 +1258,21 @@ export class TaskSupervisor {
       };
     }
     if (cancellationPending) {
-      next = transitionTask(next, "CANCELLED", { currentStep: next.currentStep }, this.isoNow());
+      next = transitionTask(next, "CANCELLED", { currentStep: next.currentStep }, this.isoNow(next.updatedAt));
     } else if (!success && next.state === "RUNNING") {
       next = transitionTask(next, "FAILED", {
         failureReason: deadlineExceeded ? "TASK_DEADLINE_EXCEEDED" : outcome.failureCode ?? `CHILD_${outcome.state.toUpperCase()}`,
         waitingReason: null,
-      }, this.isoNow());
+      }, this.isoNow(next.updatedAt));
     } else if (success && next.state === "RUNNING" && (next.currentStep === task.plan.steps.length || next.currentStep === null)) {
-      next = transitionTask(next, "COMPLETED", { currentStep: null }, this.isoNow());
+      next = transitionTask(next, "COMPLETED", { currentStep: null }, this.isoNow(next.updatedAt));
     }
     this.store.replace(next);
     return next;
   }
 
   private interruptUnknownDispatch(task: PersistentTask, stepId: string, reason = "DISPATCH_OUTCOME_UNKNOWN"): PersistentTask {
-    const at = this.isoNow();
+    const at = this.isoNow(task.updatedAt);
     const index = task.plan.steps.findIndex((step) => step.stepId === stepId);
     let next: PersistentTask;
     if (task.state === "CANCELLING") {
@@ -1297,7 +1297,7 @@ export class TaskSupervisor {
   }
 
   private failRunningTask(task: PersistentTask, stepId: string, reason: string): PersistentTask {
-    const at = this.isoNow();
+    const at = this.isoNow(task.updatedAt);
     const index = task.plan.steps.findIndex((step) => step.stepId === stepId);
     const stepState = task.stepStates.find((item) => item.stepId === stepId)?.state;
     const states = stepState === "running" ? changedStepState(task, stepId, "failed") : task.stepStates;
@@ -1311,7 +1311,14 @@ export class TaskSupervisor {
     return next;
   }
 
-  private isoNow(): string {
-    return new Date(this.now()).toISOString();
+  private isoNow(notBefore?: string): string {
+    const raw = this.now();
+    if (notBefore !== undefined) {
+      const floor = Date.parse(notBefore);
+      if (Number.isFinite(floor) && raw < floor) {
+        return new Date(floor).toISOString();
+      }
+    }
+    return new Date(raw).toISOString();
   }
 }

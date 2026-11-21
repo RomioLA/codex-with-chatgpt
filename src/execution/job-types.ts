@@ -100,6 +100,8 @@ interface ExecutionJobBase {
   timeoutSeconds: number;
   idempotencyKeyHash: string;
   tempOwnership: ExecutionTempOwnership | null;
+  /** True while execution-temp creation or cleanup confirmation is still pending. */
+  tempOwnershipPending?: boolean;
   /** Persisted only for interrupted jobs whose native process-tree result is verified. */
   recoveryEvidence?: ExecutionRecoveryEvidence;
   bootId?: string;

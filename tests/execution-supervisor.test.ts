@@ -8,6 +8,8 @@ import { resolveRepositoryIdentity } from "../src/execution/repository-identity.
 import { acquireRepositoryWriteLock } from "../src/execution/repository-write-lock.js";
 import * as fullAccessCommand from "../src/execution/full-access-command.js";
 import { ExecutionJobStore } from "../src/execution/job-store.js";
+import { ExecutionTempOwner } from "../src/execution/execution-temp.js";
+import { jobCanBeStoredInArchive } from "../src/execution/record-archive.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../src/execution/supervisor.js";
 import type { ExecutionJob, OutputStream } from "../src/execution/job-types.js";
 import type { NativeRunnerCompletion, NativeRunnerHandle } from "../src/execution/native-runner.js";
@@ -844,5 +846,114 @@ describe("ExecutionSupervisor", () => {
     await new Promise((resolve) => setTimeout(resolve, 2200));
     runner.finish(started.job.jobId, 1);
     await waitForState(started.job.jobId, "timed_out");
+  });
+
+  it("omits tempOwnershipPending once lease is created and marks interrupted if temp dir remains after create failure", async () => {
+    approveTestRecipe();
+    const okStarted = supervisor.start(startInput({ idempotencyKey: "temp-pending-cleared-0001" }));
+    expect(okStarted.ok).toBe(true);
+    if (!okStarted.ok) throw new Error(okStarted.error);
+    const okRunning = await waitForState(okStarted.job.jobId, "running");
+    expect(okRunning.tempOwnership).not.toBeNull();
+    expect("tempOwnershipPending" in okRunning).toBe(false);
+    runner.finish(okStarted.job.jobId, 0);
+    const okSucceeded = await waitForState(okStarted.job.jobId, "succeeded");
+    expect("tempOwnershipPending" in okSucceeded).toBe(false);
+
+    // Case 1: tempOwner.create fails leaving tmp-<jobId> on disk -> interrupted with tempOwnershipPending: true
+    const createSpy = vi.spyOn(ExecutionTempOwner.prototype, "create").mockImplementationOnce(function (this: ExecutionTempOwner, jobId: string) {
+      fs.mkdirSync(path.join(this.root, `tmp-${jobId}`), { mode: 0o700 });
+      throw new Error("INJECTED_TEMP_CREATE_FAILURE_WITH_LEFTOVER");
+    });
+    const leftoverStarted = supervisor.start(startInput({ idempotencyKey: "temp-create-leftover-0001" }));
+    expect(leftoverStarted.ok).toBe(true);
+    if (!leftoverStarted.ok) throw new Error(leftoverStarted.error);
+    const leftoverInterrupted = await waitForState(leftoverStarted.job.jobId, "interrupted");
+    createSpy.mockRestore();
+    expect(leftoverInterrupted.failureCode).toBe("HELPER_CLEANUP_UNCONFIRMED");
+    expect(leftoverInterrupted.tempOwnership).toBeNull();
+    expect(leftoverInterrupted.tempOwnershipPending).toBe(true);
+    expect(leftoverInterrupted.recoveryEvidence).toBeUndefined();
+    expect(jobCanBeStoredInArchive(leftoverInterrupted)).toBe(false);
+
+    // Case 2: tempOwner.create fails with no directory/authority left -> failed without tempOwnershipPending
+    const cleanCreateSpy = vi.spyOn(ExecutionTempOwner.prototype, "create").mockImplementationOnce(() => {
+      throw new Error("INJECTED_TEMP_CREATE_FAILURE_CLEAN");
+    });
+    const cleanStarted = supervisor.start(startInput({ idempotencyKey: "temp-create-clean-0001" }));
+    expect(cleanStarted.ok).toBe(true);
+    if (!cleanStarted.ok) throw new Error(cleanStarted.error);
+    const cleanFailed = await waitForState(cleanStarted.job.jobId, "failed");
+    cleanCreateSpy.mockRestore();
+    expect(cleanFailed.failureCode).toBe("HELPER_START_FAILED");
+    expect(cleanFailed.tempOwnership).toBeNull();
+    expect("tempOwnershipPending" in cleanFailed).toBe(false);
+  });
+
+  it("verifies disk absence across boot boundary before setting boot_boundary_and_temp_cleaned for null tempOwnership", async () => {
+    const oldBootId = "11111111-1111-4111-8111-111111111111";
+    const newBootId = "22222222-2222-4222-8222-222222222222";
+    const storeDir = makeTmpDir("execution-cross-boot-null-ownership");
+    const store = new ExecutionJobStore(workspace.id, { directory: storeDir });
+
+    const jobIdWithLeftover = "a".repeat(24);
+    const jobIdClean = "b".repeat(24);
+    const oldAt = new Date(Date.now() - 60_000).toISOString();
+    const baseJob = (jobId: string, idempotencyKeyHash: string): ExecutionJob => ({
+      jobId,
+      workspaceId: workspace.id,
+      executionContext: "repository",
+      repositoryIdentity: "a".repeat(64),
+      repositoryPath: ".",
+      oauthClientId: "execution-test-client",
+      recipe: { kind: "test", target: "test", packageManager: "npm", scriptHash: "b".repeat(64) },
+      state: "interrupted",
+      createdAt: oldAt,
+      startedAt: oldAt,
+      finishedAt: oldAt,
+      timeoutSeconds: 30,
+      idempotencyKeyHash,
+      tempOwnership: null,
+      tempOwnershipPending: true,
+      bootId: oldBootId,
+      exitCode: null,
+      failureCode: "BRIDGE_RESTARTED",
+      stdout: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+      stderr: { totalBytes: 0, retainedBytes: 0, oldestAvailableOffset: 0, truncated: false, restrictedReason: null },
+    });
+    store.create(baseJob(jobIdWithLeftover, "1".repeat(64)));
+    store.create(baseJob(jobIdClean, "2".repeat(64)));
+
+    // Create leftover tmp directory on disk for jobIdWithLeftover.
+    const tempOwner = new ExecutionTempOwner(storeDir, workspace.id);
+    const leftoverDir = path.join(tempOwner.root, `tmp-${jobIdWithLeftover}`);
+    fs.mkdirSync(leftoverDir, { mode: 0o700 });
+
+    const warnings: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+    const recoveredSupervisor = new ExecutionSupervisor(workspace, {
+      store,
+      runner,
+      currentBootId: newBootId,
+      permissionPollMs: 60_000,
+      logger: {
+        info: () => undefined,
+        warn: (message, fields) => warnings.push({ message, fields }),
+        error: () => undefined,
+      },
+    });
+    try {
+      const leftoverAfter = recoveredSupervisor.store.get(jobIdWithLeftover)!;
+      expect(leftoverAfter.recoveryEvidence).toBeUndefined();
+      expect(leftoverAfter.tempOwnershipPending).toBe(true);
+      expect(jobCanBeStoredInArchive(leftoverAfter)).toBe(false);
+      expect(warnings.some((w) => w.fields?.jobId === jobIdWithLeftover)).toBe(true);
+
+      const cleanAfter = recoveredSupervisor.store.get(jobIdClean)!;
+      expect(cleanAfter.recoveryEvidence).toBe("boot_boundary_and_temp_cleaned");
+      expect("tempOwnershipPending" in cleanAfter).toBe(false);
+      expect(jobCanBeStoredInArchive(cleanAfter)).toBe(true);
+    } finally {
+      await recoveredSupervisor.shutdown();
+    }
   });
 });

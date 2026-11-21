@@ -18,6 +18,7 @@ import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { probeBridge, writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 import { acquireBridgeInstanceLock, type BridgeInstanceLock } from "./instance-lock.js";
+import { readOwnWindowsProcessStartTime } from "../process/bridge-process-identity.js";
 import { applyPermission, ensurePermissionMigrated, PermissionControlError, readPermission, readPermissionStatus, type PermissionMode } from "../permission/index.js";
 import { ExecutionSupervisor, type ExecutionRunner } from "../execution/supervisor.js";
 import { TaskStore } from "../tasks/task-store.js";
@@ -174,51 +175,64 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
   }
-  // Upgrade the old persisted state shape before any MCP request can observe it.
-  // This local startup migration NEVER grants Level 2: a legacy v1 `mode=level2`
-  // record is reduced to a level1 baseline, because Level 2 must be re-enabled by
-  // the user in each Windows logon session.
-  ensurePermissionMigrated(workspace.id);
 
-  const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
-  const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
-  const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
-  const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
-  let publicBaseUrl: string | null = null;
+  // Acquire the workspace guard before loading or migrating persisted state
+  // (permissions, AuthStore, TaskStore) so no offline CLI writer can race startup.
+  const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id, workspace.root);
+  const processStartTime = await readOwnWindowsProcessStartTime();
 
-  const app = express();
-  app.set("trust proxy", true);
-  app.disable("x-powered-by");
-  if (isEventLoopTraceEnabled()) app.use(eventLoopTraceMiddleware);
+  let activeExecutionSupervisor: ExecutionSupervisor | null = null;
+  let activeTaskSupervisor: TaskSupervisor | null = null;
+  let activeServer: Server | null = null;
 
-  const localBaseUrl = (): string => `http://${host === "::1" ? "[::1]" : host}:${port}`;
-  // OAuth discovery and challenges share the trusted tunnel/bind authority.
-  // Request Host/proxy headers must not choose an authorization server.
-  const getBaseUrl = (): string => publicBaseUrl ?? localBaseUrl();
+  try {
+    // Upgrade the old persisted state shape before any MCP request can observe it.
+    // This local startup migration NEVER grants Level 2: a legacy v1 `mode=level2`
+    // record is reduced to a level1 baseline, because Level 2 must be re-enabled by
+    // the user in each Windows logon session.
+    ensurePermissionMigrated(workspace.id);
 
-  // ---- Health (public but minimal) ---------------------------------------
+    const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
+    const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
+    const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
+    const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
+    let publicBaseUrl: string | null = null;
+    let port = 0;
+    let startedAt = "";
 
-  app.get("/health", (_req, res) => {
-    if (isEventLoopTraceEnabled()) recordEventLoopTrace("handler_start");
-    res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
-  });
+    const app = express();
+    app.set("trust proxy", true);
+    app.disable("x-powered-by");
+    if (isEventLoopTraceEnabled()) app.use(eventLoopTraceMiddleware);
 
-  // ---- OAuth + discovery ---------------------------------------------------
+    const localBaseUrl = (): string => `http://${host === "::1" ? "[::1]" : host}:${port}`;
+    // OAuth discovery and challenges share the trusted tunnel/bind authority.
+    // Request Host/proxy headers must not choose an authorization server.
+    const getBaseUrl = (): string => publicBaseUrl ?? localBaseUrl();
 
-  app.use(
-    createOAuthRouter({
-      store: authStore,
-      pairing,
-      workspaceName: workspace.name,
-      getBaseUrl,
-      logger,
-    })
-  );
+    // ---- Health (public but minimal) ---------------------------------------
 
-  // ---- MCP endpoint (bearer-protected) --------------------------------------
+    app.get("/health", (_req, res) => {
+      if (isEventLoopTraceEnabled()) recordEventLoopTrace("handler_start");
+      res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
+    });
 
-  let executionSupervisor: ExecutionSupervisor | null = null;
-  let taskSupervisor: TaskSupervisor | null = null;
+    // ---- OAuth + discovery ---------------------------------------------------
+
+    app.use(
+      createOAuthRouter({
+        store: authStore,
+        pairing,
+        workspaceName: workspace.name,
+        getBaseUrl,
+        logger,
+      })
+    );
+
+    // ---- MCP endpoint (bearer-protected) --------------------------------------
+
+    let executionSupervisor: ExecutionSupervisor | null = null;
+    let taskSupervisor: TaskSupervisor | null = null;
   const mcpHandler = createMcpHttpHandler(
     () => createMcpServer({
       workspace,
@@ -486,100 +500,88 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }, 100);
   });
 
-  // Initialize routes before acquiring the guard so a synchronous setup failure
-  // cannot strand a lock owned by this still-running process. Every Bridge,
-  // including persistRuntime:false instances, must hold it before listening.
-  const instanceLock: BridgeInstanceLock = await acquireBridgeInstanceLock(workspace.id, workspace.root);
-  const supervisor = new ExecutionSupervisor(workspace, { runner: opts.executionRunner, logger });
-  let taskStore: TaskStore;
-  try {
-    taskStore = new TaskStore(workspace.id);
-  } catch (error) {
-    await supervisor.shutdown().catch(() => undefined);
-    await instanceLock.release().catch(() => undefined);
-    throw error;
-  }
-  const persistentTaskSupervisor = new TaskSupervisor(workspace, taskStore, supervisor, {
-    snapshotRegistry,
-    requireRecovery: true,
-    authorizationValid: (task) => authStore.hasActiveAuthorization(task.ownerClientId, task.authBinding.requiredScopes),
-  });
-  taskSupervisor = persistentTaskSupervisor;
-  // ExecutionJobStore loads in the ExecutionSupervisor constructor. Reconcile
-  // TaskStore against it before the listener accepts Task API mutations.
-  await persistentTaskSupervisor.recover();
-  executionSupervisor = supervisor;
-  const listening = await listen(app, host, opts.port ?? DEFAULT_PORT, workspace.id).catch(async (error: unknown) => {
-    await supervisor.shutdown().catch(() => undefined);
-    await persistentTaskSupervisor.shutdown().catch(() => undefined);
-    await instanceLock.release().catch(() => undefined);
-    throw error;
-  });
-  const { server, port } = listening;
-  const startedAt = new Date().toISOString();
-  logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
+    const supervisor = new ExecutionSupervisor(workspace, { runner: opts.executionRunner, logger });
+    activeExecutionSupervisor = supervisor;
+    const taskStore = new TaskStore(workspace.id);
+    const persistentTaskSupervisor = new TaskSupervisor(workspace, taskStore, supervisor, {
+      snapshotRegistry,
+      requireRecovery: true,
+      authorizationValid: (task) => authStore.hasActiveAuthorization(task.ownerClientId, task.authBinding.requiredScopes),
+    });
+    activeTaskSupervisor = persistentTaskSupervisor;
+    taskSupervisor = persistentTaskSupervisor;
+    // ExecutionJobStore loads in the ExecutionSupervisor constructor. Reconcile
+    // TaskStore against it before the listener accepts Task API mutations.
+    await persistentTaskSupervisor.recover();
+    executionSupervisor = supervisor;
+    const listening = await listen(app, host, opts.port ?? DEFAULT_PORT, workspace.id);
+    activeServer = listening.server;
+    const server = listening.server;
+    port = listening.port;
+    startedAt = new Date().toISOString();
+    logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
-  const persistRuntime = (): void => {
-    if (opts.persistRuntime === false) return;
-    const state: RuntimeState = {
-      service: SERVICE_NAME,
-      version: VERSION,
-      workspaceId: workspace.id,
-      workspaceRoot: workspace.root,
-      pid: process.pid,
-      port,
-      adminToken,
-      publicUrl: publicBaseUrl,
-      startedAt,
+    const persistRuntime = (): void => {
+      if (opts.persistRuntime === false) return;
+      const state: RuntimeState = {
+        service: SERVICE_NAME,
+        version: VERSION,
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+        pid: process.pid,
+        port,
+        adminToken,
+        publicUrl: publicBaseUrl,
+        startedAt,
+        ...(processStartTime ? { processStartTime } : {}),
+      };
+      writeRuntimeState(state);
     };
-    writeRuntimeState(state);
-  };
-  try {
     persistRuntime();
+
+    const shutdown = (source: BridgeShutdownSource = "admin_shutdown"): Promise<void> => {
+      if (shutdownPromise) return shutdownPromise;
+      requestShutdown(source);
+      const effectiveSource = shutdownSource ?? source;
+      shutdownPromise = (async () => {
+        recordShutdownLifecycle(logger, "shutdown_begin", effectiveSource);
+        try {
+          await supervisor.shutdown();
+          await persistentTaskSupervisor.shutdown();
+          await tunnel.stop().catch(() => undefined);
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+          if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
+          await instanceLock.release().catch(() => undefined);
+          logger.info("Bridge stopped");
+          recordShutdownLifecycle(logger, "shutdown_complete", effectiveSource);
+        } catch (error) {
+          recordShutdownLifecycle(logger, "shutdown_failed", effectiveSource);
+          throw error;
+        }
+      })();
+      return shutdownPromise;
+    };
+
+    return {
+      workspace,
+      port,
+      host,
+      adminToken,
+      authStore,
+      pairing,
+      tunnel,
+      executionSupervisor: supervisor,
+      taskStore,
+      taskSupervisor: persistentTaskSupervisor,
+      getPublicBaseUrl: () => publicBaseUrl,
+      localBaseUrl,
+      close: shutdown,
+    };
   } catch (error) {
-    await supervisor.shutdown().catch(() => undefined);
-    await persistentTaskSupervisor.shutdown().catch(() => undefined);
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (activeExecutionSupervisor) await activeExecutionSupervisor.shutdown().catch(() => undefined);
+    if (activeTaskSupervisor) await activeTaskSupervisor.shutdown().catch(() => undefined);
+    if (activeServer) await new Promise<void>((resolve) => activeServer!.close(() => resolve()));
     await instanceLock.release().catch(() => undefined);
     throw error;
   }
-
-  const shutdown = (source: BridgeShutdownSource = "admin_shutdown"): Promise<void> => {
-    if (shutdownPromise) return shutdownPromise;
-    requestShutdown(source);
-    const effectiveSource = shutdownSource ?? source;
-    shutdownPromise = (async () => {
-      recordShutdownLifecycle(logger, "shutdown_begin", effectiveSource);
-      try {
-        await supervisor.shutdown();
-        await persistentTaskSupervisor.shutdown();
-        await tunnel.stop().catch(() => undefined);
-        await new Promise<void>((resolve) => server.close(() => resolve()));
-        if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
-        await instanceLock.release().catch(() => undefined);
-        logger.info("Bridge stopped");
-        recordShutdownLifecycle(logger, "shutdown_complete", effectiveSource);
-      } catch (error) {
-        recordShutdownLifecycle(logger, "shutdown_failed", effectiveSource);
-        throw error;
-      }
-    })();
-    return shutdownPromise;
-  };
-
-  return {
-    workspace,
-    port,
-    host,
-    adminToken,
-    authStore,
-    pairing,
-    tunnel,
-    executionSupervisor: supervisor,
-    taskStore,
-    taskSupervisor: persistentTaskSupervisor,
-    getPublicBaseUrl: () => publicBaseUrl,
-    localBaseUrl,
-    close: shutdown,
-  };
 }

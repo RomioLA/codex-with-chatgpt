@@ -1,7 +1,39 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { gitDiff, gitInfo, gitRepositoryInfo, gitStatus, selectGitRepository } from "../src/workspace/git.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const spawnHooks = vi.hoisted(() => ({
+  onSpawnSync: null as null | ((args: string[], options: Record<string, unknown>) => void),
+  onSpawn: null as null | ((args: string[], options: Record<string, unknown>) => void),
+}));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawnSync: (file: string, args: string[], options: Record<string, unknown>) => {
+      spawnHooks.onSpawnSync?.(args, options);
+      return actual.spawnSync(file, args, options);
+    },
+    spawn: (file: string, args: string[], options: Record<string, unknown>) => {
+      spawnHooks.onSpawn?.(args, options);
+      return actual.spawn(file, args, options);
+    },
+  };
+});
+
+import {
+  gitDiff,
+  gitDiffAsync,
+  gitInfo,
+  gitInfoAsync,
+  gitRepositoryInfo,
+  gitRepositoryInfoAsync,
+  gitStatus,
+  gitStatusAsync,
+  selectGitRepository,
+  selectGitRepositoryAsync,
+} from "../src/workspace/git.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { makeGitRepo, makeTmpDir, git, write } from "./helpers.js";
 
@@ -43,6 +75,11 @@ function withProcessEnv<T>(values: Record<string, string>, action: () => T): T {
 }
 
 describe("Git subprocess execution policy", () => {
+  afterEach(() => {
+    spawnHooks.onSpawnSync = null;
+    spawnHooks.onSpawn = null;
+  });
+
   it("blocks repo-local fsmonitor commands for git_info and git_status", () => {
     const fixture = makeFixture("fsmonitor");
     const marker = path.join(fixture.root, "fsmonitor.marker");
@@ -286,5 +323,190 @@ describe("Git subprocess execution policy", () => {
     expect(status.isRepo).toBe(false);
     expect(diff.isRepo).toBe(false);
     expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it("fails closed before worktree inspection when .git/config contains [include] or [includeIf]", async () => {
+    for (const directive of ["include", "includeIf"] as const) {
+      const fixture = makeFixture(`config-${directive.toLowerCase()}`);
+      const marker = path.join(fixture.root, `${directive}.marker`);
+      write(fixture.root, ".gitattributes", "*.filtered filter=external\n");
+      write(fixture.root, "sample.filtered", "base content\n");
+      git(fixture.root, "add", ".gitattributes", "sample.filtered");
+      git(fixture.root, "commit", "-m", "add include filter fixture");
+      write(fixture.root, "sample.filtered", "evil content\n");
+
+      const sampleMtime = fs.statSync(path.join(fixture.root, "sample.filtered")).mtime;
+      const indexPath = path.join(fixture.root, ".git", "index");
+      const oldIndexMtime = new Date(sampleMtime.getTime() - 5000);
+      fs.utimesSync(indexPath, oldIndexMtime, oldIndexMtime);
+
+      const includedConfig = write(
+        fixture.root,
+        "included.gitconfig",
+        `[filter "external"]\n\tclean = ${fixture.markerCommand(marker)}\n`
+      );
+      const sectionHeader =
+        directive === "include"
+          ? "[include]"
+          : `[includeIf "gitdir:${fixture.root.replace(/\\/g, "/")}/"]`;
+      fs.appendFileSync(
+        path.join(fixture.root, ".git", "config"),
+        `\n${sectionHeader}\n\tpath = ${includedConfig.replace(/\\/g, "/")}\n`
+      );
+
+      const info = gitInfo(fixture.root);
+      const infoAsync = await gitInfoAsync(fixture.root);
+      const workspace = new Workspace(fixture.root);
+      const repositoryInfo = gitRepositoryInfo(selectGitRepository(workspace));
+      const repositoryInfoAsync = await gitRepositoryInfoAsync(await selectGitRepositoryAsync(workspace));
+      const status = gitStatus(fixture.root);
+      const statusAsync = await gitStatusAsync(fixture.root);
+      const diff = gitDiff(fixture.root, { mode: "unstaged" });
+      const diffAsync = await gitDiffAsync(fixture.root, { mode: "unstaged" });
+
+      expect(info).toMatchObject({ isRepo: true, branch: "main", dirty: null });
+      expect(infoAsync).toMatchObject({ isRepo: true, branch: "main", dirty: null });
+      expect(repositoryInfo).toMatchObject({ isRepo: true, dirty: null });
+      expect(repositoryInfoAsync).toMatchObject({ isRepo: true, dirty: null });
+      expect(status.isRepo).toBe(false);
+      expect(statusAsync.isRepo).toBe(false);
+      expect(diff.isRepo).toBe(false);
+      expect(diffAsync.isRepo).toBe(false);
+      expect(fs.existsSync(marker)).toBe(false);
+    }
+  });
+
+  it("blocks filters configured in .git/config.worktree across sync and async status and diff", async () => {
+    const fixture = makeFixture("config-worktree");
+    const marker = path.join(fixture.root, "worktree-filter.marker");
+    write(fixture.root, ".gitattributes", "*.filtered filter=external\n");
+    write(fixture.root, "sample.filtered", "base worktree content\n");
+    git(fixture.root, "add", ".gitattributes", "sample.filtered");
+    git(fixture.root, "commit", "-m", "add worktree config filter fixture");
+    write(fixture.root, "sample.filtered", "changed worktree content\n");
+
+    const sampleMtime = fs.statSync(path.join(fixture.root, "sample.filtered")).mtime;
+    const indexPath = path.join(fixture.root, ".git", "index");
+    const oldIndexMtime = new Date(sampleMtime.getTime() - 5000);
+    fs.utimesSync(indexPath, oldIndexMtime, oldIndexMtime);
+
+    git(fixture.root, "config", "extensions.worktreeConfig", "true");
+    git(fixture.root, "config", "--worktree", "filter.external.clean", fixture.markerCommand(marker));
+
+    const status = gitStatus(fixture.root);
+    const statusAsync = await gitStatusAsync(fixture.root);
+    const diff = gitDiff(fixture.root, { mode: "unstaged" });
+    const diffAsync = await gitDiffAsync(fixture.root, { mode: "unstaged" });
+
+    expect(status).toMatchObject({ isRepo: true, branch: "main" });
+    expect(status.unstaged.map((entry) => entry.path)).toContain("sample.filtered");
+    expect(statusAsync).toMatchObject({ isRepo: true, branch: "main" });
+    expect(statusAsync.unstaged.map((entry) => entry.path)).toContain("sample.filtered");
+    expect(diff.isRepo).toBe(true);
+    expect(diff.diff).toContain("changed worktree content");
+    expect(diffAsync.isRepo).toBe(true);
+    expect(diffAsync.diff).toContain("changed worktree content");
+    expect(fs.existsSync(marker)).toBe(false);
+
+    // Unsafe filter key inside config.worktree must also fail closed.
+    fs.appendFileSync(
+      path.join(fixture.root, ".git", "config.worktree"),
+      `\n[filter "foo=bar"]\n\tclean = ${fixture.markerCommand(marker)}\n`
+    );
+    expect(gitStatus(fixture.root).isRepo).toBe(false);
+    expect((await gitStatusAsync(fixture.root)).isRepo).toBe(false);
+    expect(gitDiff(fixture.root, { mode: "unstaged" }).isRepo).toBe(false);
+    expect((await gitDiffAsync(fixture.root, { mode: "unstaged" })).isRepo).toBe(false);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it("isolates status and diff from concurrent .git/config filter injection after enumeration", async () => {
+    const setupRaceFixture = (name: string) => {
+      const fixture = makeFixture(name);
+      const marker = path.join(fixture.root, `${name}.marker`);
+      write(fixture.root, ".gitattributes", "*.filtered filter=race\n");
+      write(fixture.root, "sample.filtered", "base race content\n");
+      git(fixture.root, "add", ".gitattributes", "sample.filtered");
+      git(fixture.root, "commit", "-m", "add TOCTOU race fixture");
+      write(fixture.root, "sample.filtered", "modified race content\n");
+
+      const sampleMtime = fs.statSync(path.join(fixture.root, "sample.filtered")).mtime;
+      const indexPath = path.join(fixture.root, ".git", "index");
+      const oldIndexMtime = new Date(sampleMtime.getTime() - 5000);
+      fs.utimesSync(indexPath, oldIndexMtime, oldIndexMtime);
+      return { fixture, marker };
+    };
+
+    const assertControlledViewAndInject = (
+      args: string[],
+      options: Record<string, unknown>,
+      repoRoot: string,
+      marker: string,
+      injectedFlag: { count: number }
+    ) => {
+      const isWorktreeCommand = args.includes("status") || args.includes("diff");
+      if (!isWorktreeCommand) return;
+      const env = options.env as NodeJS.ProcessEnv;
+      expect(env.GIT_CONFIG_NOSYSTEM).toBe("1");
+      expect(env.GIT_ATTR_NOSYSTEM).toBe("1");
+      expect(env.GIT_DIR).toBeTruthy();
+      expect(path.resolve(env.GIT_DIR!)).not.toBe(path.resolve(path.join(repoRoot, ".git")));
+
+      injectedFlag.count += 1;
+      fs.appendFileSync(
+        path.join(repoRoot, ".git", "config"),
+        `\n[filter "race"]\n\tclean = ${`node ${path.join(repoRoot, "marker.mjs").replace(/\\/g, "/")} ${marker.replace(/\\/g, "/")}`}\n`
+      );
+    };
+
+    // Sync TOCTOU race test
+    const syncCase = setupRaceFixture("toctou-sync");
+    const syncInjected = { count: 0 };
+    spawnHooks.onSpawnSync = (args, options) => {
+      assertControlledViewAndInject(args, options, syncCase.fixture.root, syncCase.marker, syncInjected);
+    };
+    const syncStatus = gitStatus(syncCase.fixture.root);
+    expect(syncInjected.count).toBe(1);
+    expect(syncStatus).toMatchObject({ isRepo: true, branch: "main" });
+    expect(syncStatus.unstaged.map((entry) => entry.path)).toContain("sample.filtered");
+    expect(fs.existsSync(syncCase.marker)).toBe(false);
+
+    // Async TOCTOU race test (status + diff)
+    const asyncCase = setupRaceFixture("toctou-async");
+    const asyncInjected = { count: 0 };
+    spawnHooks.onSpawn = (args, options) => {
+      assertControlledViewAndInject(args, options, asyncCase.fixture.root, asyncCase.marker, asyncInjected);
+    };
+    const asyncStatus = await gitStatusAsync(asyncCase.fixture.root);
+    expect(asyncInjected.count).toBeGreaterThanOrEqual(1);
+    expect(asyncStatus).toMatchObject({ isRepo: true, branch: "main" });
+    expect(asyncStatus.unstaged.map((entry) => entry.path)).toContain("sample.filtered");
+    expect(fs.existsSync(asyncCase.marker)).toBe(false);
+
+    // Clean config before testing gitDiffAsync race so enumeration sees no filter yet.
+    const diffCase = setupRaceFixture("toctou-async-diff");
+    const diffInjected = { count: 0 };
+    spawnHooks.onSpawn = (args, options) => {
+      assertControlledViewAndInject(args, options, diffCase.fixture.root, diffCase.marker, diffInjected);
+    };
+    const asyncDiff = await gitDiffAsync(diffCase.fixture.root, { mode: "unstaged" });
+    expect(diffInjected.count).toBeGreaterThanOrEqual(1);
+    expect(asyncDiff.isRepo).toBe(true);
+    expect(asyncDiff.diff).toContain("modified race content");
+    expect(fs.existsSync(diffCase.marker)).toBe(false);
+  });
+
+  it("fails closed when repository metadata directories are reparse points", () => {
+    const fixture = makeFixture("reparse-info");
+    const realInfo = path.join(fixture.root, ".git", "info");
+    const targetDir = makeTmpDir("git-security-reparse-target");
+    fs.writeFileSync(path.join(targetDir, "exclude"), "*.tmp\n");
+    fs.unlinkSync(path.join(realInfo, "exclude"));
+    fs.rmdirSync(realInfo);
+    fs.symlinkSync(targetDir, realInfo, process.platform === "win32" ? "junction" : "dir");
+
+    expect(gitStatus(fixture.root).isRepo).toBe(false);
+    expect(gitDiff(fixture.root, { mode: "unstaged" }).isRepo).toBe(false);
+    expect(gitInfo(fixture.root)).toMatchObject({ isRepo: true, dirty: null });
   });
 });

@@ -381,4 +381,112 @@ describe("workspace Bridge instance lock remediation", () => {
       }
     }
   });
+
+  it("releases the instance lock when AuthStore initialization fails during startup", async () => {
+    const stateRoot = isolateStateDir();
+    const { root, workspace } = makeWorkspace("lock-corrupt-auth-startup");
+    const authDir = path.join(stateRoot, "auth");
+    fs.mkdirSync(authDir, { recursive: true });
+    const corruptAuthFile = path.join(authDir, `${workspace.id}.json`);
+    fs.writeFileSync(corruptAuthFile, '{"clients":[],"tokens":[', "utf8");
+
+    await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
+      .rejects.toThrow(/invalid json|corrupt/i);
+    expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("missing");
+  });
+
+  it("passes recorded processStartTime to owner verification and keeps a matching live Bridge lock", async () => {
+    isolateStateDir();
+    const { root, workspace } = makeWorkspace("lock-process-start-time");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const observedStartTimes: Array<string | null | undefined> = [];
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner")
+      .mockImplementation(async (_pid, _workspaceRoot, expectedStartTime) => {
+        observedStartTimes.push(expectedStartTime);
+        return expectedStartTime === "2026-11-04T08:38:12.1447236Z" ? "bridge" : "unrelated";
+      });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", () => resolve());
+        child.once("error", reject);
+      });
+      if (!child.pid) throw new Error("Could not start isolated processStartTime fixture");
+      const lockFile = bridgeInstanceLockFile(workspace.id);
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.writeFileSync(lockFile, JSON.stringify({
+        version: 1,
+        workspaceId: workspace.id,
+        pid: child.pid,
+        token: randomBytes(16).toString("hex"),
+        createdAt: new Date().toISOString(),
+        processStartTime: "2026-11-04T08:38:12.1447236Z",
+      }));
+
+      expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("live_pid_unverified");
+      await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
+        .rejects.toThrow(/live but unverified|cannot be verified/i);
+      expect(observedStartTimes).toEqual([
+        "2026-11-04T08:38:12.1447236Z",
+        "2026-11-04T08:38:12.1447236Z",
+      ]);
+      expect(fs.existsSync(lockFile)).toBe(true);
+    } finally {
+      ownerProbe.mockRestore();
+      if (child.pid) {
+        try { child.kill("SIGKILL"); } catch { /* the child may already have exited */ }
+      }
+    }
+  });
+
+  it("does not unlink a lock whose processStartTime changed while recovery was in flight", async () => {
+    isolateStateDir();
+    const { root, workspace } = makeWorkspace("lock-recovery-start-time-race");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const lockFile = bridgeInstanceLockFile(workspace.id);
+    const token = randomBytes(16).toString("hex");
+    let probeCalls = 0;
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockImplementation(async (_pid, _root, expectedStartTime) => {
+      probeCalls += 1;
+      if (probeCalls === 2) {
+        fs.writeFileSync(lockFile, JSON.stringify({
+          version: 1,
+          workspaceId: workspace.id,
+          pid: child.pid,
+          token,
+          createdAt: new Date().toISOString(),
+          processStartTime: "2026-11-04T08:38:12.1447236Z",
+        }));
+        return "unrelated";
+      }
+      return expectedStartTime === "2026-11-04T08:38:12.1447236Z" ? "bridge" : "unrelated";
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", () => resolve());
+        child.once("error", reject);
+      });
+      if (!child.pid) throw new Error("Could not start isolated startTime race fixture");
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.writeFileSync(lockFile, JSON.stringify({
+        version: 1,
+        workspaceId: workspace.id,
+        pid: child.pid,
+        token,
+        createdAt: new Date(0).toISOString(),
+      }));
+
+      await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
+        .rejects.toThrow(/live but unverified|cannot be verified/i);
+      expect(probeCalls).toBeGreaterThanOrEqual(3);
+      expect(fs.existsSync(lockFile)).toBe(true);
+      const surviving = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { processStartTime?: string };
+      expect(surviving.processStartTime).toBe("2026-11-04T08:38:12.1447236Z");
+    } finally {
+      ownerProbe.mockRestore();
+      if (child.pid) {
+        try { child.kill("SIGKILL"); } catch { /* the child may already have exited */ }
+      }
+    }
+  });
 });
