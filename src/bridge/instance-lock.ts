@@ -172,6 +172,8 @@ async function recoverDeadOwner(
     if (!await canRecoverLockOwner(file, current, workspaceRoot)) {
       throw new Error("The Bridge instance lock owner cannot be safely verified; refusing to start another Bridge.");
     }
+    const latest = readStateLock(file, workspaceId);
+    if (!latest || latest.token !== current.token || latest.pid !== current.pid) return;
     fs.unlinkSync(file);
   } finally {
     await new Promise<void>((resolve) => recoveryServer.close(() => resolve()));

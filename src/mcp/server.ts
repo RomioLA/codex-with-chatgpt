@@ -423,7 +423,10 @@ export function createMcpServer(ctx: McpContext): McpServer {
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS }
   );
-  const finishOAuthListingRegistration = installExecutionOAuthListing(server);
+  const finishOAuthListingRegistration = installExecutionOAuthListing(
+    server,
+    `c2c-v15:${Boolean(ctx.taskSupervisor)}:${hideLegacyTools}`
+  );
 
   server.registerTool(
     "workspace_info",

@@ -42,4 +42,37 @@ describe("Bridge process identity", () => {
   it("treats a missing process as missing", () => {
     expect(classifyBridgeProcessIdentity(identity({ found: false }), "C:\\codex")).toBe("missing");
   });
+
+  it("treats relative --workspace arguments as unknown rather than unrelated", () => {
+    expect(classifyBridgeProcessIdentity(identity({
+      commandLine: '"C:\\Runtime\\dist\\cli\\index.js" serve --workspace .',
+    }), "C:\\codex")).toBe("unknown");
+    expect(classifyBridgeProcessIdentity(identity({
+      commandLine: '"C:\\Runtime\\dist\\cli\\index.js" serve --workspace=.\\sub',
+    }), "C:\\codex")).toBe("unknown");
+  });
+
+  it("distinguishes same-prefix directories as unrelated", () => {
+    expect(classifyBridgeProcessIdentity(identity({
+      commandLine: '"C:\\Runtime\\dist\\cli\\index.js" serve --workspace "C:\\codex_other"',
+    }), "C:\\codex")).toBe("unrelated");
+  });
+
+  it("normalizes --workspace=<val>, trailing slashes, and forward slashes", () => {
+    expect(classifyBridgeProcessIdentity(identity({
+      commandLine: '"C:\\Runtime\\dist\\cli\\index.js" serve --workspace="C:/codex/"',
+    }), "C:\\codex\\")).toBe("bridge");
+  });
+
+  it("treats duplicate, empty, or unclosed-quote --workspace flags as unknown", () => {
+    expect(classifyBridgeProcessIdentity(identity({
+      commandLine: '"C:\\Runtime\\dist\\cli\\index.js" serve --workspace "C:\\codex" --workspace "C:\\other"',
+    }), "C:\\codex")).toBe("unknown");
+    expect(classifyBridgeProcessIdentity(identity({
+      commandLine: '"C:\\Runtime\\dist\\cli\\index.js" serve --workspace ""',
+    }), "C:\\codex")).toBe("unknown");
+    expect(classifyBridgeProcessIdentity(identity({
+      commandLine: '"C:\\Runtime\\dist\\cli\\index.js" serve --workspace "C:\\codex',
+    }), "C:\\codex")).toBe("unknown");
+  });
 });

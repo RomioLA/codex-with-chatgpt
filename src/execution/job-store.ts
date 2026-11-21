@@ -210,17 +210,28 @@ function isValidJob(value: unknown, workspaceId: string): value is ExecutionJob 
     isStreamMeta(job.stdout) && isStreamMeta(job.stderr);
 }
 
-function sameLogicalJob(active: ExecutionJob, archived: ExecutionJob): boolean {
+function sameLogicalJobCore(active: ExecutionJob, archived: ExecutionJob): boolean {
   const requestHash = (job: ExecutionJob): string | null =>
     job.authorization?.type === "full_access" ? job.authorization.requestHash : null;
   return active.workspaceId === archived.workspaceId && active.jobId === archived.jobId &&
     active.oauthClientId === archived.oauthClientId && active.idempotencyKeyHash === archived.idempotencyKeyHash &&
     requestHash(active) === requestHash(archived) && active.executionContext === archived.executionContext &&
     active.repositoryIdentity === archived.repositoryIdentity && active.repositoryPath === archived.repositoryPath &&
-    active.timeoutSeconds === archived.timeoutSeconds && active.state === archived.state &&
-    active.recoveryEvidence === archived.recoveryEvidence &&
-    active.startedAt === archived.startedAt && active.finishedAt === archived.finishedAt &&
-    active.exitCode === archived.exitCode && active.failureCode === archived.failureCode;
+    active.timeoutSeconds === archived.timeoutSeconds && active.startedAt === archived.startedAt &&
+    active.exitCode === archived.exitCode;
+}
+
+function sameLogicalJob(active: ExecutionJob, archived: ExecutionJob): boolean {
+  return sameLogicalJobCore(active, archived) &&
+    active.state === archived.state && active.recoveryEvidence === archived.recoveryEvidence &&
+    active.finishedAt === archived.finishedAt && active.failureCode === archived.failureCode;
+}
+
+function sameLogicalJobForRecovery(active: ExecutionJob, archived: ExecutionJob): boolean {
+  return sameLogicalJobCore(active, archived) &&
+    active.createdAt === archived.createdAt &&
+    archived.state === "interrupted" &&
+    archived.finishedAt !== null;
 }
 
 function isValidFullAccessCommand(value: unknown): value is FullAccessCommand {
@@ -387,6 +398,7 @@ export class ExecutionJobStore {
       } as ExecutionJob);
     }
     const directoryEntries = fs.readdirSync(this.directory);
+    let mutatedDuringLoad = false;
     for (const [jobId, job] of loaded) {
       for (const stream of ["stdout", "stderr"] as const) {
         let segments: OutputSegment[] = [];
@@ -399,19 +411,36 @@ export class ExecutionJobStore {
         this.outputWriters.set(outputWriterKey(jobId, stream), newOutputWriter(segments, job[stream]));
       }
       if (job.state === "queued" || job.state === "running" || job.state === "cancelling") {
-        loaded.set(jobId, transitionExecutionJob(job, "interrupted", {
+        let existingArchived: ExecutionJob | null = null;
+        try {
+          const candidate = readArchivedRecord<ExecutionJob>(this.directory, "jobs", jobId);
+          if (candidate && isValidJob(candidate, this.workspaceId) && candidate.jobId === jobId &&
+              jobCanBeStoredInArchive(candidate) && sameLogicalJobForRecovery(job, candidate)) {
+            existingArchived = candidate;
+          }
+        } catch {
+          // Fall back to a fresh interruption transition if the archive cannot be read.
+        }
+        loaded.set(jobId, existingArchived ?? transitionExecutionJob(job, "interrupted", {
           failureCode: "BRIDGE_RESTARTED",
           finishedAt: new Date().toISOString(),
         }));
+        mutatedDuringLoad = true;
       } else if (job.state === "interrupted" && job.failureCode === "BRIDGE_RESTARTED" &&
                  job.recoveryEvidence === "process_tree_and_temp_cleaned") {
         // Previous restart recovery may have mistaken Temp deletion for tree exit.
         // Preserve the interruption, but revoke evidence that cannot be verified.
         loaded.set(jobId, { ...job, recoveryEvidence: undefined });
+        mutatedDuringLoad = true;
       }
     }
+    if (mutatedDuringLoad) {
+      this.persist(loaded);
+    }
     const retained = this.prune(loaded);
-    this.persist(retained);
+    if (!mutatedDuringLoad || retained.size !== loaded.size) {
+      this.persist(retained);
+    }
     this.commitJobs(retained, loaded);
   }
 
@@ -738,18 +767,13 @@ export class ExecutionJobStore {
   replace(job: ExecutionJob): void {
     if (this.corruption) throw new Error("STORE_CORRUPT");
     if (job.workspaceId !== this.workspaceId || !this.jobs.has(job.jobId)) throw new TypeError("Unknown execution job");
-    const staged = new Map(this.jobs);
-    staged.set(job.jobId, job);
-    const next = this.prune(staged);
-    if (next.size === staged.size) {
-      // Preserve the existing transition-failure contract when no archive move
-      // is involved; archive removals remain staged until the index publishes.
-      this.jobs.set(job.jobId, job);
-      this.persist();
-      return;
+    this.jobs.set(job.jobId, job);
+    this.persist();
+    const next = this.prune(this.jobs);
+    if (next.size !== this.jobs.size) {
+      this.persist(next);
+      this.commitJobs(next);
     }
-    this.persist(next);
-    this.commitJobs(next);
   }
 
   appendSanitized(jobId: string, stream: OutputStream, text: string): Promise<void> {

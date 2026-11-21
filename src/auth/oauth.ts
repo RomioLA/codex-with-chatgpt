@@ -71,6 +71,7 @@ function pairingPage(opts: {
   workspaceName: string;
   scopes: string[];
   clientName?: string;
+  redirectHost?: string;
   error?: string;
 }): string {
   const scopeLabels: Record<string, string> = {
@@ -115,6 +116,9 @@ function pairingPage(opts: {
     ? opts.clientName
     : "ChatGPT";
   const escapedRequesterName = escapeHtml(requesterName);
+  const callbackHostHtml = opts.redirectHost
+    ? `\n  <p class="sub">Callback host: <strong>${escapeHtml(opts.redirectHost)}</strong></p>`
+    : "";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -147,7 +151,7 @@ function pairingPage(opts: {
 <body>
 <div class="card">
   <h1>${escapedProductName}</h1>
-  <p class="sub">${escapedRequesterName} is requesting access to workspace <strong>${escapedWorkspaceName}</strong>${accessLabel}:</p>
+  <p class="sub">${escapedRequesterName} is requesting access to workspace <strong>${escapedWorkspaceName}</strong>${accessLabel}:</p>${callbackHostHtml}
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">
@@ -162,12 +166,17 @@ function pairingPage(opts: {
 </html>`;
 }
 
+type ExtractedClientCredentials =
+  | { ok: true; clientId?: string; clientSecret?: string; authSource: "basic" | "post" | "none" }
+  | { ok: false };
+
 function extractClientCredentials(
   req: Request,
   body: Record<string, string | undefined>
-): { ok: true; clientId?: string; clientSecret?: string } | { ok: false } {
+): ExtractedClientCredentials {
   const authHeader = req.headers.authorization;
-  if (typeof authHeader === "string" && /^basic(?:\s|$)/i.test(authHeader)) {
+  if (authHeader !== undefined) {
+    if (typeof authHeader !== "string") return { ok: false };
     const match = /^basic\s+([A-Za-z0-9+/=]+)\s*$/i.exec(authHeader);
     if (!match) return { ok: false };
     let decoded: string;
@@ -186,15 +195,19 @@ function extractClientCredentials(
     } catch {
       return { ok: false };
     }
+    if (body.client_secret !== undefined) {
+      return { ok: false };
+    }
     if (body.client_id !== undefined && body.client_id !== basicId) {
       return { ok: false };
     }
-    if (body.client_secret !== undefined && body.client_secret !== basicSecret) {
-      return { ok: false };
-    }
-    return { ok: true, clientId: basicId, clientSecret: basicSecret };
+    return { ok: true, clientId: basicId, clientSecret: basicSecret, authSource: "basic" };
   }
-  return { ok: true, clientId: body.client_id, clientSecret: body.client_secret };
+  if (body.client_secret === "") return { ok: false };
+  if (typeof body.client_secret === "string" && body.client_secret.length > 0) {
+    return { ok: true, clientId: body.client_id, clientSecret: body.client_secret, authSource: "post" };
+  }
+  return { ok: true, clientId: body.client_id, authSource: "none" };
 }
 
 export function createOAuthRouter(deps: OAuthDeps): Router {
@@ -309,9 +322,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     } catch { /* validated above */ }
     const isTrustedWebConnector = redirectProtocol === "https:" && (
       (client.clientName === "ChatGPT" && redirectHost === "chatgpt.com") ||
-      redirectHost === "gemini.google.com" ||
-      redirectHost.endsWith(".google.com") ||
-      redirectHost.endsWith(".googleusercontent.com")
+      client.trustedLocalClient === true
     );
 
     let scopes: string[];
@@ -346,6 +357,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
         workspaceName: deps.workspaceName,
         scopes,
         clientName: client.clientName,
+        redirectHost: redirectHost || undefined,
       }));
   });
 
@@ -367,6 +379,12 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
         rate_limited: "Too many attempts. Please wait a minute and try again.",
         no_active_session: "No active pairing session. Ask Codex to generate a pairing code.",
       };
+      let redirectHost: string | undefined;
+      try {
+        redirectHost = new URL(request.redirectUri).hostname || undefined;
+      } catch {
+        redirectHost = undefined;
+      }
       deps.logger.warn(`Pairing verification failed: ${verdict.reason}`);
       setAuthSecurityHeaders(res);
       res
@@ -378,6 +396,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
             workspaceName: deps.workspaceName,
             scopes: request.scopes,
             clientName: request.clientName,
+            redirectHost,
             error: messages[verdict.reason] ?? "Verification failed.",
           })
         );
@@ -401,16 +420,61 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   // ---- Token endpoint --------------------------------------------------------
 
+  const tokenStringFields = [
+    "grant_type",
+    "code",
+    "code_verifier",
+    "redirect_uri",
+    "refresh_token",
+    "client_id",
+    "client_secret",
+    "scope",
+    "resource",
+  ] as const;
+
+  const verifyTokenClient = (
+    res: Response,
+    clientId: string,
+    clientSecret: string | undefined,
+    authSource: "basic" | "post" | "none"
+  ): boolean => {
+    const credCheck = deps.store.verifyClientCredentials(clientId, clientSecret, authSource);
+    if (credCheck.ok) return true;
+    if (credCheck.challengeBasic) {
+      res.setHeader("WWW-Authenticate", 'Basic realm="c2c"');
+      res.status(401).json({ error: "invalid_client" });
+      return false;
+    }
+    if (credCheck.reason === "invalid_client") {
+      res.status(401).json({ error: "invalid_client" });
+      return false;
+    }
+    res.status(400).json({ error: "invalid_client" });
+    return false;
+  };
+
   router.post("/oauth/token", urlencoded({ extended: false }), json(), async (req, res, next) => {
     try {
-      const body = (req.body ?? {}) as Record<string, string | undefined>;
+      const rawBody: unknown = req.body;
+      if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {
+        res.status(400).json({ error: "invalid_request" });
+        return;
+      }
+      const bodyRecord = rawBody as Record<string, unknown>;
+      for (const field of tokenStringFields) {
+        if (bodyRecord[field] !== undefined && typeof bodyRecord[field] !== "string") {
+          res.status(400).json({ error: "invalid_request" });
+          return;
+        }
+      }
+      const body = bodyRecord as Record<string, string | undefined>;
       const grantType = body.grant_type;
       const extracted = extractClientCredentials(req, body);
       if (!extracted.ok) {
         res.status(400).json({ error: "invalid_request" });
         return;
       }
-      const { clientId, clientSecret } = extracted;
+      const { clientId, clientSecret, authSource } = extracted;
 
       if (grantType === "authorization_code") {
         const { code, code_verifier: codeVerifier, redirect_uri: redirectUri } = body;
@@ -418,11 +482,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
           res.status(400).json({ error: "invalid_request" });
           return;
         }
-        const credCheck = deps.store.verifyClientCredentials(clientId, clientSecret);
-        if (!credCheck.ok && credCheck.reason === "invalid_client" && deps.store.getClient(clientId)?.clientSecretHash) {
-          res.status(401).json({ error: "invalid_client" });
-          return;
-        }
+        if (!verifyTokenClient(res, clientId, clientSecret, authSource)) return;
         const record = deps.store.consumeAuthorizationCode(code);
         if (!record || record.clientId !== clientId) {
           res.status(400).json({ error: "invalid_grant" });
@@ -455,11 +515,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
           res.status(400).json({ error: "invalid_request" });
           return;
         }
-        const credCheck = deps.store.verifyClientCredentials(clientId, clientSecret);
-        if (!credCheck.ok && credCheck.reason === "invalid_client" && deps.store.getClient(clientId)?.clientSecretHash) {
-          res.status(401).json({ error: "invalid_client" });
-          return;
-        }
+        if (!verifyTokenClient(res, clientId, clientSecret, authSource)) return;
         const inflightKey = `${clientId}\0${refreshToken}`;
         let refreshPromise = inflightRefreshes.get(inflightKey);
         if (!refreshPromise) {

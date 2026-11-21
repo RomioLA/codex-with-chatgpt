@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "node:fs";
 import { createServer, type Server as NetServer } from "node:net";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
-import { DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
+import { AuthStore, DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
 
 let root: string;
@@ -717,22 +718,53 @@ describe("refresh token rotation", () => {
 });
 
 describe("Gemini and confidential client compatibility", () => {
-  it("expands scopes to full SUPPORTED_SCOPES for Gemini HTTPS redirect even with openid email profile", async () => {
+  it("rejects openid email profile scope expansion for publicly registered Gemini or google.com redirects", async () => {
+    for (const redirectUri of [
+      "https://gemini.google.com/callback",
+      "https://evil.googleusercontent.com/callback",
+      "https://docs.google.com/callback",
+    ]) {
+      const registration = await fetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ client_name: "Gemini Web", redirect_uris: [redirectUri] }),
+      });
+      expect(registration.status).toBe(201);
+      const { client_id: clientId } = (await registration.json()) as { client_id: string };
+      const { challenge } = pkceVerifierAndChallenge();
+
+      const authorizeUrl = new URL(`${base}/oauth/authorize`);
+      authorizeUrl.searchParams.set("client_id", clientId);
+      authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+      authorizeUrl.searchParams.set("response_type", "code");
+      authorizeUrl.searchParams.set("state", "gemini-public-rejected");
+      authorizeUrl.searchParams.set("code_challenge", challenge);
+      authorizeUrl.searchParams.set("code_challenge_method", "S256");
+      authorizeUrl.searchParams.set("scope", "openid email profile");
+
+      const pageResponse = await fetch(authorizeUrl, { redirect: "manual" });
+      expect(pageResponse.status).toBe(302);
+      const location = new URL(pageResponse.headers.get("location")!);
+      expect(location.searchParams.get("error")).toBe("invalid_scope");
+      expect(location.searchParams.get("state")).toBe("gemini-public-rejected");
+    }
+  });
+
+  it("expands scopes to full SUPPORTED_SCOPES for trustedLocalClient and displays callback host", async () => {
     const redirectUri = "https://gemini.google.com/callback";
-    const registration = await fetch(`${base}/oauth/register`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client_name: "Gemini Web", redirect_uris: [redirectUri] }),
+    const trusted = bridge.authStore.registerClient({
+      clientName: "Gemini Web",
+      redirectUris: [redirectUri],
+      tokenEndpointAuthMethod: "none",
+      trustedLocalClient: true,
     });
-    expect(registration.status).toBe(201);
-    const { client_id: clientId } = (await registration.json()) as { client_id: string };
     const { verifier, challenge } = pkceVerifierAndChallenge();
 
     const authorizeUrl = new URL(`${base}/oauth/authorize`);
-    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("client_id", trusted.clientId);
     authorizeUrl.searchParams.set("redirect_uri", redirectUri);
     authorizeUrl.searchParams.set("response_type", "code");
-    authorizeUrl.searchParams.set("state", "gemini-openid-state");
+    authorizeUrl.searchParams.set("state", "gemini-trusted-state");
     authorizeUrl.searchParams.set("code_challenge", challenge);
     authorizeUrl.searchParams.set("code_challenge_method", "S256");
     authorizeUrl.searchParams.set("scope", "openid email profile");
@@ -742,8 +774,19 @@ describe("Gemini and confidential client compatibility", () => {
     const html = await pageResponse.text();
     expect(html).toContain("Gemini Web is requesting access to workspace");
     expect(html).not.toContain("ChatGPT is requesting access to workspace");
+    expect(html).toContain("Callback host: <strong>gemini.google.com</strong>");
     const requestId = html.match(/name="request_id" value="([a-f0-9]+)"/)?.[1];
     expect(requestId).toBeTruthy();
+
+    bridge.pairing.create();
+    const badAttempt = await fetch(`${base}/oauth/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ request_id: requestId!, pairing_code: "AAAA-AAAA" }),
+      redirect: "manual",
+    });
+    expect(badAttempt.status).toBe(401);
+    expect(await badAttempt.text()).toContain("Callback host: <strong>gemini.google.com</strong>");
 
     const pairing = bridge.pairing.create();
     const consent = await fetch(`${base}/oauth/authorize`, {
@@ -765,7 +808,7 @@ describe("Gemini and confidential client compatibility", () => {
         grant_type: "authorization_code",
         code: code!,
         code_verifier: verifier,
-        client_id: clientId,
+        client_id: trusted.clientId,
         redirect_uri: redirectUri,
       }),
     });
@@ -838,6 +881,7 @@ describe("Gemini and confidential client compatibility", () => {
       }),
     });
     expect(wrongTokenResponse.status).toBe(401);
+    expect(wrongTokenResponse.headers.get("www-authenticate")).toBe('Basic realm="c2c"');
     expect(await wrongTokenResponse.json()).toEqual({ error: "invalid_client" });
 
     const validBasic = Buffer.from(
@@ -873,6 +917,7 @@ describe("Gemini and confidential client compatibility", () => {
       }),
     });
     expect(wrongRefresh.status).toBe(401);
+    expect(wrongRefresh.headers.get("www-authenticate")).toBe('Basic realm="c2c"');
     expect(await wrongRefresh.json()).toEqual({ error: "invalid_client" });
 
     const refreshResponse = await fetch(`${base}/oauth/token`, {
@@ -890,5 +935,411 @@ describe("Gemini and confidential client compatibility", () => {
     const refreshed = (await refreshResponse.json()) as Record<string, string>;
     expect(refreshed.access_token).toMatch(/^c2c_at_/);
     expect(refreshed.refresh_token).not.toBe(initial.refresh_token);
+  });
+
+  it("enforces Basic vs POST auth method exclusivity, rejects unknown clients, and does not consume code before client auth", async () => {
+    const basicReg = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "BasicOnly",
+        redirect_uris: [REDIRECT_URI],
+        token_endpoint_auth_method: "client_secret_basic",
+      }),
+    });
+    const basicClient = (await basicReg.json()) as { client_id: string; client_secret: string };
+
+    const postReg = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "PostOnly",
+        redirect_uris: [REDIRECT_URI],
+        token_endpoint_auth_method: "client_secret_post",
+      }),
+    });
+    const postClient = (await postReg.json()) as { client_id: string; client_secret: string };
+
+    const publicClientId = await registerClient();
+
+    // Authorization code for BasicOnly client
+    const { verifier: basicVerifier, challenge: basicChallenge } = pkceVerifierAndChallenge();
+    const basicAuth = await authorizeWithPairing(basicClient.client_id, basicChallenge, bridge.pairing.create().code);
+    expect(basicAuth.code).toBeTruthy();
+
+    // Unknown client without Basic header -> 400 invalid_client, and code stays unconsumed
+    const unknownPost = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: basicAuth.code!,
+        code_verifier: basicVerifier,
+        client_id: "nonexistent_client",
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(unknownPost.status).toBe(400);
+    expect(unknownPost.headers.get("www-authenticate")).toBeNull();
+    expect(await unknownPost.json()).toEqual({ error: "invalid_client" });
+
+    // Unknown client with Basic header -> 401 with WWW-Authenticate
+    const unknownBasic = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Basic ${Buffer.from("nonexistent_client:secret").toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: basicAuth.code!,
+        code_verifier: basicVerifier,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(unknownBasic.status).toBe(401);
+    expect(unknownBasic.headers.get("www-authenticate")).toBe('Basic realm="c2c"');
+    expect(await unknownBasic.json()).toEqual({ error: "invalid_client" });
+
+    // BasicOnly client trying POST secret -> 401 with WWW-Authenticate: Basic
+    const basicWithPost = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: basicAuth.code!,
+        code_verifier: basicVerifier,
+        client_id: basicClient.client_id,
+        client_secret: basicClient.client_secret,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(basicWithPost.status).toBe(401);
+    expect(basicWithPost.headers.get("www-authenticate")).toBe('Basic realm="c2c"');
+    expect(await basicWithPost.json()).toEqual({ error: "invalid_client" });
+
+    // Mixing Basic header + POST client_secret -> 400 invalid_request
+    const validBasicHeader = `Basic ${Buffer.from(
+      `${encodeURIComponent(basicClient.client_id)}:${encodeURIComponent(basicClient.client_secret)}`
+    ).toString("base64")}`;
+    const mixedBasicAndPost = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: validBasicHeader,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: basicAuth.code!,
+        code_verifier: basicVerifier,
+        client_secret: basicClient.client_secret,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(mixedBasicAndPost.status).toBe(400);
+    expect(await mixedBasicAndPost.json()).toEqual({ error: "invalid_request" });
+
+    // Mixing Basic header + mismatched body client_id -> 400 invalid_request
+    const mixedClientId = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: validBasicHeader,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: basicAuth.code!,
+        code_verifier: basicVerifier,
+        client_id: postClient.client_id,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(mixedClientId.status).toBe(400);
+    expect(await mixedClientId.json()).toEqual({ error: "invalid_request" });
+
+    // Non-Basic Authorization scheme -> 400 invalid_request
+    const bearerHeader = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: "Bearer not-basic",
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: basicAuth.code!,
+        code_verifier: basicVerifier,
+        client_id: basicClient.client_id,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(bearerHeader.status).toBe(400);
+    expect(await bearerHeader.json()).toEqual({ error: "invalid_request" });
+
+    // Code is still intact and succeeds with proper Basic auth!
+    const basicValid = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: validBasicHeader,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: basicAuth.code!,
+        code_verifier: basicVerifier,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(basicValid.status).toBe(200);
+
+    // PostOnly client tests
+    const { verifier: postVerifier, challenge: postChallenge } = pkceVerifierAndChallenge();
+    const postAuth = await authorizeWithPairing(postClient.client_id, postChallenge, bridge.pairing.create().code);
+    expect(postAuth.code).toBeTruthy();
+
+    // PostOnly rejects Basic auth
+    const postWithBasic = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Basic ${Buffer.from(
+          `${encodeURIComponent(postClient.client_id)}:${encodeURIComponent(postClient.client_secret)}`
+        ).toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: postAuth.code!,
+        code_verifier: postVerifier,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(postWithBasic.status).toBe(401);
+    expect(await postWithBasic.json()).toEqual({ error: "invalid_client" });
+
+    // PostOnly rejects empty client_secret -> 400 invalid_request
+    const postEmptySecret = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: postAuth.code!,
+        code_verifier: postVerifier,
+        client_id: postClient.client_id,
+        client_secret: "",
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(postEmptySecret.status).toBe(400);
+    expect(await postEmptySecret.json()).toEqual({ error: "invalid_request" });
+
+    // PostOnly rejects wrong secret -> 401 without Basic challenge
+    const postWrongSecret = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: postAuth.code!,
+        code_verifier: postVerifier,
+        client_id: postClient.client_id,
+        client_secret: "wrong",
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(postWrongSecret.status).toBe(401);
+    expect(postWrongSecret.headers.get("www-authenticate")).toBeNull();
+    expect(await postWrongSecret.json()).toEqual({ error: "invalid_client" });
+
+    // PostOnly succeeds with valid POST secret
+    const postValid = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: postAuth.code!,
+        code_verifier: postVerifier,
+        client_id: postClient.client_id,
+        client_secret: postClient.client_secret,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(postValid.status).toBe(200);
+
+    // Public client (none) rejects POST secret and Basic auth
+    const { verifier: pubVerifier, challenge: pubChallenge } = pkceVerifierAndChallenge();
+    const pubAuth = await authorizeWithPairing(publicClientId, pubChallenge, bridge.pairing.create().code);
+    const pubWithSecret = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: pubAuth.code!,
+        code_verifier: pubVerifier,
+        client_id: publicClientId,
+        client_secret: "unexpected-secret",
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(pubWithSecret.status).toBe(401);
+    expect(await pubWithSecret.json()).toEqual({ error: "invalid_client" });
+  });
+
+  it("rejects non-string req.body fields and blocks unauthenticated concurrent refresh_token collision", async () => {
+    const reg = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "ConcurrentConfidential",
+        redirect_uris: [REDIRECT_URI],
+        token_endpoint_auth_method: "client_secret_basic",
+      }),
+    });
+    const client = (await reg.json()) as { client_id: string; client_secret: string };
+    const { verifier, challenge } = pkceVerifierAndChallenge();
+    const auth = await authorizeWithPairing(client.client_id, challenge, bridge.pairing.create().code);
+
+    const basicHeader = `Basic ${Buffer.from(
+      `${encodeURIComponent(client.client_id)}:${encodeURIComponent(client.client_secret)}`
+    ).toString("base64")}`;
+    const initialRes = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicHeader,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: auth.code!,
+        code_verifier: verifier,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    expect(initialRes.status).toBe(200);
+    const initial = (await initialRes.json()) as { refresh_token: string };
+
+    // Non-string client_id array injection via JSON -> 400 invalid_request
+    const arrayInjection = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: [client.client_id],
+        refresh_token: initial.refresh_token,
+      }),
+    });
+    expect(arrayInjection.status).toBe(400);
+    expect(await arrayInjection.json()).toEqual({ error: "invalid_request" });
+
+    // Non-object / array body -> 400 invalid_request
+    const arrayBody = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(["not-an-object"]),
+    });
+    expect(arrayBody.status).toBe(400);
+    expect(await arrayBody.json()).toEqual({ error: "invalid_request" });
+
+    // Concurrent refresh race: unauthenticated attacker vs legitimate Basic client
+    const [attackerRes, legitRes] = await Promise.all([
+      fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          client_id: client.client_id,
+          refresh_token: initial.refresh_token,
+        }),
+      }),
+      fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          authorization: basicHeader,
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: initial.refresh_token,
+        }),
+      }),
+    ]);
+
+    expect(attackerRes.status).toBe(401);
+    expect(attackerRes.headers.get("www-authenticate")).toBe('Basic realm="c2c"');
+    expect(await attackerRes.json()).toEqual({ error: "invalid_client" });
+
+    expect(legitRes.status).toBe(200);
+    const legitBody = (await legitRes.json()) as { access_token: string; refresh_token: string };
+    expect(legitBody.access_token).toMatch(/^c2c_at_/);
+    expect(legitBody.refresh_token).not.toBe(initial.refresh_token);
+  });
+
+  it("preserves existing refresh token in memory when AuthStore.refresh fails to persist to disk", () => {
+    const dir = makeTmpDir("auth-atomic-refresh");
+    try {
+      const store = new AuthStore("atomic-ws", { file: path.join(dir, "store.json") });
+      const client = store.registerClient({
+        clientName: "AtomicTest",
+        redirectUris: [REDIRECT_URI],
+        tokenEndpointAuthMethod: "none",
+      });
+      const issued = store.issueTokens({
+        clientId: client.clientId,
+        scopes: ["workspace.read", "offline_access"],
+      });
+      expect(issued.refreshToken).toBeTruthy();
+      const beforeCount = store.tokenCount();
+
+      const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementationOnce(() => {
+        throw new Error("ENOSPC: simulated disk write failure");
+      });
+      try {
+        expect(() => store.refresh(issued.refreshToken!, client.clientId)).toThrow("ENOSPC");
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      // Original tokens remain intact in memory and can still be refreshed after disk recovers
+      expect(store.tokenCount()).toBe(beforeCount);
+      expect(store.verifyAccessToken(issued.accessToken).ok).toBe(true);
+      const retry = store.refresh(issued.refreshToken!, client.clientId);
+      expect(retry.ok).toBe(true);
+      if (!retry.ok) throw new Error(retry.reason);
+      expect(retry.tokens.refreshToken).not.toBe(issued.refreshToken);
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("registers trusted local OAuth clients exclusively through the loopback admin endpoint", async () => {
+    const unauthenticated = await fetch(`${base}/admin/oauth-clients`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        clientName: "Gemini Admin Test",
+        redirectUris: ["https://gemini.google.com/callback"],
+      }),
+    });
+    expect(unauthenticated.status).toBe(404);
+
+    const createdResponse = await fetch(`${base}/admin/oauth-clients`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${bridge.adminToken}`,
+      },
+      body: JSON.stringify({
+        clientName: "Gemini Admin Test",
+        redirectUris: ["https://gemini.google.com/callback"],
+        tokenEndpointAuthMethod: "client_secret_basic",
+      }),
+    });
+    expect(createdResponse.status).toBe(201);
+    const created = (await createdResponse.json()) as {
+      clientId: string;
+      clientSecret: string;
+      tokenEndpointAuthMethod: string;
+    };
+    expect(created.clientId).toMatch(/^c2c_client_/);
+    expect(created.clientSecret).toMatch(/^c2c_cs_/);
+    expect(created.tokenEndpointAuthMethod).toBe("client_secret_basic");
+    expect(bridge.authStore.getClient(created.clientId)?.trustedLocalClient).toBe(true);
   });
 });

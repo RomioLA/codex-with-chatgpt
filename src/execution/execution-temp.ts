@@ -116,43 +116,72 @@ export class ExecutionTempOwner {
   create(jobId: string, bootId?: string): ExecutionTempLease {
     if (!JOB_ID_PATTERN.test(jobId)) throw new Error("TEMP_JOB_ID_INVALID");
     const rootIdentity = this.ensureRoot();
+    const authorityPath = this.jobAuthorityPath(jobId);
+    if (fs.existsSync(authorityPath)) throw new Error("TEMP_AUTHORITY_EXISTS");
     const directory = path.join(this.root, `tmp-${jobId}`);
     fs.mkdirSync(directory, { mode: 0o700 });
-    const stat = fs.lstatSync(directory, { bigint: true });
-    const canonical = fs.realpathSync.native(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || normalized(canonical) !== normalized(directory) ||
-        !ExecutionTempOwner.isContained(this.root, canonical) || stat.dev === 0n || stat.ino === 0n) {
-      throw new Error("TEMP_DIRECTORY_INVALID");
+    const markerPath = path.join(directory, JOB_MARKER);
+    let directoryIdentity: string | null = null;
+    let markerCreated = false;
+    let authorityCreated = false;
+    try {
+      const stat = fs.lstatSync(directory, { bigint: true });
+      const canonical = fs.realpathSync.native(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || normalized(canonical) !== normalized(directory) ||
+          !ExecutionTempOwner.isContained(this.root, canonical) || stat.dev === 0n || stat.ino === 0n) {
+        throw new Error("TEMP_DIRECTORY_INVALID");
+      }
+      directoryIdentity = `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
+      const nonce = randomBytes(32).toString("hex");
+      const createdAtMs = creationTimeMs(stat);
+      const normalizedBootId = typeof bootId === "string" && BOOT_ID_PATTERN.test(bootId)
+        ? bootId.toLowerCase()
+        : undefined;
+      const ownership: ExecutionTempOwnership = {
+        rootFileIdentity: rootIdentity,
+        directoryFileIdentity: directoryIdentity,
+        nonce,
+        createdAtMs,
+        ...(normalizedBootId ? { bootId: normalizedBootId } : {}),
+      };
+      const markerText = this.jobMarkerText(jobId, ownership);
+      fs.writeFileSync(markerPath, markerText, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      markerCreated = true;
+      fs.writeFileSync(authorityPath, this.jobAuthorityText(jobId, ownership), {
+        encoding: "utf8", mode: 0o600, flag: "wx",
+      });
+      authorityCreated = true;
+      const afterIdentity = fileIdentity(directory);
+      if (afterIdentity !== directoryIdentity || normalized(fs.realpathSync.native(directory)) !== normalized(directory)) {
+        throw new Error("TEMP_DIRECTORY_IDENTITY_CHANGED");
+      }
+      return {
+        ...ownership,
+        workspaceId: this.workspaceId,
+        jobId,
+        rootPath: this.root,
+        directoryPath: canonical,
+      };
+    } catch (error) {
+      if (authorityCreated) {
+        try { fs.unlinkSync(authorityPath); } catch { /* best-effort rollback */ }
+      }
+      if (markerCreated) {
+        try { fs.unlinkSync(markerPath); } catch { /* best-effort rollback */ }
+      }
+      if (directoryIdentity !== null) {
+        try {
+          const stat = fs.lstatSync(directory, { bigint: true });
+          const currentIdentity = `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
+          if (stat.isDirectory() && !stat.isSymbolicLink() && currentIdentity === directoryIdentity) {
+            fs.rmdirSync(directory);
+          }
+        } catch {
+          /* best-effort rollback */
+        }
+      }
+      throw error;
     }
-    const directoryIdentity = `${stat.dev.toString(16)}:${stat.ino.toString(16)}`;
-    const nonce = randomBytes(32).toString("hex");
-    const createdAtMs = creationTimeMs(stat);
-    const normalizedBootId = typeof bootId === "string" && BOOT_ID_PATTERN.test(bootId)
-      ? bootId.toLowerCase()
-      : undefined;
-    const ownership: ExecutionTempOwnership = {
-      rootFileIdentity: rootIdentity,
-      directoryFileIdentity: directoryIdentity,
-      nonce,
-      createdAtMs,
-      ...(normalizedBootId ? { bootId: normalizedBootId } : {}),
-    };
-    const markerText = this.jobMarkerText(jobId, ownership);
-    fs.writeFileSync(path.join(directory, JOB_MARKER), markerText, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    fs.writeFileSync(this.jobAuthorityPath(jobId), this.jobAuthorityText(jobId, ownership), {
-      encoding: "utf8", mode: 0o600, flag: "wx",
-    });
-    const afterIdentity = fileIdentity(directory);
-    if (afterIdentity !== directoryIdentity || normalized(fs.realpathSync.native(directory)) !== normalized(directory)) {
-      throw new Error("TEMP_DIRECTORY_IDENTITY_CHANGED");
-    }
-    return {
-      ...ownership,
-      workspaceId: this.workspaceId,
-      jobId,
-      rootPath: this.root,
-      directoryPath: canonical,
-    };
   }
 
   private jobMarkerText(jobId: string, ownership: ExecutionTempOwnership): string {

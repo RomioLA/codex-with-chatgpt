@@ -6,9 +6,9 @@ import { IgnoreRules } from "./ignore.js";
 import { Workspace, WorkspaceError } from "./manager.js";
 import {
   assertNoReparsePath,
-  readFileMaterial,
+  readFileMaterialWithStat,
   resolveGitExecutable,
-  verifyExecutable,
+  verifyExecutableWithStat,
   type GitExecutable,
 } from "../git-write/security.js";
 import { beginEventLoopTraceSpan, isEventLoopTraceEnabled } from "../diagnostics/event-loop-trace.js";
@@ -120,29 +120,36 @@ function resolveTrustedGitExecutable(root: string): GitExecutable | null {
         ) {
           return bound.executable;
         }
-        const verified = verifyExecutable(bound.executable);
-        const freshStat = fs.lstatSync(verified.path, { bigint: true });
+        const verified = verifyExecutableWithStat(bound.executable);
+        const executable: GitExecutable = {
+          path: verified.path,
+          fileIdentity: verified.fileIdentity,
+          hash: verified.hash,
+        };
         TRUSTED_GIT_MATERIALS.set(key, {
-          executable: verified,
-          size: freshStat.size,
-          mtimeNs: freshStat.mtimeNs,
-          ctimeNs: freshStat.ctimeNs,
+          executable,
+          size: verified.size,
+          mtimeNs: verified.mtimeNs,
+          ctimeNs: verified.ctimeNs,
         });
-        return verified;
+        return executable;
       } catch {
         TRUSTED_GIT_MATERIALS.delete(key);
         continue;
       }
     }
     try {
-      const material = readFileMaterial(absolute);
-      const trusted = { ...material, path: material.path };
-      const stat = fs.lstatSync(trusted.path, { bigint: true });
+      const material = readFileMaterialWithStat(absolute);
+      const trusted: GitExecutable = {
+        path: material.path,
+        fileIdentity: material.fileIdentity,
+        hash: material.hash,
+      };
       TRUSTED_GIT_MATERIALS.set(key, {
         executable: trusted,
-        size: stat.size,
-        mtimeNs: stat.mtimeNs,
-        ctimeNs: stat.ctimeNs,
+        size: material.size,
+        mtimeNs: material.mtimeNs,
+        ctimeNs: material.ctimeNs,
       });
       return trusted;
     } catch {
@@ -150,6 +157,143 @@ function resolveTrustedGitExecutable(root: string): GitExecutable | null {
     }
   }
   return null;
+}
+
+function reverifyExecutableBinding(root: string, expected: GitExecutable): boolean {
+  const key = process.platform === "win32" ? expected.path.toLowerCase() : expected.path;
+  const bound = TRUSTED_GIT_MATERIALS.get(key);
+  if (!bound) return false;
+  const current = resolveTrustedGitExecutable(root);
+  if (!current) return false;
+  const currentKey = process.platform === "win32" ? current.path.toLowerCase() : current.path;
+  return (
+    currentKey === key &&
+    current.fileIdentity === expected.fileIdentity &&
+    current.hash === expected.hash
+  );
+}
+
+function statSnapshotToken(filePath: string, expectedKind: "file" | "dir" | "any"): string | null {
+  try {
+    const stat = fs.lstatSync(filePath, { bigint: true });
+    if (stat.isSymbolicLink()) return null;
+    if (expectedKind === "file" && !stat.isFile()) return null;
+    if (expectedKind === "dir" && !stat.isDirectory()) return null;
+    return `${stat.dev.toString(16)}:${stat.ino.toString(16)}:${stat.size.toString()}:${stat.mtimeNs.toString()}:${stat.ctimeNs.toString()}`;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "missing";
+    return null;
+  }
+}
+
+function readBoundedSmallFile(filePath: string, maxBytes = 4096): string | null {
+  let handle: number | undefined;
+  try {
+    const stat = fs.lstatSync(filePath, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > BigInt(maxBytes)) return null;
+    handle = fs.openSync(filePath, "r");
+    const fstat = fs.fstatSync(handle, { bigint: true });
+    if (!fstat.isFile() || fstat.size > BigInt(maxBytes)) return null;
+    const buf = Buffer.allocUnsafe(Number(fstat.size));
+    let offset = 0;
+    while (offset < buf.length) {
+      const read = fs.readSync(handle, buf, offset, buf.length - offset, null);
+      if (read === 0) break;
+      offset += read;
+    }
+    return buf.subarray(0, offset).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+}
+
+function snapshotEffectiveGitConfigFiles(root: string): string | null {
+  const tokens: string[] = [];
+  const resolvedRoot = path.resolve(root);
+  const rootAttrs = statSnapshotToken(path.join(resolvedRoot, ".gitattributes"), "file");
+  if (rootAttrs === null) return null;
+  tokens.push(`root-attrs=${rootAttrs}`);
+
+  let current = resolvedRoot;
+  for (let depth = 0; depth < 64; depth += 1) {
+    const dotGitPath = path.join(current, ".git");
+    let dotGitStat: fs.BigIntStats;
+    try {
+      dotGitStat = fs.lstatSync(dotGitPath, { bigint: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        tokens.push(`dotgit@${depth}=missing`);
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        current = parent;
+        continue;
+      }
+      return null;
+    }
+
+    if (dotGitStat.isSymbolicLink()) return null;
+    tokens.push(
+      `dotgit@${depth}=${dotGitStat.dev.toString(16)}:${dotGitStat.ino.toString(16)}:${dotGitStat.size.toString()}:${dotGitStat.mtimeNs.toString()}:${dotGitStat.ctimeNs.toString()}`
+    );
+
+    const topAttrs = statSnapshotToken(path.join(current, ".gitattributes"), "file");
+    if (topAttrs === null) return null;
+    tokens.push(`top-attrs=${topAttrs}`);
+
+    let gitDir: string | null = null;
+    if (dotGitStat.isDirectory()) {
+      gitDir = dotGitPath;
+    } else if (dotGitStat.isFile()) {
+      const gitFile = readBoundedSmallFile(dotGitPath);
+      if (gitFile === null) return null;
+      const match = /^gitdir:\s*(.+)$/im.exec(gitFile.trim());
+      if (!match?.[1]) return null;
+      gitDir = path.resolve(current, match[1].trim());
+      const gitDirToken = statSnapshotToken(gitDir, "dir");
+      if (gitDirToken === null || gitDirToken === "missing") return null;
+      tokens.push(`gitdir=${gitDirToken}`);
+    } else {
+      return null;
+    }
+
+    const repoConfig = statSnapshotToken(path.join(gitDir, "config"), "file");
+    const infoAttrs = statSnapshotToken(path.join(gitDir, "info", "attributes"), "file");
+    if (repoConfig === null || infoAttrs === null) return null;
+    tokens.push(`repo-config=${repoConfig}`, `info-attrs=${infoAttrs}`);
+
+    const commonDirPath = path.join(gitDir, "commondir");
+    const commonDirStat = statSnapshotToken(commonDirPath, "file");
+    if (commonDirStat === null) return null;
+    if (commonDirStat !== "missing") {
+      const commonDirText = readBoundedSmallFile(commonDirPath);
+      if (commonDirText === null) return null;
+      const commonDir = path.resolve(gitDir, commonDirText.trim());
+      const commonConfig = statSnapshotToken(path.join(commonDir, "config"), "file");
+      const commonAttrs = statSnapshotToken(path.join(commonDir, "info", "attributes"), "file");
+      if (commonConfig === null || commonAttrs === null) return null;
+      tokens.push(`common=${commonDirStat}`, `common-config=${commonConfig}`, `common-attrs=${commonAttrs}`);
+    }
+    break;
+  }
+
+  const homeDirs = [...new Set([os.homedir(), process.env.HOME, process.env.USERPROFILE].filter((v): v is string => Boolean(v?.trim())))];
+  for (const homeDir of homeDirs) {
+    const gitConfigToken = statSnapshotToken(path.join(homeDir, ".gitconfig"), "file");
+    if (gitConfigToken === null) return null;
+    tokens.push(`home-gitconfig=${gitConfigToken}`);
+  }
+
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), ".config");
+  const xdgConfigToken = statSnapshotToken(path.join(xdgConfigHome, "git", "config"), "file");
+  const xdgAttrsToken = statSnapshotToken(path.join(xdgConfigHome, "git", "attributes"), "file");
+  if (xdgConfigToken === null || xdgAttrsToken === null) return null;
+  tokens.push(`xdg-config=${xdgConfigToken}`, `xdg-attrs=${xdgAttrsToken}`);
+
+  return tokens.join("|");
 }
 
 type GitOperationClass = "rev-parse" | "status" | "diff" | "config" | "other";
@@ -237,7 +381,7 @@ interface AsyncSpawnOutcome {
 }
 
 function spawnGitAsync(
-  executable: string,
+  executable: GitExecutable,
   root: string,
   args: string[],
   env: NodeJS.ProcessEnv,
@@ -245,6 +389,9 @@ function spawnGitAsync(
 ): Promise<AsyncSpawnOutcome> {
   if (deadlineAt !== undefined && performance.now() >= deadlineAt) {
     return Promise.reject(new WorkspaceError("DEADLINE", "Git read deadline exceeded"));
+  }
+  if (!reverifyExecutableBinding(root, executable)) {
+    return Promise.reject(new WorkspaceError("GIT_EXECUTABLE_UNTRUSTED", "Unable to establish a trusted Git executable."));
   }
   const remainingMs = deadlineAt === undefined ? 30_000 : Math.max(1, Math.floor(deadlineAt - performance.now()));
   const span = isEventLoopTraceEnabled()
@@ -265,7 +412,7 @@ function spawnGitAsync(
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(executable, args, {
+      child = spawn(executable.path, args, {
         cwd: root,
         env,
         windowsHide: true,
@@ -279,16 +426,12 @@ function spawnGitAsync(
       return;
     }
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill(); } catch { /* process may already have exited */ }
-    }, remainingMs);
-    timer.unref?.();
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       const effectiveStatus = timedOut || bufferExceeded || spawnError ? null : code;
       const exitStatusCategory = bufferExceeded
         ? "signal"
@@ -317,33 +460,57 @@ function spawnGitAsync(
       });
     };
 
+    const onStdoutData = (chunk: Buffer): void => handleChunk(chunk, true);
+    const onStderrData = (chunk: Buffer): void => handleChunk(chunk, false);
+
+    const terminateAndSettle = (reason: "timeout" | "maxBuffer"): void => {
+      if (settled) return;
+      if (reason === "timeout") {
+        timedOut = true;
+      } else {
+        bufferExceeded = true;
+      }
+      stdoutChunks.length = 0;
+      stderrChunks.length = 0;
+      child.stdout?.off("data", onStdoutData);
+      child.stderr?.off("data", onStderrData);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref?.();
+      try {
+        if (!child.kill("SIGKILL")) child.kill();
+      } catch {
+        try { child.kill(); } catch { /* process may already have exited */ }
+      }
+      finish(null, "SIGKILL");
+    };
+
     const handleChunk = (chunk: Buffer, isStdout: boolean): void => {
       if (settled || bufferExceeded) return;
       if (isStdout) {
         stdoutBytes += chunk.byteLength;
         if (stdoutBytes > MAX_GIT_BUFFER_BYTES) {
-          bufferExceeded = true;
-          stdoutChunks.length = 0;
-          stderrChunks.length = 0;
-          try { child.kill(); } catch { /* process may already have exited */ }
+          terminateAndSettle("maxBuffer");
           return;
         }
         stdoutChunks.push(chunk);
       } else {
         stderrBytes += chunk.byteLength;
         if (stderrBytes > MAX_GIT_BUFFER_BYTES) {
-          bufferExceeded = true;
-          stdoutChunks.length = 0;
-          stderrChunks.length = 0;
-          try { child.kill(); } catch { /* process may already have exited */ }
+          terminateAndSettle("maxBuffer");
           return;
         }
         stderrChunks.push(chunk);
       }
     };
 
-    child.stdout?.on("data", (chunk: Buffer) => handleChunk(chunk, true));
-    child.stderr?.on("data", (chunk: Buffer) => handleChunk(chunk, false));
+    timer = setTimeout(() => {
+      terminateAndSettle("timeout");
+    }, remainingMs);
+    timer.unref?.();
+
+    child.stdout?.on("data", onStdoutData);
+    child.stderr?.on("data", onStderrData);
     child.on("error", (error) => {
       spawnError = error;
       finish(null, null);
@@ -393,7 +560,7 @@ function getFilterExecutionConfigKeys(
 async function getFilterExecutionConfigKeysAsync(
   root: string,
   env: NodeJS.ProcessEnv,
-  executable: string,
+  executable: GitExecutable,
   deadlineAt?: number
 ): Promise<string[] | null> {
   const result = await spawnGitAsync(executable, root, FILTER_CONFIG_ARGS, env, deadlineAt);
@@ -433,8 +600,20 @@ function buildFilteredGitArgs(args: string[], filterKeys: string[]): string[] {
 export function runGit(root: string, args: string[], options: GitReadOptions = {}): GitCommandResult {
   const { executable, env } = prepareGitExecution(root, options);
   let safeArgs = [...SAFE_GIT_GLOBAL_ARGS, ...args];
+  const needsFilterPolicy = args[0] === "diff" || args[0] === "status";
+  let configBefore: string | null = null;
 
-  if (args[0] === "diff" || args[0] === "status") {
+  if (needsFilterPolicy) {
+    configBefore = snapshotEffectiveGitConfigFiles(root);
+    if (configBefore === null) {
+      assertGitDeadline(options);
+      return {
+        ok: false,
+        stdout: "",
+        stderr: "Unable to establish a stable Git configuration policy",
+        code: null,
+      };
+    }
     const filterKeys = getFilterExecutionConfigKeys(root, env, executable.path, options.deadlineAt);
     if (filterKeys === null) {
       assertGitDeadline(options);
@@ -445,6 +624,9 @@ export function runGit(root: string, args: string[], options: GitReadOptions = {
         code: null,
       };
     }
+    if (!reverifyExecutableBinding(root, executable)) {
+      throw new WorkspaceError("GIT_EXECUTABLE_UNTRUSTED", "Unable to establish a trusted Git executable.");
+    }
     safeArgs = buildFilteredGitArgs(args, filterKeys);
   }
 
@@ -454,6 +636,17 @@ export function runGit(root: string, args: string[], options: GitReadOptions = {
   if (options.deadlineAt !== undefined &&
     (timedOut || performance.now() >= options.deadlineAt)) {
     throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+  }
+  if (needsFilterPolicy) {
+    const configAfter = snapshotEffectiveGitConfigFiles(root);
+    if (configAfter === null || configAfter !== configBefore) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: "Unable to establish a stable Git configuration policy",
+        code: null,
+      };
+    }
   }
   return {
     ok: result.status === 0,
@@ -466,9 +659,21 @@ export function runGit(root: string, args: string[], options: GitReadOptions = {
 export async function runGitAsync(root: string, args: string[], options: GitReadOptions = {}): Promise<GitCommandResult> {
   const { executable, env } = prepareGitExecution(root, options);
   let safeArgs = [...SAFE_GIT_GLOBAL_ARGS, ...args];
+  const needsFilterPolicy = args[0] === "diff" || args[0] === "status";
+  let configBefore: string | null = null;
 
-  if (args[0] === "diff" || args[0] === "status") {
-    const filterKeys = await getFilterExecutionConfigKeysAsync(root, env, executable.path, options.deadlineAt);
+  if (needsFilterPolicy) {
+    configBefore = snapshotEffectiveGitConfigFiles(root);
+    if (configBefore === null) {
+      assertGitDeadline(options);
+      return {
+        ok: false,
+        stdout: "",
+        stderr: "Unable to establish a stable Git configuration policy",
+        code: null,
+      };
+    }
+    const filterKeys = await getFilterExecutionConfigKeysAsync(root, env, executable, options.deadlineAt);
     if (filterKeys === null) {
       assertGitDeadline(options);
       return {
@@ -478,11 +683,14 @@ export async function runGitAsync(root: string, args: string[], options: GitRead
         code: null,
       };
     }
+    if (!reverifyExecutableBinding(root, executable)) {
+      throw new WorkspaceError("GIT_EXECUTABLE_UNTRUSTED", "Unable to establish a trusted Git executable.");
+    }
     safeArgs = buildFilteredGitArgs(args, filterKeys);
   }
 
   assertGitDeadline(options);
-  const result = await spawnGitAsync(executable.path, root, safeArgs, env, options.deadlineAt);
+  const result = await spawnGitAsync(executable, root, safeArgs, env, options.deadlineAt);
   if (options.deadlineAt !== undefined &&
     (result.timedOut || performance.now() >= options.deadlineAt)) {
     throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
@@ -494,6 +702,17 @@ export async function runGitAsync(root: string, args: string[], options: GitRead
       stderr: result.stderr,
       code: null,
     };
+  }
+  if (needsFilterPolicy) {
+    const configAfter = snapshotEffectiveGitConfigFiles(root);
+    if (configAfter === null || configAfter !== configBefore) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: "Unable to establish a stable Git configuration policy",
+        code: null,
+      };
+    }
   }
   return {
     ok: result.status === 0,
@@ -1013,29 +1232,12 @@ function paginateGitDiff(
   maxBytes: number,
   options: GitReadOptions
 ): GitDiffResult {
-  const full = Buffer.from(combinedDiff, "utf8");
-  const slice = full.subarray(offset, offset + maxBytes);
-  let text = slice.toString("utf8");
-  let sliceLen = slice.length;
-  // Avoid cutting mid-line when more content follows.
-  if (offset + sliceLen < full.length) {
-    const lastNewline = text.lastIndexOf("\n");
-    if (lastNewline > 0) {
-      text = text.slice(0, lastNewline + 1);
-      sliceLen = Buffer.byteLength(text, "utf8");
-    }
-  }
-  const hasMore = offset + sliceLen < full.length;
+  const page = paginateCompareDiff(combinedDiff, offset, maxBytes);
   assertGitDeadline(options);
   return {
     isRepo: true,
     mode,
-    totalBytes: full.length,
-    offset,
-    returnedBytes: sliceLen,
-    hasMore,
-    nextOffset: hasMore ? offset + sliceLen : null,
-    diff: text,
+    ...page,
   };
 }
 

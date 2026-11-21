@@ -18,6 +18,18 @@ export interface GitExecutable extends GitWriteMaterial {
   path: string;
 }
 
+export interface GitMaterialWithStat extends GitWriteMaterial {
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+export interface GitExecutableWithStat extends GitExecutable {
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : os.devNull;
 
 const GIT_WRITE_ENVIRONMENT_BASE: Record<string, string> = {
@@ -138,7 +150,7 @@ export function assertNoReparsePath(input: string, allowMissingTail = false): st
   return absolute;
 }
 
-export function readFileMaterial(input: string, maxBytes = Number.POSITIVE_INFINITY): GitWriteMaterial {
+export function readFileMaterialWithStat(input: string, maxBytes = Number.POSITIVE_INFINITY): GitMaterialWithStat {
   const absolute = assertNoReparsePath(input);
   let handle: number | undefined;
   try {
@@ -166,6 +178,9 @@ export function readFileMaterial(input: string, maxBytes = Number.POSITIVE_INFIN
       path: absolute,
       fileIdentity: `${before.dev.toString(16)}:${before.ino.toString(16)}`,
       hash: hash.digest("hex"),
+      size: after.size,
+      mtimeNs: after.mtimeNs,
+      ctimeNs: after.ctimeNs,
     };
   } catch (error) {
     if (error instanceof GitWriteError) throw error;
@@ -173,6 +188,11 @@ export function readFileMaterial(input: string, maxBytes = Number.POSITIVE_INFIN
   } finally {
     if (handle !== undefined) fs.closeSync(handle);
   }
+}
+
+export function readFileMaterial(input: string, maxBytes = Number.POSITIVE_INFINITY): GitWriteMaterial {
+  const { path: filePath, fileIdentity, hash } = readFileMaterialWithStat(input, maxBytes);
+  return { path: filePath, fileIdentity, hash };
 }
 
 function pathHasNoReparseComponents(input: string): boolean {
@@ -244,12 +264,17 @@ export function captureGitBundleCriticalMaterials(executable: GitExecutable, cwd
   return materials;
 }
 
-export function verifyExecutable(expected: GitExecutable): GitExecutable {
-  const current = readFileMaterial(expected.path);
+export function verifyExecutableWithStat(expected: GitExecutable): GitExecutableWithStat {
+  const current = readFileMaterialWithStat(expected.path);
   if (current.fileIdentity !== expected.fileIdentity || current.hash !== expected.hash) {
     throw new GitWriteError("GIT_EXECUTABLE_CHANGED");
   }
   return { ...current, path: expected.path };
+}
+
+export function verifyExecutable(expected: GitExecutable): GitExecutable {
+  const { path: filePath, fileIdentity, hash } = verifyExecutableWithStat(expected);
+  return { path: filePath, fileIdentity, hash };
 }
 
 export function buildCommonGitArgs(

@@ -78,22 +78,42 @@ export function executionScopeChallenge(resourceMetadataUri: string, scope: OAut
     `error_description=${quote(`This operation requires the '${scope}' scope.`)}, scope=${quote(scope)}`;
 }
 
+const sharedToolsListCache = new Map<string, ReturnType<typeof ListToolsResultSchema.parse>>();
+const MAX_SHARED_TOOLS_LIST_CACHE_ENTRIES = 32;
+
+function deepFreeze<T>(obj: T): T {
+  if (obj === null || typeof obj !== "object" || Object.isFrozen(obj)) {
+    return obj;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      deepFreeze(item);
+    }
+  } else {
+    for (const key of Object.keys(obj)) {
+      deepFreeze((obj as Record<string, unknown>)[key]);
+    }
+  }
+  return Object.freeze(obj);
+}
+
 /**
  * SDK 1.30 preserves _meta but does not emit top-level securitySchemes.
  * Decorate its public tools/list handler during registration, retaining the
  * SDK's schemas, annotations, enabled filtering, and tools/call validation.
  * No private SDK fields or dependency upgrade are needed.
  */
-export function installExecutionOAuthListing(server: McpServer): () => void {
+export function installExecutionOAuthListing(server: McpServer, sharedCacheKey?: string): () => void {
   const original = server.server.setRequestHandler;
   const register = original.bind(server.server);
   server.server.setRequestHandler = (schema, handler) => {
     if (!Object.is(schema, ListToolsRequestSchema)) return register(schema, handler);
-    let cachedUnpaginatedResult: ReturnType<typeof ListToolsResultSchema.parse> | null = null;
+    let localCache: ReturnType<typeof ListToolsResultSchema.parse> | null = null;
     register(schema, async (request, extra) => {
       const cursor = (request as { params?: { cursor?: string } } | undefined)?.params?.cursor;
-      if (!cursor && cachedUnpaginatedResult) {
-        return cachedUnpaginatedResult;
+      if (!cursor) {
+        const cached = sharedCacheKey ? sharedToolsListCache.get(sharedCacheKey) : localCache;
+        if (cached) return cached;
       }
       const result = ListToolsResultSchema.parse(await handler(request, extra));
       const transformed = {
@@ -105,7 +125,15 @@ export function installExecutionOAuthListing(server: McpServer): () => void {
         }),
       };
       if (!cursor && !transformed.nextCursor) {
-        cachedUnpaginatedResult = transformed;
+        const frozen = deepFreeze(transformed);
+        if (sharedCacheKey) {
+          if (sharedToolsListCache.has(sharedCacheKey) || sharedToolsListCache.size < MAX_SHARED_TOOLS_LIST_CACHE_ENTRIES) {
+            sharedToolsListCache.set(sharedCacheKey, frozen);
+          }
+        } else {
+          localCache = frozen;
+        }
+        return frozen;
       }
       return transformed;
     });

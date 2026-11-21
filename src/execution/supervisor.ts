@@ -26,7 +26,7 @@ import { transitionExecutionJob } from "./state-machine.js";
 import { NativeRunnerCleanupError, NativeRunnerOutputError, WindowsNativeExecutionRunner, type NativeRunnerHandle, type NativeRunnerRequest } from "./native-runner.js";
 import { ExecutionTempOwner, type ExecutionTempLease } from "./execution-temp.js";
 import type { runExecutionTempCleanup } from "./execution-temp-cleanup.js";
-import { readWindowsSessionIdentitySync } from "../host-observation/windows.js";
+import { getCachedWindowsBootId, readWindowsBootIdAsync } from "../host-observation/windows.js";
 import { StreamingSanitizer } from "./stream-sanitize.js";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
@@ -52,26 +52,6 @@ const BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 
 function normalizeBootId(value: unknown): string | null {
   return typeof value === "string" && BOOT_ID_PATTERN.test(value) ? value.toLowerCase() : null;
-}
-
-let cachedHostBootId: string | null = null;
-
-function getHostBootIdCached(): string | null {
-  if (cachedHostBootId !== null) return cachedHostBootId;
-  try {
-    const identity = readWindowsSessionIdentitySync();
-    const rawBootId = identity && typeof identity === "object"
-      ? (identity as Record<string, unknown>).bootId
-      : undefined;
-    const normalized = normalizeBootId(rawBootId);
-    if (normalized !== null) {
-      cachedHostBootId = normalized;
-      return normalized;
-    }
-  } catch {
-    // Do not cache transient/invalid reads.
-  }
-  return null;
 }
 
 function recoveryEvidence(treeConfirmed: boolean, cleanupConfirmed: boolean): ExecutionRecoveryEvidence | undefined {
@@ -229,6 +209,7 @@ export class ExecutionSupervisor {
   private accepting = true;
   private closed = false;
   private permissionTimer: NodeJS.Timeout | null = null;
+  private bootIdRefreshScheduled = false;
 
   constructor(
     readonly workspace: Workspace,
@@ -248,6 +229,9 @@ export class ExecutionSupervisor {
     this.store = options.store ?? new ExecutionJobStore(workspace.id);
     this.tempOwner = new ExecutionTempOwner(this.store.directory, workspace.id, options.tempCleanupImpl);
     this.reconcileRecoveredTemps();
+    if (this.configuredBootId === undefined && getCachedWindowsBootId() === null) {
+      void readWindowsBootIdAsync();
+    }
     this.runner = options.runner ?? new WindowsNativeExecutionRunner();
     this.permissionPollMs = options.permissionPollMs ?? EXECUTION_PERMISSION_POLL_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? EXECUTION_CANCEL_GRACE_MS;
@@ -266,11 +250,18 @@ export class ExecutionSupervisor {
   private readonly cancelGraceMs: number;
   private readonly now: () => number;
 
-  private resolveCurrentBootId(): string | null {
+  private peekCurrentBootId(): string | null {
     if (this.configuredBootId !== undefined) {
       return normalizeBootId(this.configuredBootId);
     }
-    return getHostBootIdCached();
+    return getCachedWindowsBootId();
+  }
+
+  private async resolveCurrentBootIdAsync(): Promise<string | null> {
+    if (this.configuredBootId !== undefined) {
+      return normalizeBootId(this.configuredBootId);
+    }
+    return getCachedWindowsBootId() ?? await readWindowsBootIdAsync();
   }
 
   private syncPermissionPolling(): void {
@@ -759,13 +750,18 @@ export class ExecutionSupervisor {
     if (job.state === "running") {
       const active = this.active.get(jobId);
       if (!active) return { ok: false, error: "CANCEL_NOT_ALLOWED" };
-      active.intent = "cancelled";
-      this.store.replace(transitionExecutionJob(job, "cancelling"));
-      active.handle.cancel();
-      this.armCancelGrace(jobId, active);
-      return { ok: true, job: this.store.get(jobId)! };
+      this.transitionToCancelling(job, active, "cancelled");
+      return { ok: true, job: this.store.get(jobId) ?? job };
     }
-    if (job.state === "cancelling") return { ok: true, job };
+    if (job.state === "cancelling") {
+      const active = this.active.get(jobId);
+      if (active && !active.graceTimer) {
+        if (!active.intent) active.intent = "cancelled";
+        active.handle.cancel();
+        this.armCancelGrace(jobId, active);
+      }
+      return { ok: true, job };
+    }
     return { ok: false, error: "CANCEL_NOT_ALLOWED" };
   }
 
@@ -844,12 +840,14 @@ export class ExecutionSupervisor {
     let trustedCommand: TrustedCommand | undefined;
     let genericCommand: GenericCommand | undefined;
     let releaseWriteLock: (() => void) | undefined;
+    let currentBootId: string | undefined;
     try {
       if (isFullAccessExecutionJob(job)) {
         const queuedFullAccessJob = job;
         const initialGrantValid = this.hasCurrentFullAccessGrant(queuedFullAccessJob);
         if (!initialGrantValid) throw new Error("FULL_ACCESS_REQUIRED");
         await verifyFullAccessCommand(queuedFullAccessJob.fullAccessCommand);
+        currentBootId = (await this.resolveCurrentBootIdAsync()) ?? undefined;
         const current = this.store.get(queuedFullAccessJob.jobId);
         if (!current || current.state !== "queued" || !isFullAccessExecutionJob(current)) {
           releaseGlobalSlot(workspaceSlot, slotReservation);
@@ -865,6 +863,10 @@ export class ExecutionSupervisor {
           releaseWriteLock = acquireRepositoryWriteLock(repository, job.jobId);
         }
       } else {
+        currentBootId = this.peekCurrentBootId() ?? undefined;
+        if (currentBootId === undefined && this.configuredBootId === undefined) {
+          void readWindowsBootIdAsync();
+        }
         repository = resolveRepositoryIdentity(this.workspace, job.repositoryPath);
         if (repository.identity !== job.repositoryIdentity) throw new RepositoryIdentityError("PATH_CHANGED");
         if (job.authorization) {
@@ -915,7 +917,10 @@ export class ExecutionSupervisor {
     const fullAccessJob = isFullAccessExecutionJob(job);
     let running: ExecutionJob;
     try {
-      running = transitionExecutionJob(job, "running", { failureCode: null });
+      running = transitionExecutionJob({
+        ...job,
+        ...(currentBootId ? { bootId: currentBootId } : {}),
+      }, "running", { failureCode: null });
       this.store.replace(running);
     } catch (error) {
       releaseWriteLock?.();
@@ -925,8 +930,9 @@ export class ExecutionSupervisor {
     const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
     let active!: ActiveExecution;
     let tempLease: ExecutionTempLease | undefined;
+    let tempCreateAttempted = false;
     try {
-      const currentBootId = this.resolveCurrentBootId() ?? undefined;
+      tempCreateAttempted = true;
       tempLease = this.tempOwner.create(job.jobId, currentBootId);
       const tempOwnership: ExecutionTempOwnership = {
         rootFileIdentity: tempLease.rootFileIdentity,
@@ -937,7 +943,6 @@ export class ExecutionSupervisor {
       };
       this.store.replace({
         ...running,
-        ...(currentBootId ? { bootId: currentBootId } : {}),
         tempOwnership,
       });
       const fullAccessGitAuthorization = isFullAccessGitAuthorization(job.authorization)
@@ -1045,6 +1050,8 @@ export class ExecutionSupervisor {
       if (tempLease) {
         tempCleaned = !fs.existsSync(tempLease.directoryPath) ||
           this.tempOwner.cleanup(job.jobId, tempLease, undefined, true);
+      } else if (tempCreateAttempted) {
+        tempCleaned = !fs.existsSync(path.join(this.tempOwner.root, `tmp-${job.jobId}`));
       }
       if (tempCleaned) {
         const failed = transitionExecutionJob({ ...persisted, tempOwnership: null }, "failed", {
@@ -1255,7 +1262,25 @@ export class ExecutionSupervisor {
     const recordedBootIdOf = (job: ExecutionJob): string | null =>
       normalizeBootId(job.tempOwnership?.bootId) ?? normalizeBootId(job.bootId);
     const hasRecordedBootId = interruptedJobs.some((job) => recordedBootIdOf(job) !== null);
-    const currentBootId = hasRecordedBootId ? this.resolveCurrentBootId() : null;
+    const currentBootId = hasRecordedBootId ? this.peekCurrentBootId() : null;
+    if (hasRecordedBootId && currentBootId === null && this.configuredBootId === undefined && !this.bootIdRefreshScheduled) {
+      this.bootIdRefreshScheduled = true;
+      void readWindowsBootIdAsync().then((bootId) => {
+        this.bootIdRefreshScheduled = false;
+        if (bootId !== null && !this.closed && !this.store.corruption) {
+          try {
+            this.reconcileRecoveredTemps();
+          } catch (error) {
+            this.logger.error("Failed to reconcile recovered temps after async bootId read", {
+              workspaceId: this.workspace.id,
+              error: cleanCode((error as Error).message),
+            });
+          }
+        }
+      }, () => {
+        this.bootIdRefreshScheduled = false;
+      });
+    }
 
     const crossBootByJobId = new Map<string, boolean>();
     const records: Array<{ jobId: string; ownership: ExecutionTempOwnership }> = [];
@@ -1354,17 +1379,37 @@ export class ExecutionSupervisor {
     try { const final = this.store.get(jobId); if (final) archiveGitJobPlan(this.workspace, final); } catch { /* no automatic cleanup of unknown evidence */ }
   }
 
+  private transitionToCancelling(job: ExecutionJob, active: ActiveExecution, intent: "cancelled" | "timed_out"): void {
+    active.intent = intent;
+    try {
+      this.store.replace(transitionExecutionJob(job, "cancelling"));
+    } catch (error) {
+      this.logger.error("Failed to persist cancelling transition", {
+        workspaceId: this.workspace.id,
+        jobId: job.jobId,
+        intent,
+        error: cleanCode((error as Error).message),
+      });
+    } finally {
+      active.handle.cancel();
+      this.armCancelGrace(job.jobId, active);
+    }
+  }
+
   private requestTermination(jobId: string, active: ActiveExecution, intent: "cancelled" | "timed_out"): void {
     const job = this.store.get(jobId);
     if (!job || job.finishedAt || this.active.get(jobId) !== active) return;
     if (job.state === "running") {
-      active.intent = intent;
-      this.store.replace(transitionExecutionJob(job, "cancelling"));
-      active.handle.cancel();
-      this.armCancelGrace(jobId, active);
+      this.transitionToCancelling(job, active, intent);
       return;
     }
-    if (job.state === "cancelling" && intent === "timed_out") active.intent = "timed_out";
+    if (job.state === "cancelling") {
+      if (intent === "timed_out" || !active.intent) active.intent = intent;
+      if (!active.graceTimer) {
+        active.handle.cancel();
+        this.armCancelGrace(jobId, active);
+      }
+    }
   }
 
   private armCancelGrace(jobId: string, active: ActiveExecution): void {
@@ -1381,13 +1426,26 @@ export class ExecutionSupervisor {
 
   private cancelQueuedForDowngrade(): void {
     for (const job of this.queuedJobs()) {
-      this.store.replace(transitionExecutionJob(job, "cancelled", { failureCode: "PERMISSION_DOWNGRADED" }));
-      this.auditControlledCompletion(job.jobId);
+      try {
+        this.store.replace(transitionExecutionJob(job, "cancelled", { failureCode: "PERMISSION_DOWNGRADED" }));
+        this.auditControlledCompletion(job.jobId);
+      } catch (error) {
+        this.logger.error("Failed to cancel queued job during permission downgrade", {
+          workspaceId: this.workspace.id,
+          jobId: job.jobId,
+          error: cleanCode((error as Error).message),
+        });
+      }
     }
     for (const [jobId, active] of this.active) {
-      if (active.intent) continue;
       const job = this.store.get(jobId);
-      if (job?.state === "running") this.requestTermination(jobId, active, "cancelled");
+      if (!job) continue;
+      if (job.state === "cancelling" && !active.graceTimer) {
+        this.requestTermination(jobId, active, "cancelled");
+        continue;
+      }
+      if (active.intent) continue;
+      if (job.state === "running") this.requestTermination(jobId, active, "cancelled");
     }
   }
 

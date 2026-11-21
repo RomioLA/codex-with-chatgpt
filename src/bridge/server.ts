@@ -46,6 +46,17 @@ function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider
   return new CloudflaredQuickTunnel(logger);
 }
 
+function isAllowedAdminRedirectUri(uri: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  return parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+}
+
 export interface BridgeOptions {
   workspaceRoot: string;
   port?: number;
@@ -336,6 +347,64 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     res.json({ revoked: count });
   });
 
+  app.post("/admin/oauth-clients", adminGuard, express.json({ limit: "4kb" }), (req, res) => {
+    const body = req.body as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      res.status(400).json({
+        error: "INVALID_REQUEST",
+        code: "INVALID_REQUEST",
+        message: "Request body must be a JSON object.",
+      });
+      return;
+    }
+    const record = body as Record<string, unknown>;
+    const clientName = typeof record.clientName === "string" && record.clientName.trim().length > 0
+      ? record.clientName.trim().slice(0, 200)
+      : undefined;
+    const rawUris = record.redirectUris;
+    if (
+      !Array.isArray(rawUris) ||
+      rawUris.length === 0 ||
+      rawUris.length > 32 ||
+      !rawUris.every((uri) => typeof uri === "string" && isAllowedAdminRedirectUri(uri))
+    ) {
+      res.status(400).json({
+        error: "INVALID_REDIRECT_URI",
+        code: "INVALID_REDIRECT_URI",
+        message: "redirectUris must be 1..32 HTTPS or localhost callback URLs.",
+      });
+      return;
+    }
+    const methodRaw = record.tokenEndpointAuthMethod;
+    const tokenEndpointAuthMethod = methodRaw === undefined
+      ? "client_secret_basic"
+      : methodRaw === "none" || methodRaw === "client_secret_post" || methodRaw === "client_secret_basic"
+        ? methodRaw
+        : null;
+    if (!tokenEndpointAuthMethod) {
+      res.status(400).json({
+        error: "INVALID_AUTH_METHOD",
+        code: "INVALID_AUTH_METHOD",
+        message: "Unsupported tokenEndpointAuthMethod.",
+      });
+      return;
+    }
+    const registered = authStore.registerClient({
+      clientName,
+      redirectUris: rawUris as string[],
+      tokenEndpointAuthMethod,
+      trustedLocalClient: true,
+    });
+    logger.info(`Pre-registered trusted local OAuth client ${registered.clientId} (${registered.clientName ?? "unnamed"})`);
+    res.status(201).json({
+      clientId: registered.clientId,
+      clientName: registered.clientName ?? null,
+      clientSecret: registered.clientSecret ?? null,
+      redirectUris: registered.redirectUris,
+      tokenEndpointAuthMethod,
+    });
+  });
+
   // ---- Level2 local permission control plane (loopback + admin token only) --
   //
   // This is the Bridge's own Level 2 grant authority and the ONLY supported way
@@ -378,8 +447,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     logger.info(`Permission control applied effectiveMode=${applied.effectiveMode} baseline=${applied.baselineMode}`);
     try {
       executionSupervisor?.reconcilePermission();
-    } catch {
-      /* reconcilePermission persists conservative downgrade decisions on failure */
+    } catch (error) {
+      logger.warn("Permission reconciliation encountered a persistence error after mode change", {
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
     res.json({
       workspaceId: workspace.id,

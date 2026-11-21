@@ -39,6 +39,7 @@ export interface ClientRegistration {
   createdAt: string;
   clientSecretHash?: string;
   tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
+  trustedLocalClient?: boolean;
 }
 
 export interface AuthorizationCodeRecord {
@@ -122,11 +123,14 @@ export class AuthStore {
     }
   }
 
-  private save(): void {
+  private persistState(
+    clientsMap: Map<string, ClientRegistration>,
+    tokensMap: Map<string, TokenRecord>
+  ): void {
     const now = Date.now();
     const state: PersistedAuthState = {
-      clients: [...this.clients.values()],
-      tokens: [...this.tokens.values()].filter((t) => !t.revoked && t.expiresAt > now),
+      clients: [...clientsMap.values()],
+      tokens: [...tokensMap.values()].filter((t) => !t.revoked && t.expiresAt > now),
     };
     writeSecureJson(this.file, state);
   }
@@ -138,6 +142,7 @@ export class AuthStore {
     redirectUris: string[];
     tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
     clientSecret?: string;
+    trustedLocalClient?: boolean;
   }): ClientRegistration & { clientSecret?: string } {
     const authMethod = input.tokenEndpointAuthMethod;
     const isConfidential = authMethod === "client_secret_post" || authMethod === "client_secret_basic";
@@ -154,9 +159,12 @@ export class AuthStore {
       createdAt: new Date().toISOString(),
       ...(authMethod !== undefined ? { tokenEndpointAuthMethod: authMethod } : {}),
       ...(plainSecret !== undefined ? { clientSecretHash: sha256hex(plainSecret) } : {}),
+      ...(input.trustedLocalClient === true ? { trustedLocalClient: true } : {}),
     };
-    this.clients.set(client.clientId, client);
-    this.save();
+    const nextClients = new Map(this.clients);
+    nextClients.set(client.clientId, client);
+    this.persistState(nextClients, this.tokens);
+    this.clients = nextClients;
     return plainSecret !== undefined ? { ...client, clientSecret: plainSecret } : { ...client };
   }
 
@@ -166,20 +174,46 @@ export class AuthStore {
 
   verifyClientCredentials(
     clientId: string,
-    clientSecret?: string
-  ): { ok: true; client: ClientRegistration } | { ok: false; reason: "unknown_client" | "invalid_client" } {
+    clientSecret?: string,
+    authSource: "basic" | "post" | "none" = "none"
+  ):
+    | { ok: true; client: ClientRegistration }
+    | { ok: false; reason: "unknown_client" | "invalid_client"; challengeBasic?: boolean } {
+    if (typeof clientId !== "string" || clientId.length === 0) {
+      return { ok: false, reason: "unknown_client", challengeBasic: authSource === "basic" };
+    }
     const client = this.clients.get(clientId);
-    if (!client) return { ok: false, reason: "unknown_client" };
-    if (client.clientSecretHash) {
-      if (!clientSecret || !safeEqual(sha256hex(clientSecret), client.clientSecretHash)) {
-        return { ok: false, reason: "invalid_client" };
+    if (!client) {
+      return { ok: false, reason: "unknown_client", challengeBasic: authSource === "basic" };
+    }
+    const expectedMethod: TokenEndpointAuthMethod =
+      client.tokenEndpointAuthMethod ?? (client.clientSecretHash ? "client_secret_basic" : "none");
+    if (expectedMethod === "none") {
+      if (authSource !== "none" || clientSecret !== undefined) {
+        return { ok: false, reason: "invalid_client", challengeBasic: authSource === "basic" };
       }
       return { ok: true, client };
     }
-    if (clientSecret !== undefined && clientSecret !== "") {
-      return { ok: false, reason: "invalid_client" };
+    if (expectedMethod === "client_secret_basic") {
+      if (
+        authSource === "basic" &&
+        !!client.clientSecretHash &&
+        typeof clientSecret === "string" &&
+        safeEqual(sha256hex(clientSecret), client.clientSecretHash)
+      ) {
+        return { ok: true, client };
+      }
+      return { ok: false, reason: "invalid_client", challengeBasic: true };
     }
-    return { ok: true, client };
+    if (
+      authSource === "post" &&
+      !!client.clientSecretHash &&
+      typeof clientSecret === "string" &&
+      safeEqual(sha256hex(clientSecret), client.clientSecretHash)
+    ) {
+      return { ok: true, client };
+    }
+    return { ok: false, reason: "invalid_client", challengeBasic: authSource === "basic" };
   }
 
   // ---- Authorization codes ----------------------------------------------
@@ -218,32 +252,37 @@ export class AuthStore {
 
   // ---- Tokens -------------------------------------------------------------
 
-  issueTokens(input: {
+  private prepareIssuedTokens(input: {
     clientId: string;
     scopes: string[];
     workspaceId?: string;
     accessTtlMs?: number;
-  }): { accessToken: string; refreshToken: string | null; expiresIn: number; scopes: string[] } {
+  }): {
+    result: { accessToken: string; refreshToken: string | null; expiresIn: number; scopes: string[] };
+    records: TokenRecord[];
+  } {
     const now = Date.now();
     const workspaceId = input.workspaceId ?? this.workspaceId;
     const accessTtl = input.accessTtlMs ?? ACCESS_TOKEN_TTL_MS;
 
     const accessToken = newToken("c2c_at");
-    this.tokens.set(sha256hex(accessToken), {
-      hash: sha256hex(accessToken),
-      kind: "access",
-      clientId: input.clientId,
-      workspaceId,
-      scopes: input.scopes,
-      issuedAt: now,
-      expiresAt: now + accessTtl,
-      revoked: false,
-    });
+    const records: TokenRecord[] = [
+      {
+        hash: sha256hex(accessToken),
+        kind: "access",
+        clientId: input.clientId,
+        workspaceId,
+        scopes: input.scopes,
+        issuedAt: now,
+        expiresAt: now + accessTtl,
+        revoked: false,
+      },
+    ];
 
     let refreshToken: string | null = null;
     if (input.scopes.includes("offline_access")) {
       refreshToken = newToken("c2c_rt");
-      this.tokens.set(sha256hex(refreshToken), {
+      records.push({
         hash: sha256hex(refreshToken),
         kind: "refresh",
         clientId: input.clientId,
@@ -254,13 +293,32 @@ export class AuthStore {
         revoked: false,
       });
     }
-    this.save();
+
     return {
-      accessToken,
-      refreshToken,
-      expiresIn: Math.floor(accessTtl / 1000),
-      scopes: input.scopes,
+      result: {
+        accessToken,
+        refreshToken,
+        expiresIn: Math.floor(accessTtl / 1000),
+        scopes: input.scopes,
+      },
+      records,
     };
+  }
+
+  issueTokens(input: {
+    clientId: string;
+    scopes: string[];
+    workspaceId?: string;
+    accessTtlMs?: number;
+  }): { accessToken: string; refreshToken: string | null; expiresIn: number; scopes: string[] } {
+    const { result, records } = this.prepareIssuedTokens(input);
+    const nextTokens = new Map(this.tokens);
+    for (const record of records) {
+      nextTokens.set(record.hash, record);
+    }
+    this.persistState(this.clients, nextTokens);
+    this.tokens = nextTokens;
+    return result;
   }
 
   verifyAccessToken(token: string): VerifyTokenResult {
@@ -282,34 +340,42 @@ export class AuthStore {
     if (record.revoked) return { ok: false, reason: "invalid_grant" };
     if (Date.now() > record.expiresAt) return { ok: false, reason: "invalid_grant" };
     if (record.clientId !== clientId) return { ok: false, reason: "invalid_client" };
-    record.revoked = true;
-    this.tokens.delete(record.hash);
-    const tokens = this.issueTokens({
+    const { result, records } = this.prepareIssuedTokens({
       clientId,
       scopes: record.scopes,
       workspaceId: record.workspaceId,
     });
-    return { ok: true, tokens };
+    const nextTokens = new Map(this.tokens);
+    nextTokens.delete(record.hash);
+    for (const nextRecord of records) {
+      nextTokens.set(nextRecord.hash, nextRecord);
+    }
+    this.persistState(this.clients, nextTokens);
+    record.revoked = true;
+    this.tokens = nextTokens;
+    return { ok: true, tokens: result };
   }
 
   revokeToken(token: string): boolean {
     const record = this.tokens.get(sha256hex(token));
     if (!record) return false;
+    const nextTokens = new Map(this.tokens);
+    nextTokens.delete(record.hash);
+    this.persistState(this.clients, nextTokens);
     record.revoked = true;
-    this.tokens.delete(record.hash);
-    this.save();
+    this.tokens = nextTokens;
     return true;
   }
 
   /** Used by `c2c unpair`: revoke everything for this workspace. */
   revokeAll(): number {
     const count = this.tokens.size;
+    this.persistState(this.clients, new Map());
     // Revoke persisted Tasks even when this AuthStore is used by the offline
     // `c2c unpair` path. The workspace epoch survives Bridge restarts.
     incrementAuthorizationEpoch(this.workspaceId);
     this.tokens.clear();
     this.authCodes.clear();
-    this.save();
     return count;
   }
 

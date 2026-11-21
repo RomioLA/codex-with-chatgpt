@@ -324,4 +324,61 @@ describe("workspace Bridge instance lock remediation", () => {
       await closeExternal(external, externalSockets);
     }
   });
+
+  it("does not unlink a newer lock published while async owner verification is in flight", async () => {
+    isolateStateDir();
+    const { root, workspace } = makeWorkspace("lock-recovery-toctou-race");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const lockFile = bridgeInstanceLockFile(workspace.id);
+    const tokenA = randomBytes(16).toString("hex");
+    const tokenB = randomBytes(16).toString("hex");
+    let probeCalls = 0;
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockImplementation(async () => {
+      probeCalls += 1;
+      if (probeCalls === 1) {
+        return "unrelated";
+      }
+      if (probeCalls === 2) {
+        // Simulate another Bridge publishing a fresh lock while recoverDeadOwner awaits WMI probe.
+        fs.writeFileSync(lockFile, JSON.stringify({
+          version: 1,
+          workspaceId: workspace.id,
+          pid: process.pid,
+          token: tokenB,
+          createdAt: new Date().toISOString(),
+        }));
+        return "unrelated";
+      }
+      return "bridge";
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", () => resolve());
+        child.once("error", reject);
+      });
+      if (!child.pid) throw new Error("Could not start isolated TOCTOU fixture");
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.writeFileSync(lockFile, JSON.stringify({
+        version: 1,
+        workspaceId: workspace.id,
+        pid: child.pid,
+        token: tokenA,
+        createdAt: new Date(0).toISOString(),
+      }));
+
+      await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
+        .rejects.toThrow(/live but unverified|cannot be verified/i);
+      expect(probeCalls).toBeGreaterThanOrEqual(3);
+      expect(fs.existsSync(lockFile)).toBe(true);
+      const surviving = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { token: string; pid: number };
+      expect(surviving.token).toBe(tokenB);
+      expect(surviving.pid).toBe(process.pid);
+    } finally {
+      ownerProbe.mockRestore();
+      if (child.pid) {
+        try { child.kill("SIGKILL"); } catch { /* the child may already have exited */ }
+      }
+    }
+  });
 });

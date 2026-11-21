@@ -951,4 +951,120 @@ describe("ExecutionJobStore", () => {
       await supervisor.shutdown();
     }
   });
+
+  it("persists interrupted state before archiving in load() so a crash before active-index removal avoids ARCHIVE_CONFLICT", () => {
+    const directory = makeTmpDir("execution-load-archive-persist-crash");
+    const workspaceId = "load-archive-persist-crash";
+    const store = new ExecutionJobStore(workspaceId, { directory });
+    const job = makeJob(workspaceId, "queued");
+    job.executionContext = "repository";
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    job.createdAt = oldAt;
+    job.startedAt = null;
+    job.finishedAt = null;
+    job.idempotencyKeyHash = randomBytes(32).toString("hex");
+    store.create(job);
+
+    let indexWrites = 0;
+    expect(() => new ExecutionJobStore(workspaceId, {
+      directory,
+      replaceActiveIndex(source, destination) {
+        if (path.resolve(destination) === path.join(path.resolve(directory), "jobs.json")) {
+          indexWrites += 1;
+          if (indexWrites === 2) {
+            throw new Error("INJECT_LOAD_SECOND_PERSIST_FAILURE");
+          }
+        }
+        atomicReplace(source, destination);
+      },
+    })).toThrow("INJECT_LOAD_SECOND_PERSIST_FAILURE");
+
+    expect(indexWrites).toBe(2);
+    const archived = readArchivedRecord<ExecutionJob>(directory, "jobs", job.jobId);
+    expect(archived).toMatchObject({ jobId: job.jobId, state: "interrupted", failureCode: "BRIDGE_RESTARTED" });
+    const persisted = JSON.parse(fs.readFileSync(path.join(directory, "jobs.json"), "utf8")) as { jobs: ExecutionJob[] };
+    expect(persisted.jobs).toHaveLength(1);
+    expect(persisted.jobs[0]?.finishedAt).toBe(archived?.finishedAt);
+
+    const recovered = new ExecutionJobStore(workspaceId, { directory });
+    expect(recovered.corruption).toBeNull();
+    expect(recovered.listAll()).toEqual([]);
+    expect(fs.existsSync(archivePath(directory, "jobs", job.jobId))).toBe(true);
+    expect(recovered.lookupIdempotentForReconciliation(job.oauthClientId, job.idempotencyKeyHash))
+      .toMatchObject({
+        kind: "found",
+        job: { jobId: job.jobId, state: "interrupted", failureCode: "BRIDGE_RESTARTED" },
+      });
+  });
+
+  it("persists updated evidence before archiving in replace() so active-index removal failure avoids ARCHIVE_ACTIVE_RECORD_MISMATCH", () => {
+    const directory = makeTmpDir("execution-replace-archive-persist-crash");
+    const workspaceId = "replace-archive-persist-crash";
+    let failSecondIndexWrite = false;
+    let indexWritesDuringReplace = 0;
+    const store = new ExecutionJobStore(workspaceId, {
+      directory,
+      replaceActiveIndex(source, destination) {
+        if (failSecondIndexWrite && path.resolve(destination) === path.join(path.resolve(directory), "jobs.json")) {
+          indexWritesDuringReplace += 1;
+          if (indexWritesDuringReplace === 2) {
+            throw new Error("INJECT_REPLACE_INDEX_REMOVAL_FAILURE");
+          }
+        }
+        atomicReplace(source, destination);
+      },
+    });
+    const job = makeJob(workspaceId, "interrupted");
+    job.executionContext = "repository";
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    job.createdAt = oldAt;
+    job.startedAt = oldAt;
+    job.finishedAt = oldAt;
+    job.failureCode = "BRIDGE_RESTARTED";
+    job.bootId = "11111111-1111-4111-8111-111111111111";
+    job.idempotencyKeyHash = randomBytes(32).toString("hex");
+    job.tempOwnership = {
+      rootFileIdentity: "1:2",
+      directoryFileIdentity: "3:4",
+      nonce: "a".repeat(64),
+      createdAtMs: 1,
+      bootId: job.bootId,
+    };
+    store.create(job);
+
+    failSecondIndexWrite = true;
+    expect(() => store.replace({
+      ...job,
+      tempOwnership: null,
+      recoveryEvidence: "boot_boundary_and_temp_cleaned",
+    })).toThrow("INJECT_REPLACE_INDEX_REMOVAL_FAILURE");
+
+    expect(indexWritesDuringReplace).toBe(2);
+    expect(readArchivedRecord<ExecutionJob>(directory, "jobs", job.jobId)).toMatchObject({
+      jobId: job.jobId,
+      tempOwnership: null,
+      recoveryEvidence: "boot_boundary_and_temp_cleaned",
+    });
+    expect(store.lookupIdempotentForReconciliation(job.oauthClientId, job.idempotencyKeyHash))
+      .toMatchObject({
+        kind: "found",
+        job: {
+          jobId: job.jobId,
+          tempOwnership: null,
+          recoveryEvidence: "boot_boundary_and_temp_cleaned",
+        },
+      });
+
+    const reopened = new ExecutionJobStore(workspaceId, { directory });
+    expect(reopened.listAll()).toEqual([]);
+    expect(reopened.lookupIdempotentForReconciliation(job.oauthClientId, job.idempotencyKeyHash))
+      .toMatchObject({
+        kind: "found",
+        job: {
+          jobId: job.jobId,
+          tempOwnership: null,
+          recoveryEvidence: "boot_boundary_and_temp_cleaned",
+        },
+      });
+  });
 });

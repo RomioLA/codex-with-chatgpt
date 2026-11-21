@@ -87,7 +87,6 @@ public static class C2CSessionIdentity {
    var identifier = new Guid(identifierBytes);
    if (identifier == Guid.Empty) continue;
    long bootTime = BitConverter.ToInt64(buffer, EnvironmentBootTimeOffset);
-   if (!IsPlausibleFileTime(bootTime)) continue;
    ulong flags = BitConverter.ToUInt64(buffer, 16);
    return new object[] { identifier, bootTime, (int)(flags & 0xFFFFUL), (int)(flags >> 16), "environment-information" };
   }
@@ -135,8 +134,13 @@ public static class C2CSessionIdentity {
    long observedBoot = (long)extended[1];
    result["bootSource"] = "environment-identifier";
    result["firmwareType"] = extended[2];
-   result["observedBootTime"] = FormatFileTime(observedBoot);
-   result["bootTimeFileTime"] = observedBoot;
+   if (IsPlausibleFileTime(observedBoot)) {
+    result["observedBootTime"] = FormatFileTime(observedBoot);
+    result["bootTimeFileTime"] = observedBoot;
+   } else if (timeOfDayBoot.HasValue) {
+    result["observedBootTime"] = FormatFileTime(timeOfDayBoot.Value);
+    result["bootTimeFileTime"] = timeOfDayBoot.Value;
+   }
   } else {
    bootIdentifier = ReadBootIdentifier();
    result["bootSource"] = "boot-identifier";
@@ -596,6 +600,38 @@ function runPowerShell(
 
 /** Ordered, cached per-interpreter identity outcome. */
 const candidateOutcomes = new Map<string, PowerShellCandidateOutcome>();
+const BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BOOT_ID_ASYNC_TIMEOUT_MS = 5_000;
+const BOOT_ID_BACKOFF_MS = 30_000;
+
+let cachedVerifiedBootId: string | null = null;
+let bootIdInFlight: Promise<string | null> | null = null;
+let bootIdBackoffUntil = 0;
+
+function normalizeBootId(value: unknown): string | null {
+  return typeof value === "string" && BOOT_ID_PATTERN.test(value) ? value.toLowerCase() : null;
+}
+
+function runPowerShellAsync(
+  executable: string,
+  script: string,
+  timeoutMs: number,
+): Promise<{ outcome: "ok"; stdout: string } | { outcome: PowerShellCandidateOutcome }> {
+  return new Promise((resolve) => {
+    execFile(executable, fixedPowerShellArgs(script), {
+      windowsHide: true,
+      timeout: timeoutMs,
+      maxBuffer: 64 * 1024,
+      encoding: "utf8",
+    }, (error, stdout) => {
+      if (error) {
+        resolve({ outcome: classifySpawnError(error) });
+        return;
+      }
+      resolve({ outcome: "ok", stdout });
+    });
+  });
+}
 
 /**
  * Read the Windows logon identity together with an explicit failure reason.
@@ -645,6 +681,10 @@ export function readWindowsSessionIdentitySyncDetailed(): SessionIdentityReadRes
       lastReason = "INVALID_OUTPUT";
       continue;
     }
+    const verifiedBootId = normalizeBootId(parsed.bootId);
+    if (verifiedBootId !== null) {
+      cachedVerifiedBootId = verifiedBootId;
+    }
     attempts.push({ executable, outcome: "identity-ok" });
     return { ok: true, identity: parsed, reason: null, executable, attempts };
   }
@@ -655,6 +695,56 @@ export function readWindowsSessionIdentitySyncDetailed(): SessionIdentityReadRes
   // Preserve the interpreter for diagnostics even on failure.
   const failed = empty(lastReason, attempts);
   return { ...failed, executable: lastExecutable };
+}
+
+/** Return the in-process cached Windows boot ID without spawning PowerShell. */
+export function getCachedWindowsBootId(): string | null {
+  return cachedVerifiedBootId;
+}
+
+/**
+ * Asynchronously read and cache the current Windows boot ID using fixed PowerShell
+ * candidates, deduplicating concurrent callers and backing off for 30s on failure.
+ */
+export function readWindowsBootIdAsync(): Promise<string | null> {
+  if (process.platform !== "win32") return Promise.resolve(null);
+  if (cachedVerifiedBootId !== null) return Promise.resolve(cachedVerifiedBootId);
+  if (Date.now() < bootIdBackoffUntil) return Promise.resolve(null);
+  if (bootIdInFlight !== null) return bootIdInFlight;
+
+  bootIdInFlight = (async (): Promise<string | null> => {
+    try {
+      const candidates = fixedPowerShellCandidates();
+      for (const executable of candidates) {
+        const key = process.platform === "win32" ? executable.toLowerCase() : executable;
+        if (candidateOutcomes.get(key) === "interpreter-failed") continue;
+        const run = await runPowerShellAsync(executable, WINDOWS_SESSION_IDENTITY_SCRIPT, BOOT_ID_ASYNC_TIMEOUT_MS);
+        if (run.outcome !== "ok") {
+          if (run.outcome === "interpreter-failed") candidateOutcomes.set(key, "interpreter-failed");
+          continue;
+        }
+        const parsed = parseIdentityPayload(run.stdout);
+        if (parsed === null) {
+          candidateOutcomes.set(key, "interpreter-failed");
+          continue;
+        }
+        const verifiedBootId = normalizeBootId(parsed.bootId);
+        if (verifiedBootId !== null) {
+          cachedVerifiedBootId = verifiedBootId;
+          bootIdBackoffUntil = 0;
+          return verifiedBootId;
+        }
+      }
+    } catch {
+      // Fail closed and fall through to bounded backoff.
+    }
+    bootIdBackoffUntil = Date.now() + BOOT_ID_BACKOFF_MS;
+    return null;
+  })().finally(() => {
+    bootIdInFlight = null;
+  });
+
+  return bootIdInFlight;
 }
 
 /**

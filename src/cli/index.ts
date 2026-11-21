@@ -1752,22 +1752,50 @@ oauthClientCmd
             ? (() => { throw new Error("auth-method must be client_secret_basic, client_secret_post, or none"); })()
             : "client_secret_basic";
 
-      const store = new AuthStore(workspace.id);
-      const client = store.registerClient({
-        clientName: opts.name.slice(0, 200),
-        redirectUris,
-        tokenEndpointAuthMethod,
-      });
-      const liveBridge = await findLiveBridge(workspace.id);
+      const observation = await findBridgeObservation(workspace.id);
+      if (observation.state === "unknown") {
+        throw new Error(
+          `Bridge state is uncertain (${observation.reason}); refusing to modify OAuth store while Bridge ownership is unverified.`
+        );
+      }
+
+      const client = observation.state === "healthy"
+        ? await adminFetch<{
+            clientId: string;
+            clientName: string | null;
+            clientSecret: string | null;
+            redirectUris: string[];
+            tokenEndpointAuthMethod: string;
+          }>(observation.runtime, "POST", "/admin/oauth-clients", 10_000, {
+            clientName: opts.name.slice(0, 200),
+            redirectUris,
+            tokenEndpointAuthMethod,
+          })
+        : (() => {
+            const registered = new AuthStore(workspace.id).registerClient({
+              clientName: opts.name.slice(0, 200),
+              redirectUris,
+              tokenEndpointAuthMethod,
+              trustedLocalClient: true,
+            });
+            return {
+              clientId: registered.clientId,
+              clientName: registered.clientName ?? null,
+              clientSecret: registered.clientSecret ?? null,
+              redirectUris: registered.redirectUris,
+              tokenEndpointAuthMethod,
+            };
+          })();
+
       const payload = {
         ok: true,
         workspaceId: workspace.id,
         clientId: client.clientId,
-        clientName: client.clientName ?? null,
-        clientSecret: client.clientSecret ?? null,
+        clientName: client.clientName,
+        clientSecret: client.clientSecret,
         redirectUris: client.redirectUris,
         tokenEndpointAuthMethod,
-        restartRequired: Boolean(liveBridge),
+        restartRequired: false,
       };
       if (opts.json) {
         say(JSON.stringify(payload));
@@ -1778,8 +1806,8 @@ oauthClientCmd
       if (client.clientSecret) say(`client_secret: ${client.clientSecret}`);
       say(`auth_method: ${tokenEndpointAuthMethod}`);
       say(`redirect_uris: ${client.redirectUris.join(", ")}`);
-      if (liveBridge) {
-        say(`提示：检测到 Bridge 正在运行，请运行 \`c2c restart -w "${workspace.root}"\` 让运行中的 Bridge 加载新客户端凭据。`);
+      if (observation.state === "healthy") {
+        say("已同步写入运行中的 Bridge，即时生效，无需重启。");
       }
     } catch (error) {
       handleCliError(error, opts.json);

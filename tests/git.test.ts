@@ -2,9 +2,20 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gitCompare, gitDiff, gitInfo, gitStatus, runGit } from "../src/workspace/git.js";
+import {
+  gitCompare,
+  gitCompareAsync,
+  gitDiff,
+  gitDiffAsync,
+  gitInfo,
+  gitInfoAsync,
+  gitStatus,
+  gitStatusAsync,
+  runGit,
+  runGitAsync,
+} from "../src/workspace/git.js";
 import { resolveGitExecutable } from "../src/git-write/security.js";
-import { Workspace } from "../src/workspace/manager.js";
+import { Workspace, WorkspaceError } from "../src/workspace/manager.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
 let repo: string;
@@ -658,5 +669,88 @@ describe("gitCompare historical commits", () => {
     });
     expect(second.offset).toBe(first.nextOffset);
     expect(second.diff.length).toBeGreaterThan(0);
+  });
+});
+
+describe("gitDiff UTF-8 pagination and async git operations", () => {
+  it("paginates a long single-line multibyte UTF-8 diff without U+FFFD in both sync and async modes", async () => {
+    const isolated = makeTmpDir("git-diff-utf8-pagination");
+    makeGitRepo(isolated);
+    write(isolated, "utf8-long.txt", `${"汉".repeat(2000)}\n`);
+
+    const fullSync = gitDiff(isolated, { mode: "unstaged", maxBytes: 256 * 1024 });
+    const fullAsync = await gitDiffAsync(isolated, { mode: "unstaged", maxBytes: 256 * 1024 });
+    expect(fullSync.isRepo).toBe(true);
+    expect(fullSync.hasMore).toBe(false);
+    expect(fullAsync.diff).toBe(fullSync.diff);
+
+    const collectPages = async (isAsync: boolean): Promise<string> => {
+      const pages: string[] = [];
+      let offset = 0;
+      for (let hop = 0; hop < 64; hop += 1) {
+        const page = isAsync
+          ? await gitDiffAsync(isolated, { mode: "unstaged", offset, maxBytes: 1024 })
+          : gitDiff(isolated, { mode: "unstaged", offset, maxBytes: 1024 });
+        expect(page.diff).not.toContain("\uFFFD");
+        expect(page.returnedBytes).toBe(Buffer.byteLength(page.diff, "utf8"));
+        pages.push(page.diff);
+        if (!page.hasMore) break;
+        expect(page.nextOffset).toBe(page.offset + page.returnedBytes);
+        offset = page.nextOffset!;
+        if (hop === 63) throw new Error("UTF8_DIFF_PAGINATION_EXCEEDED_MAX_PAGES");
+      }
+      return pages.join("");
+    };
+
+    expect(await collectPages(false)).toBe(fullSync.diff);
+    expect(await collectPages(true)).toBe(fullSync.diff);
+  });
+
+  it("supports gitInfoAsync, gitStatusAsync, gitDiffAsync, gitCompareAsync, and deadline enforcement", async () => {
+    const isolated = makeTmpDir("git-async-operations");
+    makeGitRepo(isolated);
+    const base = git(isolated, "rev-parse", "HEAD").trim();
+
+    write(isolated, "hello.txt", "async committed update\n");
+    git(isolated, "add", "hello.txt");
+    git(isolated, "commit", "-m", "async compare commit");
+    const head = git(isolated, "rev-parse", "HEAD").trim();
+
+    write(isolated, "hello.txt", "async working tree update\n");
+    write(isolated, "untracked-async.txt", "untracked\n");
+
+    const [info, status, diff, compared] = await Promise.all([
+      gitInfoAsync(isolated),
+      gitStatusAsync(isolated),
+      gitDiffAsync(isolated, { mode: "unstaged" }),
+      gitCompareAsync(isolated, { baseCommit: base, headCommit: head }),
+    ]);
+
+    expect(info).toEqual({ isRepo: true, branch: "main", commit: expect.stringMatching(/^[a-f0-9]{7,}$/), dirty: true });
+    expect(status.isRepo).toBe(true);
+    expect(status.branch).toBe("main");
+    expect(status.unstaged.map((entry) => entry.path)).toContain("hello.txt");
+    expect(status.untracked).toContain("untracked-async.txt");
+    expect(diff.isRepo).toBe(true);
+    expect(diff.diff).toContain("async working tree update");
+    expect(compared.isRepo).toBe(true);
+    expect(compared.baseCommit).toBe(base);
+    expect(compared.headCommit).toBe(head);
+    expect(compared.diff).toContain("async committed update");
+
+    const expectDeadline = async (action: () => Promise<unknown>): Promise<void> => {
+      let caught: unknown;
+      try {
+        await action();
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(WorkspaceError);
+      expect((caught as WorkspaceError).code).toBe("DEADLINE");
+    };
+
+    await expectDeadline(() => gitStatusAsync(isolated, { deadlineAt: performance.now() + 0.001 }));
+    await expectDeadline(() => gitDiffAsync(isolated, { mode: "unstaged" }, undefined, { deadlineAt: performance.now() + 0.001 }));
+    await expectDeadline(() => runGitAsync(isolated, ["status", "--porcelain=v2"], { deadlineAt: performance.now() + 0.001 }));
   });
 });
