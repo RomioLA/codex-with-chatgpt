@@ -236,9 +236,7 @@ export class AuthStore {
       for (const [hash, previous] of this.tokens) {
         if (!snapshot.tokens.has(hash)) previous.revoked = true;
       }
-      for (const [code, authCode] of this.authCodes) {
-        if (!snapshot.clients.has(authCode.clientId)) this.authCodes.delete(code);
-      }
+      this.authCodes.clear();
       this.clients = snapshot.clients;
       this.tokens = snapshot.tokens;
       this.stateUncertain = false;
@@ -560,12 +558,19 @@ export class AuthStore {
   revokeAll(): number {
     this.ensureReconciled();
     const count = this.tokens.size;
-    this.persistState(this.clients, new Map());
+    // Invalidate pending pairing codes immediately and require the workspace
+    // authorizationEpoch bump even if persistState throws after publishing.
+    this.authCodes.clear();
+    try {
+      this.persistState(this.clients, new Map());
+    } catch (error) {
+      this.epochUncertain = true;
+      throw error;
+    }
     for (const record of this.tokens.values()) {
       record.revoked = true;
     }
     this.tokens.clear();
-    this.authCodes.clear();
     // Revoke persisted Tasks even when this AuthStore is used by the offline
     // `c2c unpair` path. The workspace epoch survives Bridge restarts.
     try {

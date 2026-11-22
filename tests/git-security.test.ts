@@ -616,6 +616,14 @@ describe("Git subprocess execution policy", () => {
     const fetchMarker = path.join(markerHost.root, "lazy-fetch.marker");
     git(partialRoot, "config", "remote.origin.uploadpack", markerHost.markerCommand(fetchMarker));
 
+    const observedCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
+    spawnHooks.onSpawnSync = (args, options) => {
+      observedCalls.push({ args: [...args], env: { ...(options.env as NodeJS.ProcessEnv) } });
+    };
+    spawnHooks.onSpawn = (args, options) => {
+      observedCalls.push({ args: [...args], env: { ...(options.env as NodeJS.ProcessEnv) } });
+    };
+
     // Diffing c1..c2 requires missing promisor blobs; read-only Git must fail closed without lazy-fetching.
     const compareSync = gitCompare(partialRoot, { baseCommit: c1, headCommit: c2 });
     const compareAsync = await gitCompareAsync(partialRoot, { baseCommit: c1, headCommit: c2 });
@@ -629,5 +637,13 @@ describe("Git subprocess execution policy", () => {
     expect(resolveGitCommit(partialRoot, c1)).toBe(c1);
     expect(await resolveGitCommitAsync(partialRoot, c2)).toBe(c2);
     expect(fs.existsSync(fetchMarker)).toBe(false);
+
+    // Pre-Git-2.45 compatibility: lazy fetch is disabled via GIT_NO_LAZY_FETCH=1 env rather than CLI --no-lazy-fetch.
+    expect(observedCalls.length).toBeGreaterThan(0);
+    for (const call of observedCalls) {
+      expect(call.args).not.toContain("--no-lazy-fetch");
+      expect(call.env.GIT_NO_LAZY_FETCH).toBe("1");
+      expect(call.env.GIT_ALLOW_PROTOCOL).toBe("");
+    }
   });
 });

@@ -35,7 +35,6 @@ const NULL_DEVICE = process.platform === "win32" ? "NUL" : os.devNull;
 
 const SAFE_GIT_GLOBAL_ARGS = [
   "--no-pager",
-  "--no-lazy-fetch",
   "-c", "core.fsmonitor=false",
   "-c", "core.pager=cat",
   "-c", "core.editor=:",

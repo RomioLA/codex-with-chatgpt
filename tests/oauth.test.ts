@@ -4,6 +4,7 @@ import { createServer, type Server as NetServer } from "node:net";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { AuthStore, AuthStoreCorruptError, DEFAULT_SCOPES, SUPPORTED_SCOPES } from "../src/auth/store.js";
+import { readAuthorizationEpoch } from "../src/permission/store.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
 
 let root: string;
@@ -1479,6 +1480,69 @@ describe("Gemini and confidential client compatibility", () => {
       expect(store.verifyAccessToken(issued.accessToken).ok).toBe(false);
     } finally {
       if (fs.existsSync(permFile)) fs.unlinkSync(permFile);
+      cleanup(dir);
+    }
+  });
+
+  it("invalidates pending auth codes and bumps authorizationEpoch on reconciliation when revokeAll fails post-rename verification", () => {
+    const dir = makeTmpDir("auth-revoke-all-post-rename-fail");
+    const wsId = "c1d2e3f4a5b6";
+    try {
+      const storeFile = path.join(dir, "store.json");
+      const store = new AuthStore(wsId, { file: storeFile });
+      const client = store.registerClient({
+        clientName: "RevokeAllPostRenameClient",
+        redirectUris: [REDIRECT_URI],
+        tokenEndpointAuthMethod: "none",
+      });
+      const { challenge } = pkceVerifierAndChallenge();
+      const pendingCode = store.createAuthorizationCode({
+        clientId: client.clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: challenge,
+        scopes: ["workspace.read", "offline_access"],
+        pairingSessionId: "pair-session-1",
+      });
+      const issued = store.issueTokens({
+        clientId: client.clientId,
+        scopes: ["workspace.read", "offline_access"],
+      });
+      const epochBefore = readAuthorizationEpoch(wsId) ?? 0;
+
+      // Simulate Windows denying read-back immediately after atomicReplace renames empty tokens onto store.json.
+      const realOpenSync = fs.openSync.bind(fs);
+      let denyStoreRead = true;
+      const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((filePath, flags, mode) => {
+        if (denyStoreRead && path.resolve(String(filePath)) === path.resolve(storeFile) && flags === "r") {
+          throw Object.assign(new Error("EACCES: transient post-rename read failure"), { code: "EACCES" });
+        }
+        return realOpenSync(filePath as fs.PathLike, flags as fs.OpenMode, mode as fs.Mode | undefined);
+      }) as typeof fs.openSync);
+      const realReadFileSync = fs.readFileSync.bind(fs);
+      const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath, options) => {
+        if (denyStoreRead && typeof filePath === "string" && path.resolve(filePath) === path.resolve(storeFile)) {
+          throw Object.assign(new Error("EACCES: transient read failure"), { code: "EACCES" });
+        }
+        return realReadFileSync(filePath as fs.PathOrFileDescriptor, options as never);
+      }) as typeof fs.readFileSync);
+
+      try {
+        expect(() => store.revokeAll()).toThrow(/EACCES/);
+        expect(() => store.consumeAuthorizationCode(pendingCode)).toThrow(AuthStoreCorruptError);
+        expect(store.verifyAccessToken(issued.accessToken).ok).toBe(false);
+        expect(store.hasActiveAuthorization(client.clientId, ["workspace.read"])).toBe(false);
+      } finally {
+        denyStoreRead = false;
+        openSpy.mockRestore();
+        readSpy.mockRestore();
+      }
+
+      // After disk becomes readable again, reconciliation must reject the old auth code AND complete the epoch bump.
+      expect(store.consumeAuthorizationCode(pendingCode)).toBeNull();
+      expect(readAuthorizationEpoch(wsId)).toBeGreaterThan(epochBefore);
+      expect(store.verifyAccessToken(issued.accessToken).ok).toBe(false);
+      expect(store.tokenCount()).toBe(0);
+    } finally {
       cleanup(dir);
     }
   });
