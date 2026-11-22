@@ -625,6 +625,7 @@ describe("Git subprocess execution policy", () => {
     };
 
     // Diffing c1..c2 requires missing promisor blobs; read-only Git must fail closed without lazy-fetching.
+    const missingCommit = "1".repeat(40);
     const compareSync = gitCompare(partialRoot, { baseCommit: c1, headCommit: c2 });
     const compareAsync = await gitCompareAsync(partialRoot, { baseCommit: c1, headCommit: c2 });
     expect(compareSync.isRepo).toBe(false);
@@ -636,6 +637,8 @@ describe("Git subprocess execution policy", () => {
     expect((await gitDiffAsync(partialRoot, { mode: "head" })).isRepo).toBe(false);
     expect(resolveGitCommit(partialRoot, c1)).toBe(c1);
     expect(await resolveGitCommitAsync(partialRoot, c2)).toBe(c2);
+    expect(resolveGitCommit(partialRoot, missingCommit)).toBeNull();
+    expect(await resolveGitCommitAsync(partialRoot, missingCommit)).toBeNull();
     expect(fs.existsSync(fetchMarker)).toBe(false);
 
     // Pre-Git-2.45 compatibility: lazy fetch is disabled via GIT_NO_LAZY_FETCH=1 env rather than CLI --no-lazy-fetch.
@@ -645,5 +648,80 @@ describe("Git subprocess execution policy", () => {
       expect(call.env.GIT_NO_LAZY_FETCH).toBe("1");
       expect(call.env.GIT_ALLOW_PROTOCOL).toBe("");
     }
+  });
+
+  it("never spawns an internal git fetch subprocess even when Git ignores GIT_NO_LAZY_FETCH (Git <= 2.44)", async () => {
+    const originRoot = makeTmpDir("git-security-trace2-origin");
+    makeGitRepo(originRoot);
+    git(originRoot, "config", "uploadpack.allowFilter", "true");
+    write(originRoot, "secret-blob.txt", "first partial blob content\n");
+    git(originRoot, "add", ".");
+    git(originRoot, "commit", "-m", "c1");
+    const c1 = git(originRoot, "rev-parse", "HEAD").trim();
+
+    write(originRoot, "secret-blob.txt", "second partial blob content\n");
+    git(originRoot, "add", ".");
+    git(originRoot, "commit", "-m", "c2");
+    const c2 = git(originRoot, "rev-parse", "HEAD").trim();
+
+    const partialParent = makeTmpDir("git-security-trace2-clone");
+    const partialRoot = path.join(partialParent, "clone");
+    const originFileUrl = `file:///${originRoot.replace(/\\/g, "/").replace(/^\/+/, "")}`;
+    git(partialParent, "-c", "protocol.file.allow=always", "clone", "--no-local", "--filter=blob:none", "--no-checkout", originFileUrl, partialRoot);
+
+    const markerHost = makeFixture("trace2-marker-host");
+    const fetchMarker = path.join(markerHost.root, "lazy-fetch.marker");
+    git(partialRoot, "config", "remote.origin.uploadpack", markerHost.markerCommand(fetchMarker));
+
+    const traceDir = makeTmpDir("git-security-trace2-events");
+    const rewriteEnvAndVerifyPolicy = (args: string[], options: Record<string, unknown>): void => {
+      const env = { ...(options.env as NodeJS.ProcessEnv) };
+      expect(args).not.toContain("--no-lazy-fetch");
+      expect(env.GIT_NO_LAZY_FETCH).toBe("1");
+      expect(env.GIT_ALLOW_PROTOCOL).toBe("");
+      // Simulate Git <= 2.44 ignoring GIT_NO_LAZY_FETCH=1 and trace every spawned Git child process.
+      delete env.GIT_NO_LAZY_FETCH;
+      env.GIT_TRACE2_EVENT = traceDir;
+      options.env = env;
+    };
+    spawnHooks.onSpawnSync = rewriteEnvAndVerifyPolicy;
+    spawnHooks.onSpawn = rewriteEnvAndVerifyPolicy;
+
+    const missingCommit = "1".repeat(40);
+    expect(gitCompare(partialRoot, { baseCommit: c1, headCommit: c2 }).isRepo).toBe(false);
+    expect((await gitCompareAsync(partialRoot, { baseCommit: c1, headCommit: c2 })).isRepo).toBe(false);
+    expect(gitStatus(partialRoot).isRepo).toBe(true);
+    expect((await gitStatusAsync(partialRoot)).isRepo).toBe(true);
+    expect(gitDiff(partialRoot, { mode: "head" }).isRepo).toBe(false);
+    expect((await gitDiffAsync(partialRoot, { mode: "head" })).isRepo).toBe(false);
+    expect(resolveGitCommit(partialRoot, c1)).toBe(c1);
+    expect(await resolveGitCommitAsync(partialRoot, c2)).toBe(c2);
+    expect(resolveGitCommit(partialRoot, missingCommit)).toBeNull();
+    expect(await resolveGitCommitAsync(partialRoot, missingCommit)).toBeNull();
+    expect(gitInfo(partialRoot).isRepo).toBe(true);
+    expect((await gitInfoAsync(partialRoot)).isRepo).toBe(true);
+    expect(gitRepositoryInfo(selectGitRepository(new Workspace(partialRoot))).isRepo).toBe(true);
+    expect((await gitRepositoryInfoAsync(await selectGitRepositoryAsync(new Workspace(partialRoot)))).isRepo).toBe(true);
+    expect(fs.existsSync(fetchMarker)).toBe(false);
+
+    const traceFiles = fs.readdirSync(traceDir);
+    expect(traceFiles.length).toBeGreaterThan(0);
+    const events: Array<{ event?: string; argv?: unknown[] }> = [];
+    for (const fileName of traceFiles) {
+      const content = fs.readFileSync(path.join(traceDir, fileName), "utf8");
+      for (const line of content.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        events.push(JSON.parse(line) as { event?: string; argv?: unknown[] });
+      }
+    }
+    expect(events.some((entry) => entry.event === "child_start")).toBe(false);
+    expect(
+      events.some(
+        (entry) =>
+          entry.event === "start" &&
+          Array.isArray(entry.argv) &&
+          entry.argv.some((arg) => arg === "fetch")
+      )
+    ).toBe(false);
   });
 });

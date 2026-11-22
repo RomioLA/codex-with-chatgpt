@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { atomicReplace } from "../execution/atomic-replace.js";
+import { atomicReplace, AtomicReplaceError } from "../execution/atomic-replace.js";
 import { incrementAuthorizationEpoch } from "../permission/store.js";
 
 // Newly authorized connections receive only this explicitly approved scope set.
@@ -139,12 +139,23 @@ function isValidTokenRecord(value: unknown): value is TokenRecord {
     typeof token.revoked === "boolean";
 }
 
+function tempFileStillPresent(tempFile: string): boolean {
+  try {
+    const stat = fs.lstatSync(tempFile);
+    return stat.isFile() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 export class AuthStore {
   private clients = new Map<string, ClientRegistration>();
   private tokens = new Map<string, TokenRecord>();
   private authCodes = new Map<string, AuthorizationCodeRecord>();
   private stateUncertain = false;
   private epochUncertain = false;
+  private pendingRevokeAllHash: string | null = null;
+  private pendingRevokeAllApplied = false;
   private readonly file: string;
 
   constructor(
@@ -159,13 +170,14 @@ export class AuthStore {
   private readDiskSnapshot(): {
     clients: Map<string, ClientRegistration>;
     tokens: Map<string, TokenRecord>;
+    rawHash: string | null;
   } {
     let stat: fs.Stats;
     try {
       stat = fs.lstatSync(this.file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return { clients: new Map(), tokens: new Map() };
+        return { clients: new Map(), tokens: new Map(), rawHash: null };
       }
       throw new AuthStoreCorruptError("Cannot inspect OAuth store file.");
     }
@@ -179,6 +191,7 @@ export class AuthStore {
     } catch {
       throw new AuthStoreCorruptError("Cannot read OAuth store file.");
     }
+    const rawHash = sha256hex(raw);
 
     let parsed: unknown;
     try {
@@ -217,7 +230,7 @@ export class AuthStore {
     for (const token of tokens) {
       if (!token.revoked && token.expiresAt > now) tokensMap.set(token.hash, token);
     }
-    return { clients: clientsMap, tokens: tokensMap };
+    return { clients: clientsMap, tokens: tokensMap, rawHash };
   }
 
   private load(): void {
@@ -236,9 +249,22 @@ export class AuthStore {
       for (const [hash, previous] of this.tokens) {
         if (!snapshot.tokens.has(hash)) previous.revoked = true;
       }
-      this.authCodes.clear();
+      const revokeAllLanded =
+        this.pendingRevokeAllApplied ||
+        (this.pendingRevokeAllHash !== null &&
+          (snapshot.rawHash === this.pendingRevokeAllHash || snapshot.tokens.size === 0));
+      if (revokeAllLanded) {
+        this.authCodes.clear();
+        this.epochUncertain = true;
+      } else {
+        for (const [code, authCode] of this.authCodes) {
+          if (!snapshot.clients.has(authCode.clientId)) this.authCodes.delete(code);
+        }
+      }
       this.clients = snapshot.clients;
       this.tokens = snapshot.tokens;
+      this.pendingRevokeAllHash = null;
+      this.pendingRevokeAllApplied = false;
       this.stateUncertain = false;
     }
     if (this.epochUncertain) {
@@ -259,7 +285,10 @@ export class AuthStore {
 
   private persistState(
     clientsMap: Map<string, ClientRegistration>,
-    tokensMap: Map<string, TokenRecord>
+    tokensMap: Map<string, TokenRecord>,
+    opts: {
+      onUncertainPublish?: (info: { expectedNewHash: string; operationApplied: boolean }) => void;
+    } = {}
   ): void {
     this.ensureReconciled();
     const now = Date.now();
@@ -292,7 +321,17 @@ export class AuthStore {
         atomicReplace(tempFile, this.file, { expectedNewHash });
         published = true;
       } catch (error) {
-        this.stateUncertain = true;
+        const confirmedUnpublished =
+          error instanceof AtomicReplaceError &&
+          !error.operationApplied &&
+          tempFileStillPresent(tempFile);
+        if (!confirmedUnpublished) {
+          this.stateUncertain = true;
+          opts.onUncertainPublish?.({
+            expectedNewHash,
+            operationApplied: error instanceof AtomicReplaceError && error.operationApplied,
+          });
+        }
         throw error;
       }
     } finally {
@@ -558,19 +597,17 @@ export class AuthStore {
   revokeAll(): number {
     this.ensureReconciled();
     const count = this.tokens.size;
-    // Invalidate pending pairing codes immediately and require the workspace
-    // authorizationEpoch bump even if persistState throws after publishing.
-    this.authCodes.clear();
-    try {
-      this.persistState(this.clients, new Map());
-    } catch (error) {
-      this.epochUncertain = true;
-      throw error;
-    }
+    this.persistState(this.clients, new Map(), {
+      onUncertainPublish: ({ expectedNewHash, operationApplied }) => {
+        this.pendingRevokeAllHash = expectedNewHash;
+        this.pendingRevokeAllApplied = operationApplied;
+      },
+    });
     for (const record of this.tokens.values()) {
       record.revoked = true;
     }
     this.tokens.clear();
+    this.authCodes.clear();
     // Revoke persisted Tasks even when this AuthStore is used by the offline
     // `c2c unpair` path. The workspace epoch survives Bridge restarts.
     try {

@@ -1388,6 +1388,14 @@ describe("Gemini and confidential client compatibility", () => {
         clientId: client.clientId,
         scopes: ["workspace.read", "offline_access"],
       });
+      const { challenge } = pkceVerifierAndChallenge();
+      const unrelatedPendingCode = store.createAuthorizationCode({
+        clientId: client.clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: challenge,
+        scopes: ["workspace.read"],
+        pairingSessionId: "pair-unrelated-refresh",
+      });
 
       // Block read-back on storeFile right after renameWithWindowsRetry publishes the rotated state.
       const realOpenSync = fs.openSync.bind(fs);
@@ -1415,9 +1423,10 @@ describe("Gemini and confidential client compatibility", () => {
       try {
         expect(() => store.refresh(initial.refreshToken!, client.clientId)).toThrow(/EACCES/);
 
-        // While reconciliation cannot read storeFile, token checks and writes fail closed.
+        // While reconciliation cannot read storeFile, token checks, code consumption, and writes fail closed.
         expect(store.verifyAccessToken(initial.accessToken).ok).toBe(false);
         expect(store.hasActiveAuthorization(client.clientId, ["workspace.read"])).toBe(false);
+        expect(() => store.consumeAuthorizationCode(unrelatedPendingCode)).toThrow(AuthStoreCorruptError);
         expect(() => store.issueTokens({ clientId: client.clientId, scopes: ["workspace.read"] }))
           .toThrow(AuthStoreCorruptError);
         expect(() => store.registerClient({ redirectUris: [REDIRECT_URI] }))
@@ -1428,9 +1437,16 @@ describe("Gemini and confidential client compatibility", () => {
         readSpy.mockRestore();
       }
 
-      // Once readable again, subsequent operations reconcile disk first instead of writing stale tokens back.
+      // Once readable again, subsequent operations reconcile disk first instead of writing stale tokens back,
+      // and pending auth codes unrelated to refresh() remain intact for their registered client.
       const diskRotatedSnapshot = JSON.parse(fs.readFileSync(storeFile, "utf8")) as { tokens: Array<{ hash: string }> };
       expect(diskRotatedSnapshot.tokens).toHaveLength(3);
+
+      expect(store.consumeAuthorizationCode(unrelatedPendingCode)).toMatchObject({
+        clientId: client.clientId,
+        pairingSessionId: "pair-unrelated-refresh",
+      });
+      expect(store.consumeAuthorizationCode(unrelatedPendingCode)).toBeNull();
 
       store.registerClient({ clientName: "AfterReconcile", redirectUris: [REDIRECT_URI] });
       expect(store.refresh(initial.refreshToken!, client.clientId)).toEqual({
@@ -1542,6 +1558,77 @@ describe("Gemini and confidential client compatibility", () => {
       expect(readAuthorizationEpoch(wsId)).toBeGreaterThan(epochBefore);
       expect(store.verifyAccessToken(issued.accessToken).ok).toBe(false);
       expect(store.tokenCount()).toBe(0);
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("preserves tokens, pending auth codes, and authorizationEpoch when revokeAll fails before publishing to disk", () => {
+    const dir = makeTmpDir("auth-revoke-all-pre-publish-fail");
+    const wsId = "d1e2f3a4b5c6";
+    try {
+      const storeFile = path.join(dir, "store.json");
+      const store = new AuthStore(wsId, { file: storeFile });
+      const client = store.registerClient({
+        clientName: "RevokeAllPrePublishClient",
+        redirectUris: [REDIRECT_URI],
+        tokenEndpointAuthMethod: "none",
+      });
+      const issued = store.issueTokens({
+        clientId: client.clientId,
+        scopes: ["workspace.read", "offline_access"],
+      });
+      const { challenge: c1 } = pkceVerifierAndChallenge();
+      const pendingCode1 = store.createAuthorizationCode({
+        clientId: client.clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: c1,
+        scopes: ["workspace.read"],
+        pairingSessionId: "pair-pre-write-fail",
+      });
+      const { challenge: c2 } = pkceVerifierAndChallenge();
+      const pendingCode2 = store.createAuthorizationCode({
+        clientId: client.clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: c2,
+        scopes: ["workspace.read"],
+        pairingSessionId: "pair-rename-fail",
+      });
+      const epochBefore = readAuthorizationEpoch(wsId) ?? 0;
+
+      // Case A: temp-file write fails before atomicReplace is even reached.
+      const writeSpy = vi.spyOn(fs, "writeFileSync").mockImplementationOnce(() => {
+        throw new Error("ENOSPC: simulated temp write failure");
+      });
+      try {
+        expect(() => store.revokeAll()).toThrow("ENOSPC");
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(store.verifyAccessToken(issued.accessToken).ok).toBe(true);
+      expect(store.hasActiveAuthorization(client.clientId, ["workspace.read"])).toBe(true);
+      expect(readAuthorizationEpoch(wsId) ?? 0).toBe(epochBefore);
+      expect(store.consumeAuthorizationCode(pendingCode1)).toMatchObject({
+        clientId: client.clientId,
+        pairingSessionId: "pair-pre-write-fail",
+      });
+
+      // Case B: fs.renameSync fails before overwriting store.json, leaving the temp file unrenamed.
+      const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+        throw Object.assign(new Error("EACCES: simulated rename failure"), { code: "EACCES" });
+      });
+      try {
+        expect(() => store.revokeAll()).toThrow(/EACCES/);
+      } finally {
+        renameSpy.mockRestore();
+      }
+      expect(store.verifyAccessToken(issued.accessToken).ok).toBe(true);
+      expect(store.hasActiveAuthorization(client.clientId, ["workspace.read"])).toBe(true);
+      expect(readAuthorizationEpoch(wsId) ?? 0).toBe(epochBefore);
+      expect(store.consumeAuthorizationCode(pendingCode2)).toMatchObject({
+        clientId: client.clientId,
+        pairingSessionId: "pair-rename-fail",
+      });
     } finally {
       cleanup(dir);
     }

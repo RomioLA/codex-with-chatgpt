@@ -50,8 +50,31 @@ const SAFE_GIT_GLOBAL_ARGS = [
 const SAFE_FILTER_CONFIG_OVERRIDE_PATTERN = /^filter\.[A-Za-z0-9._-]+\.(?:clean|process)$/i;
 const INCLUDE_CONFIG_KEY_PATTERN = /^(?:include|includeif)\./i;
 const FILTER_EXECUTION_KEY_PATTERN = /^filter\.[\s\S]*\.(?:clean|process)$/i;
+const PROMISOR_CONFIG_KEY_PATTERN =
+  /^(?:extensions\.(?:[\s\S]*\.)?partialclone|remote\.[\s\S]*\.(?:promisor|partialclonefilter))$/i;
 const MAX_FILTER_CONFIG_OVERRIDES = 128;
 const MAX_FILTER_CONFIG_OVERRIDE_BYTES = 16 * 1024;
+const MAX_PROMISOR_CONFIG_KEYS = 128;
+const MAX_PROMISOR_CONFIG_KEY_BYTES = 4096;
+const DIRECT_REV_PARSE_ARGS = new Set([
+  "--is-inside-work-tree",
+  "--show-toplevel",
+  "--show-prefix",
+  "--absolute-git-dir",
+  "--git-common-dir",
+  "--abbrev-ref",
+  "--short",
+  "HEAD",
+]);
+
+function needsControlledGitView(args: string[]): boolean {
+  const subcommand = args[0];
+  if (subcommand === "diff" || subcommand === "status") return true;
+  if (subcommand === "rev-parse") {
+    return args.length < 2 || !args.slice(1).every((arg) => DIRECT_REV_PARSE_ARGS.has(arg));
+  }
+  return false;
+}
 const MAX_GIT_BUFFER_BYTES = 64 * 1024 * 1024;
 const MAX_CONTROLLED_CONFIG_BYTES = 2 * 1024 * 1024;
 const MAX_CONTROLLED_PACKED_REFS_BYTES = 32 * 1024 * 1024;
@@ -214,6 +237,7 @@ type BoundedReadResult =
 interface ControlledGitView {
   viewDir: string;
   viewEnv: NodeJS.ProcessEnv;
+  configFiles: readonly string[];
   currentBranch: string | null;
   copyLooseRefIfPresent: (relRef: string) => { status: "copied"; data: Buffer } | { status: "missing" } | { status: "unsafe" };
   cleanup: () => void;
@@ -534,13 +558,24 @@ function createControlledGitView(
     ensureRelDir(["refs"]);
     ensureRelDir(["info"]);
 
+    const configFiles: string[] = [];
     if (!copyOptionalFile(layout.commonDir, ["config"], MAX_CONTROLLED_CONFIG_BYTES)) {
       cleanup();
       return null;
     }
+    if (writtenRelFiles.has("config")) {
+      const viewConfigPath = path.join(viewDir, "config");
+      configFiles.push(viewConfigPath);
+      createdFiles.push(`${viewConfigPath}.lock`);
+    }
     if (!copyOptionalFile(layout.gitDir, ["config.worktree"], MAX_CONTROLLED_CONFIG_BYTES)) {
       cleanup();
       return null;
+    }
+    if (writtenRelFiles.has("config.worktree")) {
+      const viewWorktreeConfigPath = path.join(viewDir, "config.worktree");
+      configFiles.push(viewWorktreeConfigPath);
+      createdFiles.push(`${viewWorktreeConfigPath}.lock`);
     }
 
     const headRead = readBoundedRegularFile(path.join(layout.gitDir, "HEAD"), MAX_CONTROLLED_SMALL_FILE_BYTES);
@@ -653,6 +688,7 @@ function createControlledGitView(
     return {
       viewDir,
       viewEnv,
+      configFiles,
       currentBranch,
       copyLooseRefIfPresent,
       cleanup,
@@ -897,7 +933,7 @@ const CONTROLLED_CONFIG_LIST_ARGS = [
 type ControlledConfigParseResult =
   | { kind: "unstable" }
   | { kind: "unsafe_filter" }
-  | { kind: "ok"; filterKeys: string[]; upstreamRelRef: string | null };
+  | { kind: "ok"; filterKeys: string[]; promisorKeys: string[]; upstreamRelRef: string | null };
 
 function parseControlledGitConfig(
   status: number | null,
@@ -910,6 +946,7 @@ function parseControlledGitConfig(
   }
 
   const rawFilterKeys: string[] = [];
+  const rawPromisorKeys: string[] = [];
   let branchRemote: string | null = null;
   let branchMerge: string | null = null;
   const remoteKey = targetBranch !== null ? `branch.${targetBranch}.remote` : null;
@@ -933,6 +970,9 @@ function parseControlledGitConfig(
       if (FILTER_EXECUTION_KEY_PATTERN.test(key)) {
         rawFilterKeys.push(key);
       }
+      if (PROMISOR_CONFIG_KEY_PATTERN.test(key)) {
+        rawPromisorKeys.push(key);
+      }
       if (value !== null) {
         if (remoteKey !== null && key === remoteKey) branchRemote = value;
         else if (mergeKey !== null && key === mergeKey) branchMerge = value;
@@ -951,6 +991,14 @@ function parseControlledGitConfig(
     return { kind: "unsafe_filter" };
   }
 
+  const promisorKeys = [...new Set(rawPromisorKeys)];
+  if (
+    promisorKeys.length > MAX_PROMISOR_CONFIG_KEYS ||
+    promisorKeys.some((key) => key.startsWith("-") || Buffer.byteLength(key, "utf8") > MAX_PROMISOR_CONFIG_KEY_BYTES)
+  ) {
+    return { kind: "unstable" };
+  }
+
   let upstreamRelRef: string | null = null;
   if (branchRemote && branchMerge && branchMerge.startsWith("refs/heads/")) {
     const candidate = branchRemote === "."
@@ -959,7 +1007,7 @@ function parseControlledGitConfig(
     if (isSafeRelRef(candidate)) upstreamRelRef = candidate;
   }
 
-  return { kind: "ok", filterKeys, upstreamRelRef };
+  return { kind: "ok", filterKeys, promisorKeys, upstreamRelRef };
 }
 
 function unstableConfigPolicyError(options: GitReadOptions, message = "Unable to establish a stable Git configuration policy"): GitCommandResult {
@@ -1033,6 +1081,10 @@ function prepareControlledExecution(
   return { layout: layoutResolution.layout, view };
 }
 
+function buildPromisorUnsetArgs(configFile: string, key: string): string[] {
+  return [...SAFE_GIT_GLOBAL_ARGS, "config", "--no-includes", "--file", configFile, "--unset-all", key];
+}
+
 function finalizeControlledPolicyArgs(
   root: string,
   args: string[],
@@ -1041,7 +1093,7 @@ function finalizeControlledPolicyArgs(
   configStatus: number | null,
   configStdout: string,
   options: GitReadOptions
-): { ok: true; safeArgs: string[] } | { ok: false; result: GitCommandResult } {
+): { ok: true; safeArgs: string[]; promisorKeys: string[] } | { ok: false; result: GitCommandResult } {
   const parsed = parseControlledGitConfig(
     configStatus,
     configStdout,
@@ -1069,14 +1121,98 @@ function finalizeControlledPolicyArgs(
     throw new WorkspaceError("GIT_EXECUTABLE_UNTRUSTED", "Unable to establish a trusted Git executable.");
   }
 
-  return { ok: true, safeArgs: buildFilteredGitArgs(args, parsed.filterKeys) };
+  return { ok: true, safeArgs: buildFilteredGitArgs(args, parsed.filterKeys), promisorKeys: parsed.promisorKeys };
+}
+
+function stripPromisorConfigSync(
+  root: string,
+  layout: ControlledRepositoryLayout,
+  executable: GitExecutable,
+  view: ControlledGitView,
+  promisorKeys: string[],
+  options: GitReadOptions
+): GitCommandResult | null {
+  if (promisorKeys.length === 0) return null;
+  if (view.configFiles.length === 0) return unstableConfigPolicyError(options);
+
+  for (const key of promisorKeys) {
+    let unsetMatched = false;
+    for (const configFile of view.configFiles) {
+      assertGitDeadline(options);
+      const unsetResult = spawnGit(
+        executable.path,
+        layout.canonicalRoot,
+        buildPromisorUnsetArgs(configFile, key),
+        view.viewEnv,
+        options.deadlineAt
+      );
+      const unsetTimedOut = (unsetResult.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+      if (options.deadlineAt !== undefined && (unsetTimedOut || performance.now() >= options.deadlineAt)) {
+        throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+      }
+      if (unsetResult.status === 0) {
+        unsetMatched = true;
+      } else if (unsetResult.status !== 5) {
+        return unstableConfigPolicyError(options);
+      }
+    }
+    if (!unsetMatched) return unstableConfigPolicyError(options);
+  }
+
+  if (!reverifyExecutableBinding(root, executable)) {
+    throw new WorkspaceError("GIT_EXECUTABLE_UNTRUSTED", "Unable to establish a trusted Git executable.");
+  }
+  return null;
+}
+
+async function stripPromisorConfigAsync(
+  root: string,
+  layout: ControlledRepositoryLayout,
+  executable: GitExecutable,
+  view: ControlledGitView,
+  promisorKeys: string[],
+  options: GitReadOptions
+): Promise<GitCommandResult | null> {
+  if (promisorKeys.length === 0) return null;
+  if (view.configFiles.length === 0) return unstableConfigPolicyError(options);
+
+  for (const key of promisorKeys) {
+    let unsetMatched = false;
+    for (const configFile of view.configFiles) {
+      assertGitDeadline(options);
+      const unsetResult = await spawnGitAsync(
+        executable,
+        layout.canonicalRoot,
+        buildPromisorUnsetArgs(configFile, key),
+        view.viewEnv,
+        options.deadlineAt
+      );
+      if (options.deadlineAt !== undefined && (unsetResult.timedOut || performance.now() >= options.deadlineAt)) {
+        throw new WorkspaceError("DEADLINE", "Git read deadline exceeded");
+      }
+      if (unsetResult.bufferExceeded) {
+        return unstableConfigPolicyError(options);
+      }
+      if (unsetResult.status === 0) {
+        unsetMatched = true;
+      } else if (unsetResult.status !== 5) {
+        return unstableConfigPolicyError(options);
+      }
+    }
+    if (!unsetMatched) return unstableConfigPolicyError(options);
+  }
+
+  if (!reverifyExecutableBinding(root, executable)) {
+    throw new WorkspaceError("GIT_EXECUTABLE_UNTRUSTED", "Unable to establish a trusted Git executable.");
+  }
+  return null;
 }
 
 export function runGit(root: string, args: string[], options: GitReadOptions = {}): GitCommandResult {
   const { executable, env } = prepareGitExecution(root, options);
-  const needsFilterPolicy = args[0] === "diff" || args[0] === "status";
+  const useControlledView = needsControlledGitView(args);
 
-  if (!needsFilterPolicy) {
+  if (!useControlledView) {
     const safeArgs = [...SAFE_GIT_GLOBAL_ARGS, ...args];
     assertGitDeadline(options);
     const result = spawnGit(executable.path, root, safeArgs, env, options.deadlineAt);
@@ -1121,6 +1257,16 @@ export function runGit(root: string, args: string[], options: GitReadOptions = {
     );
     if (!finalized.ok) return finalized.result;
 
+    const stripError = stripPromisorConfigSync(
+      root,
+      layout,
+      executable,
+      view,
+      finalized.promisorKeys,
+      options
+    );
+    if (stripError) return stripError;
+
     assertGitDeadline(options);
     const result = spawnGit(executable.path, layout.canonicalRoot, finalized.safeArgs, view.viewEnv, options.deadlineAt);
     const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
@@ -1140,9 +1286,9 @@ export function runGit(root: string, args: string[], options: GitReadOptions = {
 
 export async function runGitAsync(root: string, args: string[], options: GitReadOptions = {}): Promise<GitCommandResult> {
   const { executable, env } = prepareGitExecution(root, options);
-  const needsFilterPolicy = args[0] === "diff" || args[0] === "status";
+  const useControlledView = needsControlledGitView(args);
 
-  if (!needsFilterPolicy) {
+  if (!useControlledView) {
     const safeArgs = [...SAFE_GIT_GLOBAL_ARGS, ...args];
     assertGitDeadline(options);
     const result = await spawnGitAsync(executable, root, safeArgs, env, options.deadlineAt);
@@ -1187,6 +1333,16 @@ export async function runGitAsync(root: string, args: string[], options: GitRead
       options
     );
     if (!finalized.ok) return finalized.result;
+
+    const stripError = await stripPromisorConfigAsync(
+      root,
+      layout,
+      executable,
+      view,
+      finalized.promisorKeys,
+      options
+    );
+    if (stripError) return stripError;
 
     assertGitDeadline(options);
     const result = await spawnGitAsync(
