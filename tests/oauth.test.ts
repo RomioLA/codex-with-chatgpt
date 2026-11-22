@@ -1633,4 +1633,97 @@ describe("Gemini and confidential client compatibility", () => {
       cleanup(dir);
     }
   });
+
+  it("distinguishes unpublished vs published revokeAll on an already-empty token store even when temp lstatSync fails", () => {
+    const dir = makeTmpDir("auth-revoke-all-empty-snapshot-fail");
+    const wsId = "e1f2a3b4c5d6";
+    try {
+      const storeFile = path.join(dir, "store.json");
+      const store = new AuthStore(wsId, { file: storeFile });
+      const client = store.registerClient({
+        clientName: "EmptySnapshotRevokeClient",
+        redirectUris: [REDIRECT_URI],
+        tokenEndpointAuthMethod: "none",
+      });
+      // Establish a persisted store.json with tokens: [] before creating a fresh auth code.
+      store.revokeAll();
+      const epochBefore = readAuthorizationEpoch(wsId) ?? 0;
+      expect(epochBefore).toBeGreaterThan(0);
+
+      const { challenge: c1 } = pkceVerifierAndChallenge();
+      const pendingCode1 = store.createAuthorizationCode({
+        clientId: client.clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: c1,
+        scopes: ["workspace.read"],
+        pairingSessionId: "pair-empty-unpublished",
+      });
+      const bytesBefore = fs.readFileSync(storeFile, "utf8");
+
+      // Case A: renameSync fails before replacing store.json AND lstatSync on the temp file also throws,
+      // leaving the old empty-token snapshot untouched on disk.
+      const realLstatSync = fs.lstatSync.bind(fs);
+      const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+        throw Object.assign(new Error("EACCES: simulated rename failure"), { code: "EACCES" });
+      });
+      const lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation(((targetPath, options) => {
+        if (String(targetPath).endsWith(".tmp")) {
+          throw Object.assign(new Error("EACCES: simulated temp lstat failure"), { code: "EACCES" });
+        }
+        return realLstatSync(targetPath as fs.PathLike, options as never);
+      }) as typeof fs.lstatSync);
+      try {
+        expect(() => store.revokeAll()).toThrow(/EACCES/);
+      } finally {
+        renameSpy.mockRestore();
+        lstatSpy.mockRestore();
+      }
+      expect(fs.readFileSync(storeFile, "utf8")).toBe(bytesBefore);
+      expect(store.verifyAccessToken("c2c_at_probe").ok).toBe(false);
+      expect(readAuthorizationEpoch(wsId) ?? 0).toBe(epochBefore);
+      expect(store.consumeAuthorizationCode(pendingCode1)).toMatchObject({
+        clientId: client.clientId,
+        pairingSessionId: "pair-empty-unpublished",
+      });
+
+      // Case B: renameSync DOES overwrite store.json on an already-empty snapshot, then post-rename read-back fails.
+      // Distinct writeNonce allows reconciliation to recognize the landed revokeAll and complete code/epoch invalidation.
+      const { challenge: c2 } = pkceVerifierAndChallenge();
+      const pendingCode2 = store.createAuthorizationCode({
+        clientId: client.clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: c2,
+        scopes: ["workspace.read"],
+        pairingSessionId: "pair-empty-published",
+      });
+      const realOpenSync = fs.openSync.bind(fs);
+      const realReadFileSync = fs.readFileSync.bind(fs);
+      let denyStoreRead = true;
+      const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((filePath, flags, mode) => {
+        if (denyStoreRead && path.resolve(String(filePath)) === path.resolve(storeFile) && flags === "r") {
+          throw Object.assign(new Error("EACCES: transient post-rename read failure"), { code: "EACCES" });
+        }
+        return realOpenSync(filePath as fs.PathLike, flags as fs.OpenMode, mode as fs.Mode | undefined);
+      }) as typeof fs.openSync);
+      const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath, options) => {
+        if (denyStoreRead && typeof filePath === "string" && path.resolve(filePath) === path.resolve(storeFile)) {
+          throw Object.assign(new Error("EACCES: transient read failure"), { code: "EACCES" });
+        }
+        return realReadFileSync(filePath as fs.PathOrFileDescriptor, options as never);
+      }) as typeof fs.readFileSync);
+      try {
+        expect(() => store.revokeAll()).toThrow(/EACCES/);
+      } finally {
+        denyStoreRead = false;
+        openSpy.mockRestore();
+        readSpy.mockRestore();
+      }
+      expect(fs.readFileSync(storeFile, "utf8")).not.toBe(bytesBefore);
+      expect(store.verifyAccessToken("c2c_at_probe").ok).toBe(false);
+      expect(readAuthorizationEpoch(wsId) ?? 0).toBeGreaterThan(epochBefore);
+      expect(store.consumeAuthorizationCode(pendingCode2)).toBeNull();
+    } finally {
+      cleanup(dir);
+    }
+  });
 });

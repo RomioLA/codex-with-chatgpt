@@ -69,6 +69,7 @@ export interface TokenRecord {
 interface PersistedAuthState {
   clients: ClientRegistration[];
   tokens: TokenRecord[];
+  writeNonce?: string;
 }
 
 export type VerifyTokenResult =
@@ -203,9 +204,12 @@ export class AuthStore {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new AuthStoreCorruptError("OAuth store file must contain a JSON object.");
     }
-    const record = parsed as { clients?: unknown; tokens?: unknown };
+    const record = parsed as { clients?: unknown; tokens?: unknown; writeNonce?: unknown };
     if (!Array.isArray(record.clients) || !Array.isArray(record.tokens)) {
       throw new AuthStoreCorruptError("OAuth store file must contain clients and tokens arrays.");
+    }
+    if (record.writeNonce !== undefined && typeof record.writeNonce !== "string") {
+      throw new AuthStoreCorruptError("OAuth store file contains an invalid writeNonce.");
     }
 
     const clients: ClientRegistration[] = [];
@@ -251,8 +255,7 @@ export class AuthStore {
       }
       const revokeAllLanded =
         this.pendingRevokeAllApplied ||
-        (this.pendingRevokeAllHash !== null &&
-          (snapshot.rawHash === this.pendingRevokeAllHash || snapshot.tokens.size === 0));
+        (this.pendingRevokeAllHash !== null && snapshot.rawHash === this.pendingRevokeAllHash);
       if (revokeAllLanded) {
         this.authCodes.clear();
         this.epochUncertain = true;
@@ -295,6 +298,7 @@ export class AuthStore {
     const state: PersistedAuthState = {
       clients: [...clientsMap.values()],
       tokens: [...tokensMap.values()].filter((t) => !t.revoked && t.expiresAt > now),
+      writeNonce: randomBytes(16).toString("hex"),
     };
     ensureDir(path.dirname(this.file));
     const bytes = Buffer.from(JSON.stringify(state, null, 2), "utf8");
