@@ -229,7 +229,7 @@ describe("workspace Bridge instance lock remediation", () => {
     }
   });
 
-  it("recovers a live PID that process identity proves is unrelated", async () => {
+  it("recovers a live PID that process creation identity proves is unrelated", async () => {
     isolateStateDir();
     const { root, workspace } = makeWorkspace("lock-reused-unrelated-pid");
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
@@ -249,6 +249,7 @@ describe("workspace Bridge instance lock remediation", () => {
         pid: child.pid,
         token: randomBytes(16).toString("hex"),
         createdAt: new Date().toISOString(),
+        processStartTime: "2026-11-01T00:00:00.0000000Z",
       }));
       expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("stale");
       bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
@@ -259,6 +260,42 @@ describe("workspace Bridge instance lock remediation", () => {
     } finally {
       ownerProbe.mockRestore();
       if (bridge) await bridge.close();
+      if (child.pid) {
+        try { child.kill("SIGKILL"); } catch { /* the child may already have exited */ }
+      }
+    }
+  });
+
+  it("never recovers a live lock lacking processStartTime even if process identity looks unrelated", async () => {
+    isolateStateDir();
+    const { root, workspace } = makeWorkspace("lock-legacy-no-starttime-live");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const ownerProbe = vi.spyOn(processIdentity, "observeBridgeProcessOwner").mockResolvedValue("unrelated");
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", () => resolve());
+        child.once("error", reject);
+      });
+      if (!child.pid) throw new Error("Could not start isolated legacy lock fixture");
+      const lockToken = randomBytes(16).toString("hex");
+      const lockFile = bridgeInstanceLockFile(workspace.id);
+      fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+      fs.writeFileSync(lockFile, JSON.stringify({
+        version: 1,
+        workspaceId: workspace.id,
+        pid: child.pid,
+        token: lockToken,
+        createdAt: new Date().toISOString(),
+      }));
+      expect(await inspectBridgeInstanceLock(workspace.id, root)).toBe("live_pid_unverified");
+      await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
+        .rejects.toThrow(/live but unverified|cannot be verified/i);
+      expect(ownerProbe).not.toHaveBeenCalled();
+      const surviving = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { token: string; pid: number };
+      expect(surviving.token).toBe(lockToken);
+      expect(surviving.pid).toBe(child.pid);
+    } finally {
+      ownerProbe.mockRestore();
       if (child.pid) {
         try { child.kill("SIGKILL"); } catch { /* the child may already have exited */ }
       }
@@ -346,6 +383,7 @@ describe("workspace Bridge instance lock remediation", () => {
           pid: process.pid,
           token: tokenB,
           createdAt: new Date().toISOString(),
+          processStartTime: "2026-11-04T08:38:12.1447236Z",
         }));
         return "unrelated";
       }
@@ -365,6 +403,7 @@ describe("workspace Bridge instance lock remediation", () => {
         pid: child.pid,
         token: tokenA,
         createdAt: new Date(0).toISOString(),
+        processStartTime: "2026-11-01T00:00:00.0000000Z",
       }));
 
       await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))
@@ -474,6 +513,7 @@ describe("workspace Bridge instance lock remediation", () => {
         pid: child.pid,
         token,
         createdAt: new Date(0).toISOString(),
+        processStartTime: "2026-11-01T00:00:00.0000000Z",
       }));
 
       await expect(startBridge({ workspaceRoot: root, port: 0, persistRuntime: false }))

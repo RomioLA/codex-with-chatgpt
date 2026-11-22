@@ -19,12 +19,18 @@ describe("Bridge process identity", () => {
     expect(classifyBridgeProcessIdentity(identity(), "C:\\codex")).toBe("bridge");
   });
 
-  it("proves a non-Node process cannot own the Bridge PID", () => {
+  it("keeps non-node.exe or renamed Node executables unknown without expectedStartTime", () => {
     expect(classifyBridgeProcessIdentity(identity({
       name: "sunshine.exe",
       exePath: "C:\\Program Files\\Sunshine\\sunshine.exe",
       commandLine: null,
-    }), "C:\\codex")).toBe("unrelated");
+    }), "C:\\codex")).toBe("unknown");
+
+    expect(classifyBridgeProcessIdentity(identity({
+      name: "c2c-node.exe",
+      exePath: "C:\\Runtime\\c2c-node.exe",
+      commandLine: '"C:\\Runtime\\c2c-node.exe" "C:\\Runtime\\dist\\cli\\index.js" serve --workspace "C:\\codex"',
+    }), "C:\\codex")).toBe("unknown");
   });
 
   it("keeps a legacy C2C Bridge with another --workspace string unknown without expectedStartTime", () => {
@@ -98,7 +104,7 @@ describe("Bridge process identity", () => {
     )).toBe("unrelated");
   });
 
-  it("handles missing WMI startTime when expectedStartTime is provided", () => {
+  it("keeps identity unknown when WMI startTime is missing even for non-node.exe executables", () => {
     expect(classifyBridgeProcessIdentity(
       identity({
         name: "sunshine.exe",
@@ -108,7 +114,17 @@ describe("Bridge process identity", () => {
       }),
       "C:\\codex",
       { expectedStartTime: "2026-11-04T08:38:12.1447236Z" },
-    )).toBe("unrelated");
+    )).toBe("unknown");
+
+    expect(classifyBridgeProcessIdentity(
+      identity({
+        name: "c2c-node.exe",
+        exePath: "C:\\Runtime\\c2c-node.exe",
+        startTime: "2026-11-04T08:38:12.1447236Z",
+      }),
+      "C:\\codex",
+      { expectedStartTime: "2026-11-04T08:38:12.1447236Z" },
+    )).toBe("bridge");
 
     expect(classifyBridgeProcessIdentity(
       identity({

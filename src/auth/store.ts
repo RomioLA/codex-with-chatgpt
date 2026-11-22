@@ -143,6 +143,8 @@ export class AuthStore {
   private clients = new Map<string, ClientRegistration>();
   private tokens = new Map<string, TokenRecord>();
   private authCodes = new Map<string, AuthorizationCodeRecord>();
+  private stateUncertain = false;
+  private epochUncertain = false;
   private readonly file: string;
 
   constructor(
@@ -154,12 +156,17 @@ export class AuthStore {
     this.load();
   }
 
-  private load(): void {
+  private readDiskSnapshot(): {
+    clients: Map<string, ClientRegistration>;
+    tokens: Map<string, TokenRecord>;
+  } {
     let stat: fs.Stats;
     try {
       stat = fs.lstatSync(this.file);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { clients: new Map(), tokens: new Map() };
+      }
       throw new AuthStoreCorruptError("Cannot inspect OAuth store file.");
     }
     if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -204,9 +211,51 @@ export class AuthStore {
     }
 
     const now = Date.now();
-    for (const client of clients) this.clients.set(client.clientId, client);
+    const clientsMap = new Map<string, ClientRegistration>();
+    const tokensMap = new Map<string, TokenRecord>();
+    for (const client of clients) clientsMap.set(client.clientId, client);
     for (const token of tokens) {
-      if (!token.revoked && token.expiresAt > now) this.tokens.set(token.hash, token);
+      if (!token.revoked && token.expiresAt > now) tokensMap.set(token.hash, token);
+    }
+    return { clients: clientsMap, tokens: tokensMap };
+  }
+
+  private load(): void {
+    const snapshot = this.readDiskSnapshot();
+    this.clients = snapshot.clients;
+    this.tokens = snapshot.tokens;
+  }
+
+  /**
+   * Reconcile in-memory state with authoritative disk state after an uncertain
+   * atomicReplace or interrupted epoch bump before allowing further reads/writes.
+   */
+  private ensureReconciled(): void {
+    if (this.stateUncertain) {
+      const snapshot = this.readDiskSnapshot();
+      for (const [hash, previous] of this.tokens) {
+        if (!snapshot.tokens.has(hash)) previous.revoked = true;
+      }
+      for (const [code, authCode] of this.authCodes) {
+        if (!snapshot.clients.has(authCode.clientId)) this.authCodes.delete(code);
+      }
+      this.clients = snapshot.clients;
+      this.tokens = snapshot.tokens;
+      this.stateUncertain = false;
+    }
+    if (this.epochUncertain) {
+      incrementAuthorizationEpoch(this.workspaceId);
+      this.epochUncertain = false;
+    }
+  }
+
+  private tryReconcile(): boolean {
+    if (!this.stateUncertain && !this.epochUncertain) return true;
+    try {
+      this.ensureReconciled();
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -214,6 +263,7 @@ export class AuthStore {
     clientsMap: Map<string, ClientRegistration>,
     tokensMap: Map<string, TokenRecord>
   ): void {
+    this.ensureReconciled();
     const now = Date.now();
     const state: PersistedAuthState = {
       clients: [...clientsMap.values()],
@@ -240,8 +290,13 @@ export class AuthStore {
       } catch {
         // best effort on platforms without POSIX chmod semantics
       }
-      atomicReplace(tempFile, this.file, { expectedNewHash });
-      published = true;
+      try {
+        atomicReplace(tempFile, this.file, { expectedNewHash });
+        published = true;
+      } catch (error) {
+        this.stateUncertain = true;
+        throw error;
+      }
     } finally {
       if (fd !== undefined) {
         try {
@@ -269,6 +324,7 @@ export class AuthStore {
     clientSecret?: string;
     trustedLocalClient?: boolean;
   }): ClientRegistration & { clientSecret?: string } {
+    this.ensureReconciled();
     const authMethod = input.tokenEndpointAuthMethod;
     const isConfidential = authMethod === "client_secret_post" || authMethod === "client_secret_basic";
     const plainSecret = isConfidential
@@ -294,6 +350,7 @@ export class AuthStore {
   }
 
   getClient(clientId: string): ClientRegistration | undefined {
+    this.ensureReconciled();
     return this.clients.get(clientId);
   }
 
@@ -304,6 +361,7 @@ export class AuthStore {
   ):
     | { ok: true; client: ClientRegistration }
     | { ok: false; reason: "unknown_client" | "invalid_client"; challengeBasic?: boolean } {
+    this.ensureReconciled();
     if (typeof clientId !== "string" || clientId.length === 0) {
       return { ok: false, reason: "unknown_client", challengeBasic: authSource === "basic" };
     }
@@ -351,6 +409,7 @@ export class AuthStore {
     pairingSessionId: string;
     resource?: string;
   }): string {
+    this.ensureReconciled();
     const code = newToken("c2c_ac");
     this.authCodes.set(code, {
       code,
@@ -368,6 +427,7 @@ export class AuthStore {
 
   /** One-time consumption of an authorization code. */
   consumeAuthorizationCode(code: string): AuthorizationCodeRecord | null {
+    this.ensureReconciled();
     const record = this.authCodes.get(code);
     if (!record) return null;
     this.authCodes.delete(code);
@@ -436,6 +496,7 @@ export class AuthStore {
     workspaceId?: string;
     accessTtlMs?: number;
   }): { accessToken: string; refreshToken: string | null; expiresIn: number; scopes: string[] } {
+    this.ensureReconciled();
     const { result, records } = this.prepareIssuedTokens(input);
     const nextTokens = new Map(this.tokens);
     for (const record of records) {
@@ -447,6 +508,7 @@ export class AuthStore {
   }
 
   verifyAccessToken(token: string): VerifyTokenResult {
+    if (!this.tryReconcile()) return { ok: false, reason: "unknown" };
     const record = this.tokens.get(sha256hex(token));
     if (!record) return { ok: false, reason: "unknown" };
     if (record.kind !== "access") return { ok: false, reason: "wrong_kind" };
@@ -460,6 +522,7 @@ export class AuthStore {
     refreshToken: string,
     clientId: string
   ): { ok: true; tokens: ReturnType<AuthStore["issueTokens"]> } | { ok: false; reason: string } {
+    this.ensureReconciled();
     const record = this.tokens.get(sha256hex(refreshToken));
     if (!record || record.kind !== "refresh") return { ok: false, reason: "invalid_grant" };
     if (record.revoked) return { ok: false, reason: "invalid_grant" };
@@ -482,6 +545,7 @@ export class AuthStore {
   }
 
   revokeToken(token: string): boolean {
+    this.ensureReconciled();
     const record = this.tokens.get(sha256hex(token));
     if (!record) return false;
     const nextTokens = new Map(this.tokens);
@@ -494,17 +558,27 @@ export class AuthStore {
 
   /** Used by `c2c unpair`: revoke everything for this workspace. */
   revokeAll(): number {
+    this.ensureReconciled();
     const count = this.tokens.size;
     this.persistState(this.clients, new Map());
-    // Revoke persisted Tasks even when this AuthStore is used by the offline
-    // `c2c unpair` path. The workspace epoch survives Bridge restarts.
-    incrementAuthorizationEpoch(this.workspaceId);
+    for (const record of this.tokens.values()) {
+      record.revoked = true;
+    }
     this.tokens.clear();
     this.authCodes.clear();
+    // Revoke persisted Tasks even when this AuthStore is used by the offline
+    // `c2c unpair` path. The workspace epoch survives Bridge restarts.
+    try {
+      incrementAuthorizationEpoch(this.workspaceId);
+    } catch (error) {
+      this.epochUncertain = true;
+      throw error;
+    }
     return count;
   }
 
   tokenCount(): number {
+    if (!this.tryReconcile()) return 0;
     return this.tokens.size;
   }
 
@@ -514,6 +588,7 @@ export class AuthStore {
    * background-resume revalidation; MCP requests still check their own token.
    */
   hasActiveAuthorization(clientId: string, requiredScopes: readonly string[]): boolean {
+    if (!this.tryReconcile()) return false;
     if (typeof clientId !== "string" || clientId.length < 1 || !Array.isArray(requiredScopes)) return false;
     const now = Date.now();
     for (const token of this.tokens.values()) {

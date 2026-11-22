@@ -222,10 +222,26 @@ function sameLogicalJobCore(active: ExecutionJob, archived: ExecutionJob): boole
     active.exitCode === archived.exitCode;
 }
 
+function sameGitResult(a: ExecutionJob["gitResult"], b: ExecutionJob["gitResult"]): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.integrity === b.integrity &&
+    a.confirmation === b.confirmation &&
+    a.confirmationScope === b.confirmationScope &&
+    a.remoteOutcome === b.remoteOutcome &&
+    a.partialSuccessPossible === b.partialSuccessPossible &&
+    a.headBefore === b.headBefore &&
+    a.headAfter === b.headAfter &&
+    a.branchBefore === b.branchBefore &&
+    a.branchAfter === b.branchAfter;
+}
+
 function sameLogicalJob(active: ExecutionJob, archived: ExecutionJob): boolean {
   return sameLogicalJobCore(active, archived) &&
+    active.createdAt === archived.createdAt &&
     active.state === archived.state && active.recoveryEvidence === archived.recoveryEvidence &&
-    active.finishedAt === archived.finishedAt && active.failureCode === archived.failureCode;
+    active.finishedAt === archived.finishedAt && active.failureCode === archived.failureCode &&
+    sameGitResult(active.gitResult, archived.gitResult);
 }
 
 function sameLogicalJobForRecovery(active: ExecutionJob, archived: ExecutionJob): boolean {
@@ -316,6 +332,14 @@ function isOutputStream(value: string): value is OutputStream {
   return value === "stdout" || value === "stderr";
 }
 
+function normalizeJobRecord(job: ExecutionJob): ExecutionJob {
+  return {
+    ...job,
+    executionContext: job.executionContext ?? "repository",
+    tempOwnership: job.tempOwnership ?? null,
+  } as ExecutionJob;
+}
+
 export class ExecutionJobStore {
   readonly directory: string;
   private readonly file: string;
@@ -392,11 +416,7 @@ export class ExecutionJobStore {
         this.markCorrupt("duplicate_job_id");
         return;
       }
-      loaded.set(value.jobId, {
-        ...value,
-        executionContext: value.executionContext ?? "repository",
-        tempOwnership: value.tempOwnership ?? null,
-      } as ExecutionJob);
+      loaded.set(value.jobId, normalizeJobRecord(value as ExecutionJob));
     }
     const directoryEntries = fs.readdirSync(this.directory);
     let mutatedDuringLoad = false;
@@ -618,7 +638,7 @@ export class ExecutionJobStore {
     if (job.workspaceId !== this.workspaceId || this.jobs.has(job.jobId)) throw new TypeError("Invalid execution job");
     const next = this.prune(new Map(this.jobs), Date.now(), true);
     if (next.size >= MAX_JOBS_PER_WORKSPACE) throw new Error("JOB_STORE_FULL");
-    next.set(job.jobId, { ...job, stdout: { ...EMPTY_STREAM }, stderr: { ...EMPTY_STREAM } });
+    next.set(job.jobId, normalizeJobRecord({ ...job, stdout: { ...EMPTY_STREAM }, stderr: { ...EMPTY_STREAM } }));
     this.persist(next);
     this.commitJobs(next);
     this.outputWriters.set(outputWriterKey(job.jobId, "stdout"), newOutputWriter());
@@ -769,22 +789,20 @@ export class ExecutionJobStore {
     if (this.corruption) throw new Error("STORE_CORRUPT");
     const previous = this.jobs.get(job.jobId);
     if (job.workspaceId !== this.workspaceId || !previous) throw new TypeError("Unknown execution job");
+    const normalized = normalizeJobRecord(job);
+    const now = Date.now();
     const staged = new Map(this.jobs);
-    staged.set(job.jobId, job);
-    if (!sameLogicalJob(previous, job)) {
-      this.jobs.set(job.jobId, job);
-      this.persist();
+    staged.set(normalized.jobId, normalized);
+    // Persist the complete updated record into jobs.json before publishing any
+    // immutable archive record so a crash or archive-publish failure can never
+    // leave jobs.json and .archive/jobs disagreeing on any field (including gitResult).
+    this.jobs.set(normalized.jobId, normalized);
+    this.persist();
+    const next = this.prune(staged, now);
+    if (next.size !== staged.size) {
+      this.persist(next);
+      this.commitJobs(next);
     }
-    const next = this.prune(staged);
-    if (next.size === staged.size) {
-      if (this.jobs.get(job.jobId) !== job) {
-        this.jobs.set(job.jobId, job);
-        this.persist();
-      }
-      return;
-    }
-    this.persist(next);
-    this.commitJobs(next);
   }
 
   appendSanitized(jobId: string, stream: OutputStream, text: string): Promise<void> {

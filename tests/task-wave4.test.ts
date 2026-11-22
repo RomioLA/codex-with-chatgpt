@@ -442,7 +442,8 @@ describe("Task restart, retry, authorization, and cancellation", () => {
         phase: "CHECKPOINTED",
       }],
     });
-    expect(reloadedJobs.listAll().map((job) => job.jobId)).toEqual([started.job.jobId]);
+    expect(reloadedJobs.listAll()).toEqual([]);
+    expect(reloadedJobs.get(started.job.jobId)).toMatchObject({ jobId: started.job.jobId, state: "succeeded" });
     expect(runner.runs.size).toBe(1);
   });
   }

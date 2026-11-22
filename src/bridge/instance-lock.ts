@@ -124,7 +124,11 @@ async function canRecoverLockOwner(
   const presence = processPresence(record.pid);
   if (presence === "dead") return true;
   if (presence !== "alive" || isLocallyOwnedLock(file, record)) return false;
-  const owner = await observeBridgeProcessOwner(record.pid, workspaceRoot, record.processStartTime);
+  const expectedStartTime = typeof record.processStartTime === "string"
+    ? record.processStartTime.trim()
+    : "";
+  if (!expectedStartTime) return false;
+  const owner = await observeBridgeProcessOwner(record.pid, workspaceRoot, expectedStartTime);
   return owner === "unrelated";
 }
 

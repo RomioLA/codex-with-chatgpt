@@ -1372,4 +1372,114 @@ describe("Gemini and confidential client compatibility", () => {
     expect(created.tokenEndpointAuthMethod).toBe("client_secret_basic");
     expect(bridge.authStore.getClient(created.clientId)?.trustedLocalClient).toBe(true);
   });
+
+  it("halts token validation/issuance and reconciles from disk when post-rename verification fails", () => {
+    const dir = makeTmpDir("auth-post-rename-reconcile");
+    try {
+      const storeFile = path.join(dir, "store.json");
+      const store = new AuthStore("a1b2c3d4e5f6", { file: storeFile });
+      const client = store.registerClient({
+        clientName: "PostRenameTest",
+        redirectUris: [REDIRECT_URI],
+        tokenEndpointAuthMethod: "none",
+      });
+      const initial = store.issueTokens({
+        clientId: client.clientId,
+        scopes: ["workspace.read", "offline_access"],
+      });
+
+      // Block read-back on storeFile right after renameWithWindowsRetry publishes the rotated state.
+      const realOpenSync = fs.openSync.bind(fs);
+      let denyStoreRead = true;
+      const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((filePath, flags, mode) => {
+        if (denyStoreRead && path.resolve(String(filePath)) === path.resolve(storeFile) && flags === "r") {
+          const err = Object.assign(new Error("EACCES: transient post-rename read failure"), { code: "EACCES" });
+          throw err;
+        }
+        return realOpenSync(filePath as fs.PathLike, flags as fs.OpenMode, mode as fs.Mode | undefined);
+      }) as typeof fs.openSync);
+      const realReadFileSync = fs.readFileSync.bind(fs);
+      const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((filePath, options) => {
+        if (
+          denyStoreRead &&
+          typeof filePath === "string" &&
+          path.resolve(filePath) === path.resolve(storeFile)
+        ) {
+          const err = Object.assign(new Error("EACCES: transient read failure"), { code: "EACCES" });
+          throw err;
+        }
+        return realReadFileSync(filePath as fs.PathOrFileDescriptor, options as never);
+      }) as typeof fs.readFileSync);
+
+      try {
+        expect(() => store.refresh(initial.refreshToken!, client.clientId)).toThrow(/EACCES/);
+
+        // While reconciliation cannot read storeFile, token checks and writes fail closed.
+        expect(store.verifyAccessToken(initial.accessToken).ok).toBe(false);
+        expect(store.hasActiveAuthorization(client.clientId, ["workspace.read"])).toBe(false);
+        expect(() => store.issueTokens({ clientId: client.clientId, scopes: ["workspace.read"] }))
+          .toThrow(AuthStoreCorruptError);
+        expect(() => store.registerClient({ redirectUris: [REDIRECT_URI] }))
+          .toThrow(AuthStoreCorruptError);
+      } finally {
+        denyStoreRead = false;
+        openSpy.mockRestore();
+        readSpy.mockRestore();
+      }
+
+      // Once readable again, subsequent operations reconcile disk first instead of writing stale tokens back.
+      const diskRotatedSnapshot = JSON.parse(fs.readFileSync(storeFile, "utf8")) as { tokens: Array<{ hash: string }> };
+      expect(diskRotatedSnapshot.tokens).toHaveLength(3);
+
+      store.registerClient({ clientName: "AfterReconcile", redirectUris: [REDIRECT_URI] });
+      expect(store.refresh(initial.refreshToken!, client.clientId)).toEqual({
+        ok: false,
+        reason: "invalid_grant",
+      });
+      const diskAfterSave = JSON.parse(fs.readFileSync(storeFile, "utf8")) as { tokens: Array<{ hash: string }> };
+      expect(diskAfterSave.tokens.map((t) => t.hash)).toEqual(diskRotatedSnapshot.tokens.map((t) => t.hash));
+    } finally {
+      cleanup(dir);
+    }
+  });
+
+  it("clears in-memory tokens immediately in revokeAll even if authorization epoch update fails", () => {
+    const dir = makeTmpDir("auth-revoke-all-epoch-fail");
+    const wsId = "b1c2d3e4f5a6";
+    const permDir = path.join(process.env.C2C_STATE_DIR!, "permissions");
+    fs.mkdirSync(permDir, { recursive: true });
+    const permFile = path.join(permDir, `${wsId}.json`);
+    try {
+      const storeFile = path.join(dir, "store.json");
+      const store = new AuthStore(wsId, { file: storeFile });
+      const client = store.registerClient({
+        clientName: "EpochFailClient",
+        redirectUris: [REDIRECT_URI],
+        tokenEndpointAuthMethod: "none",
+      });
+      const issued = store.issueTokens({
+        clientId: client.clientId,
+        scopes: ["workspace.read", "offline_access"],
+      });
+
+      // Force incrementAuthorizationEpoch to throw after persistState empties store.json.
+      fs.writeFileSync(permFile, "{corrupt-permission-file", "utf8");
+      expect(() => store.revokeAll()).toThrow("AUTHORIZATION_EPOCH_UNAVAILABLE");
+
+      // Old tokens must neither validate in memory nor be usable while epoch bump is pending.
+      expect(store.verifyAccessToken(issued.accessToken).ok).toBe(false);
+      expect(store.hasActiveAuthorization(client.clientId, ["workspace.read"])).toBe(false);
+      expect(() => store.registerClient({ redirectUris: [REDIRECT_URI] })).toThrow("AUTHORIZATION_EPOCH_UNAVAILABLE");
+
+      // Once permission state is repaired, reconciliation completes the epoch bump and never writes old tokens back.
+      fs.unlinkSync(permFile);
+      store.registerClient({ clientName: "PostRecoveryClient", redirectUris: [REDIRECT_URI] });
+      const persisted = JSON.parse(fs.readFileSync(storeFile, "utf8")) as { tokens: unknown[] };
+      expect(persisted.tokens).toEqual([]);
+      expect(store.verifyAccessToken(issued.accessToken).ok).toBe(false);
+    } finally {
+      if (fs.existsSync(permFile)) fs.unlinkSync(permFile);
+      cleanup(dir);
+    }
+  });
 });

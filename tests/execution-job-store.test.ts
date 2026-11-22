@@ -1195,4 +1195,74 @@ describe("ExecutionJobStore", () => {
       lstatSpy.mockRestore();
     }
   });
+
+  it("persists gitResult-only updates to jobs.json before archiving expired Git jobs", () => {
+    const directory = makeTmpDir("execution-replace-gitresult-archive");
+    const workspaceId = "replace-gitresult";
+    let indexWritesDuringReplace = 0;
+    let failRemovalIndexWrite = false;
+
+    const store = new ExecutionJobStore(workspaceId, {
+      directory,
+      replaceActiveIndex(source, destination, options) {
+        if (failRemovalIndexWrite) {
+          indexWritesDuringReplace += 1;
+          if (indexWritesDuringReplace === 2) {
+            throw new Error("INJECT_GITRESULT_INDEX_REMOVAL_FAILURE");
+          }
+        }
+        return atomicReplace(source, destination, options);
+      },
+    });
+
+    const oldAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    const gitJob = makeJob(workspaceId, "succeeded");
+    gitJob.createdAt = oldAt;
+    gitJob.startedAt = oldAt;
+    gitJob.finishedAt = oldAt;
+    gitJob.exitCode = 0;
+    gitJob.idempotencyKeyHash = randomBytes(32).toString("hex");
+    gitJob.authorization = {
+      type: "git",
+      requestId: "req-git-1234567890abcdef",
+      digest: "d".repeat(64),
+    };
+    // Without gitResult yet, store.create keeps this expired Git job in active jobs.json.
+    store.create(gitJob);
+    expect(store.listAll().map((j) => j.jobId)).toEqual([gitJob.jobId]);
+
+    const completedWithGitResult: ExecutionJob = {
+      ...store.get(gitJob.jobId)!,
+      gitResult: {
+        integrity: "verified",
+        confirmation: "confirmed",
+        confirmationScope: "local_repository",
+        remoteOutcome: "not_applicable",
+        partialSuccessPossible: false,
+        headBefore: "1".repeat(40),
+        headAfter: "2".repeat(40),
+        branchBefore: "main",
+        branchAfter: "main",
+      },
+    };
+
+    failRemovalIndexWrite = true;
+    expect(() => store.replace(completedWithGitResult)).toThrow("INJECT_GITRESULT_INDEX_REMOVAL_FAILURE");
+    expect(indexWritesDuringReplace).toBe(2);
+
+    // Both jobs.json and .archive/jobs must already hold identical gitResult metadata.
+    const rawActive = JSON.parse(fs.readFileSync(path.join(directory, "jobs.json"), "utf8")) as { jobs: ExecutionJob[] };
+    expect(rawActive.jobs[0]?.gitResult).toEqual(completedWithGitResult.gitResult);
+    expect(readArchivedRecord<ExecutionJob>(directory, "jobs", gitJob.jobId)?.gitResult)
+      .toEqual(completedWithGitResult.gitResult);
+    expect(store.lookupIdempotentForReconciliation(gitJob.oauthClientId, gitJob.idempotencyKeyHash))
+      .toMatchObject({
+        kind: "found",
+        job: { jobId: gitJob.jobId, gitResult: completedWithGitResult.gitResult },
+      });
+
+    const reopened = new ExecutionJobStore(workspaceId, { directory });
+    expect(reopened.listAll()).toEqual([]);
+    expect(reopened.get(gitJob.jobId)?.gitResult).toEqual(completedWithGitResult.gitResult);
+  });
 });

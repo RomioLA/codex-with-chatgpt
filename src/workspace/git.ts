@@ -35,12 +35,17 @@ const NULL_DEVICE = process.platform === "win32" ? "NUL" : os.devNull;
 
 const SAFE_GIT_GLOBAL_ARGS = [
   "--no-pager",
+  "--no-lazy-fetch",
   "-c", "core.fsmonitor=false",
   "-c", "core.pager=cat",
   "-c", "core.editor=:",
   "-c", "sequence.editor=:",
   "-c", `core.attributesFile=${NULL_DEVICE}`,
   "-c", "credential.interactive=false",
+  "-c", "submodule.recurse=false",
+  "-c", "status.submodulesummary=false",
+  "-c", "diff.submodule=short",
+  "-c", "protocol.allow=never",
 ];
 
 const SAFE_FILTER_CONFIG_OVERRIDE_PATTERN = /^filter\.[A-Za-z0-9._-]+\.(?:clean|process)$/i;
@@ -81,6 +86,8 @@ function createGitEnvironment(): NodeJS.ProcessEnv {
     GIT_CONFIG_SYSTEM: NULL_DEVICE,
     GIT_CONFIG_GLOBAL: NULL_DEVICE,
     GIT_ATTR_NOSYSTEM: "1",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_ALLOW_PROTOCOL: "",
     GIT_OPTIONAL_LOCKS: "0",
     GIT_TERMINAL_PROMPT: "0",
     GIT_PAGER: "cat",
@@ -983,16 +990,28 @@ function prepareGitExecution(root: string, options: GitReadOptions): { executabl
 
 function buildFilteredGitArgs(args: string[], filterKeys: string[]): string[] {
   const filterOverrides = filterKeys.flatMap((key) => ["-c", `${key}=`]);
-  return args[0] === "diff"
-    ? [
-        ...SAFE_GIT_GLOBAL_ARGS,
-        ...filterOverrides,
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        ...args.slice(1),
-      ]
-    : [...SAFE_GIT_GLOBAL_ARGS, ...filterOverrides, ...args];
+  if (args[0] === "diff") {
+    return [
+      ...SAFE_GIT_GLOBAL_ARGS,
+      ...filterOverrides,
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--submodule=short",
+      "--ignore-submodules=dirty",
+      ...args.slice(1),
+    ];
+  }
+  if (args[0] === "status") {
+    return [
+      ...SAFE_GIT_GLOBAL_ARGS,
+      ...filterOverrides,
+      "status",
+      "--ignore-submodules=dirty",
+      ...args.slice(1),
+    ];
+  }
+  return [...SAFE_GIT_GLOBAL_ARGS, ...filterOverrides, ...args];
 }
 
 function prepareControlledExecution(

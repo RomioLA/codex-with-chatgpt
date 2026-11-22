@@ -116,10 +116,10 @@ function normalizeWinPath(p: string): string {
 
 /**
  * Classify only what the process metadata proves. When `expectedStartTime` is
- * present, OS process creation time establishes whether a live PID is the same
- * OS process regardless of path aliases (e.g. Windows junctions). For legacy
- * records without `expectedStartTime`, C2C entries with differing or unverified
- * `--workspace` strings stay `"unknown"` rather than risking a false `"unrelated"`.
+ * present and WMI reports `startTime`, OS process creation time establishes
+ * whether a live PID is the same OS process regardless of path aliases or
+ * executable basename (`process.execPath` is not required to be `node.exe`).
+ * Without both timestamps, never classify a live process as `"unrelated"`.
  */
 export function classifyBridgeProcessIdentity(
   identity: WindowsProcessIdentity,
@@ -137,20 +137,12 @@ export function classifyBridgeProcessIdentity(
     if (typeof identity.startTime === "string" && identity.startTime.trim().length > 0) {
       return identity.startTime.trim() === expectedStartTime ? "bridge" : "unrelated";
     }
-    const executable = identity.exePath || identity.name;
-    if (
-      typeof executable === "string" &&
-      executable.trim() &&
-      path.win32.basename(executable).toLowerCase() !== "node.exe"
-    ) {
-      return "unrelated";
-    }
     return "unknown";
   }
 
   const executable = identity.exePath || identity.name;
   if (typeof executable !== "string" || !executable.trim()) return "unknown";
-  if (path.win32.basename(executable).toLowerCase() !== "node.exe") return "unrelated";
+  if (path.win32.basename(executable).toLowerCase() !== "node.exe") return "unknown";
   if (typeof identity.commandLine !== "string" || !identity.commandLine.trim()) return "unknown";
 
   let normalizedRoot: string;
@@ -168,23 +160,17 @@ export function classifyBridgeProcessIdentity(
   const hasServe = /(?:^|[\s"'])serve(?:$|[\s"'])/i.test(commandLine);
   const workspaceArg = extractWorkspaceArg(identity.commandLine);
 
-  if (hasC2cEntry) {
-    if (hasServe && workspaceArg.kind === "found" && path.win32.isAbsolute(workspaceArg.value)) {
-      let normalizedArg: string;
-      try {
-        normalizedArg = normalizeWinPath(workspaceArg.value);
-      } catch {
-        return "unknown";
-      }
-      if (normalizedArg === normalizedRoot) return "bridge";
+  if (hasC2cEntry && hasServe && workspaceArg.kind === "found" && path.win32.isAbsolute(workspaceArg.value)) {
+    let normalizedArg: string;
+    try {
+      normalizedArg = normalizeWinPath(workspaceArg.value);
+    } catch {
+      return "unknown";
     }
-    return "unknown";
+    if (normalizedArg === normalizedRoot) return "bridge";
   }
 
-  if (hasServe && workspaceArg.kind !== "missing") {
-    return "unknown";
-  }
-  return "unrelated";
+  return "unknown";
 }
 
 /** Read-only Windows process identity probe. Unsupported or inaccessible data fails closed. */

@@ -23,6 +23,8 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 import {
+  gitCompare,
+  gitCompareAsync,
   gitDiff,
   gitDiffAsync,
   gitInfo,
@@ -31,6 +33,8 @@ import {
   gitRepositoryInfoAsync,
   gitStatus,
   gitStatusAsync,
+  resolveGitCommit,
+  resolveGitCommitAsync,
   selectGitRepository,
   selectGitRepositoryAsync,
 } from "../src/workspace/git.js";
@@ -508,5 +512,122 @@ describe("Git subprocess execution policy", () => {
     expect(gitStatus(fixture.root).isRepo).toBe(false);
     expect(gitDiff(fixture.root, { mode: "unstaged" }).isRepo).toBe(false);
     expect(gitInfo(fixture.root)).toMatchObject({ isRepo: true, dirty: null });
+  });
+
+  it("blocks submodule worktree recursion and inline diff while preserving gitlink changes", async () => {
+    const subSource = makeTmpDir("git-security-sub-source");
+    makeGitRepo(subSource);
+    write(subSource, "tracked.sub", "sub v1\n");
+    write(subSource, ".gitattributes", "*.sub filter=subtrap\n");
+    git(subSource, "add", ".");
+    git(subSource, "commit", "-m", "sub v1");
+    const subCommit1 = git(subSource, "rev-parse", "HEAD").trim();
+
+    write(subSource, "tracked.sub", "sub v2\n");
+    git(subSource, "add", ".");
+    git(subSource, "commit", "-m", "sub v2");
+    const subCommit2 = git(subSource, "rev-parse", "HEAD").trim();
+
+    const fixture = makeFixture("submodule-filter");
+    const subMarker = path.join(fixture.root, "submodule-filter.marker");
+    git(fixture.root, "-c", "protocol.file.allow=always", "submodule", "add", subSource, "sub");
+    const subWorktree = path.join(fixture.root, "sub");
+    git(subWorktree, "checkout", subCommit1);
+    git(fixture.root, "add", ".gitmodules", "sub");
+    git(fixture.root, "commit", "-m", "add submodule at v1");
+    const baseSuperCommit = git(fixture.root, "rev-parse", "HEAD").trim();
+
+    // Configure an active clean filter inside the submodule's own config, plus recursive/inline settings in superproject.
+    git(subWorktree, "config", "filter.subtrap.clean", fixture.markerCommand(subMarker));
+    git(fixture.root, "config", "diff.submodule", "diff");
+    git(fixture.root, "config", "status.submodulesummary", "true");
+    git(fixture.root, "config", "submodule.recurse", "true");
+
+    // Dirty the submodule worktree and backdate its index so any child git status/diff inside sub would invoke subtrap.
+    write(subWorktree, "tracked.sub", "dirty in submodule worktree\n");
+    write(subWorktree, "untracked.txt", "untracked inside submodule\n");
+    const subGitModulesIndex = path.join(fixture.root, ".git", "modules", "sub", "index");
+    if (fs.existsSync(subGitModulesIndex)) {
+      const stale = new Date(fs.statSync(path.join(subWorktree, "tracked.sub")).mtime.getTime() - 5000);
+      fs.utimesSync(subGitModulesIndex, stale, stale);
+    }
+
+    // Dirty submodule worktree alone should be ignored without running submodule filters.
+    expect(gitStatus(fixture.root).unstaged.map((e) => e.path)).not.toContain("sub");
+    expect((await gitStatusAsync(fixture.root)).unstaged.map((e) => e.path)).not.toContain("sub");
+    expect(gitDiff(fixture.root, { mode: "unstaged" }).diff).toBe("");
+    expect((await gitDiffAsync(fixture.root, { mode: "unstaged" })).diff).toBe("");
+    expect(fs.existsSync(subMarker)).toBe(false);
+
+    // Advance submodule gitlink commit while keeping dirty worktree inside submodule.
+    git(subWorktree, "-c", "filter.subtrap.clean=", "checkout", "-f", subCommit2);
+    write(subWorktree, "tracked.sub", "dirty after checkout\n");
+    if (fs.existsSync(subGitModulesIndex)) {
+      const stale = new Date(fs.statSync(path.join(subWorktree, "tracked.sub")).mtime.getTime() - 5000);
+      fs.utimesSync(subGitModulesIndex, stale, stale);
+    }
+
+    const unstagedStatus = gitStatus(fixture.root);
+    const unstagedStatusAsync = await gitStatusAsync(fixture.root);
+    expect(unstagedStatus.unstaged.map((e) => e.path)).toContain("sub");
+    expect(unstagedStatusAsync.unstaged.map((e) => e.path)).toContain("sub");
+
+    const unstagedDiff = gitDiff(fixture.root, { mode: "unstaged" });
+    const unstagedDiffAsync = await gitDiffAsync(fixture.root, { mode: "unstaged" });
+    expect(unstagedDiff.diff).toContain(`-Subproject commit ${subCommit1}`);
+    expect(unstagedDiff.diff).toContain(`+Subproject commit ${subCommit2}`);
+    expect(unstagedDiff.diff).not.toContain("dirty after checkout");
+    expect(unstagedDiffAsync.diff).toContain(`+Subproject commit ${subCommit2}`);
+    expect(unstagedDiffAsync.diff).not.toContain("dirty after checkout");
+
+    git(fixture.root, "add", "sub");
+    git(fixture.root, "commit", "-m", "advance submodule gitlink");
+    const headSuperCommit = git(fixture.root, "rev-parse", "HEAD").trim();
+
+    const compareSync = gitCompare(fixture.root, { baseCommit: baseSuperCommit, headCommit: headSuperCommit });
+    const compareAsync = await gitCompareAsync(fixture.root, { baseCommit: baseSuperCommit, headCommit: headSuperCommit });
+    expect(compareSync.files.map((f) => f.path)).toContain("sub");
+    expect(compareSync.diff).toContain(`+Subproject commit ${subCommit2}`);
+    expect(compareSync.diff).not.toContain("sub v2");
+    expect(compareAsync.files.map((f) => f.path)).toContain("sub");
+    expect(fs.existsSync(subMarker)).toBe(false);
+  });
+
+  it("disables partial-clone lazy fetch across read-only Git entry points", async () => {
+    const originRoot = makeTmpDir("git-security-partial-origin");
+    makeGitRepo(originRoot);
+    git(originRoot, "config", "uploadpack.allowFilter", "true");
+    write(originRoot, "secret-blob.txt", "first partial blob content\n");
+    git(originRoot, "add", ".");
+    git(originRoot, "commit", "-m", "c1");
+    const c1 = git(originRoot, "rev-parse", "HEAD").trim();
+
+    write(originRoot, "secret-blob.txt", "second partial blob content\n");
+    git(originRoot, "add", ".");
+    git(originRoot, "commit", "-m", "c2");
+    const c2 = git(originRoot, "rev-parse", "HEAD").trim();
+
+    const partialParent = makeTmpDir("git-security-partial-clone");
+    const partialRoot = path.join(partialParent, "clone");
+    const originFileUrl = `file:///${originRoot.replace(/\\/g, "/").replace(/^\/+/, "")}`;
+    git(partialParent, "-c", "protocol.file.allow=always", "clone", "--no-local", "--filter=blob:none", "--no-checkout", originFileUrl, partialRoot);
+
+    const markerHost = makeFixture("partial-marker-host");
+    const fetchMarker = path.join(markerHost.root, "lazy-fetch.marker");
+    git(partialRoot, "config", "remote.origin.uploadpack", markerHost.markerCommand(fetchMarker));
+
+    // Diffing c1..c2 requires missing promisor blobs; read-only Git must fail closed without lazy-fetching.
+    const compareSync = gitCompare(partialRoot, { baseCommit: c1, headCommit: c2 });
+    const compareAsync = await gitCompareAsync(partialRoot, { baseCommit: c1, headCommit: c2 });
+    expect(compareSync.isRepo).toBe(false);
+    expect(compareAsync.isRepo).toBe(false);
+
+    expect(gitStatus(partialRoot).isRepo).toBe(true);
+    expect((await gitStatusAsync(partialRoot)).isRepo).toBe(true);
+    expect(gitDiff(partialRoot, { mode: "head" }).isRepo).toBe(false);
+    expect((await gitDiffAsync(partialRoot, { mode: "head" })).isRepo).toBe(false);
+    expect(resolveGitCommit(partialRoot, c1)).toBe(c1);
+    expect(await resolveGitCommitAsync(partialRoot, c2)).toBe(c2);
+    expect(fs.existsSync(fetchMarker)).toBe(false);
   });
 });
