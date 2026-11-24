@@ -12,3 +12,15 @@ export function resolveTunnelProtocol(env: NodeJS.Dict<string> = process.env): T
 export function tunnelProtocolArgs(protocol: TunnelProtocol | null = resolveTunnelProtocol()): string[] {
   return protocol ? ["--protocol", protocol] : [];
 }
+
+/**
+ * Named Tunnel protocol resolver: preserves explicit `C2C_TUNNEL_PROTOCOL`
+ * overrides while allowing production callers to default to a resilient transport.
+ */
+export function namedTunnelProtocolArgs(
+  env: NodeJS.Dict<string> = process.env,
+  defaultProtocol: TunnelProtocol | null = null
+): string[] {
+  const explicit = resolveTunnelProtocol(env);
+  return tunnelProtocolArgs(explicit ?? defaultProtocol);
+}

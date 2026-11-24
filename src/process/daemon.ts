@@ -143,7 +143,7 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
   child.unref();
   fs.closeSync(out);
 
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 300));
     const runtime = await findLiveBridge(workspace.id);
@@ -165,7 +165,7 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
       throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
     }
   }
-  throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
+  throw new Error(`Bridge did not become healthy within 45s. See ${logFile}`);
 }
 
 export async function adminFetch<T = unknown>(

@@ -76,7 +76,7 @@ export function buildLogonTaskXml(input: {
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>C2C workspace autostart</Description><URI>\\${taskName}</URI></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${userSid}</UserId></LogonTrigger></Triggers>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT30M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><UserId>${userSid}</UserId><Delay>PT20S</Delay></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>${userSid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>

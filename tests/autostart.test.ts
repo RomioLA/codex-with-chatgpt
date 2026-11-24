@@ -500,7 +500,7 @@ describe("Windows Task Scheduler command construction", () => {
     expect(xml).toContain("C2C &amp; workspace");
     expect(xml).toContain("<LogonType>InteractiveToken</LogonType>");
     expect(xml).toContain("<RunLevel>LeastPrivilege</RunLevel>");
-    expect(xml).toContain("<LogonTrigger><Enabled>true</Enabled><UserId>S-1-5-21-1-2-3-1001</UserId></LogonTrigger>");
+    expect(xml).toContain("<LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT30M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><UserId>S-1-5-21-1-2-3-1001</UserId><Delay>PT20S</Delay></LogonTrigger>");
     expect(xml).toContain("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>");
     expect(xml).toContain("<Command>C:\\Windows\\System32\\cmd.exe</Command>");
     expect(xml).toContain("c2c-autostart-task.cmd");

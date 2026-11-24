@@ -12,7 +12,9 @@ import { createMcpHttpHandler, safeToolName } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
-import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
+import { isNamedTunnelReady, namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
+import { inspectNamedTunnelCredentials } from "../tunnel/named-provision.js";
+import { probePublicHealth } from "../process/recovery.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
@@ -35,13 +37,21 @@ import {
   type BridgeShutdownSource,
 } from "../diagnostics/bridge-lifecycle.js";
 
-function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
+function tunnelForWorkspace(
+  workspaceId: string,
+  logger: Logger,
+  onStateChange?: (url: string | null) => void
+): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
   if (binding) {
     return new CloudflaredNamedTunnel({
       tunnelName: binding.tunnelName,
       hostname: binding.hostname,
       logger,
+      defaultProtocol: "http2",
+      stripProxyEnv: true,
+      autoReconnect: true,
+      onStateChange,
     });
   }
   return new CloudflaredQuickTunnel(logger);
@@ -71,6 +81,14 @@ export interface BridgeOptions {
   accessTokenTtlMs?: number;
   /** Internal test seam; production callers use the fixed Windows helper. */
   executionRunner?: ExecutionRunner;
+  /** Automatically start and supervise a configured Named Tunnel from the Bridge. */
+  autoManageNamedTunnel?: boolean;
+  /** Delay (ms) before Bridge auto-starts an idle Named Tunnel so external restore can lead cleanly. */
+  namedTunnelStartupDelayMs?: number;
+  /** Interval (ms) for low-frequency Named Tunnel stale-edge self-checks. */
+  namedTunnelWatchdogIntervalMs?: number;
+  /** Optional fetch implementation for Named Tunnel watchdog probes (test seam). */
+  watchdogFetchImpl?: typeof fetch;
 }
 
 export interface Bridge {
@@ -194,9 +212,21 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
     const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
     const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
-    const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
-    const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
     let publicBaseUrl: string | null = null;
+    let shutdownSource: BridgeShutdownSource | null = null;
+    let persistRuntimeRef: (() => void) | null = null;
+    let manuallyStoppedTunnel = false;
+    let managedTunnelStarting = false;
+    let startupTunnelTimer: NodeJS.Timeout | null = null;
+    let watchdogTimer: NodeJS.Timeout | null = null;
+    const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger, (nextUrl) => {
+      if (shutdownSource !== null) return;
+      if (publicBaseUrl !== nextUrl) {
+        publicBaseUrl = nextUrl;
+        persistRuntimeRef?.();
+      }
+    });
+    const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
     let port = 0;
     let startedAt = "";
 
@@ -273,7 +303,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     next();
   };
 
-  let shutdownSource: BridgeShutdownSource | null = null;
   let shutdownPromise: Promise<void> | null = null;
   const requestShutdown = (source: BridgeShutdownSource): void => {
     if (shutdownSource !== null) return;
@@ -302,7 +331,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       workspaceRoot: workspace.root,
       port,
       publicUrl: publicBaseUrl,
-      tunnel: tunnel.status(),
+      tunnel: {
+        ...tunnel.status(),
+        ...(managedTunnelStarting ? { managedStarting: true } : {}),
+      },
       tokenCount: authStore.tokenCount(),
       // Read persisted state per request so local CLI changes are visible without restart.
       permissionMode: readPermission(workspace.id),
@@ -316,6 +348,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/tunnel/start", adminGuard, (_req, res) => {
+    manuallyStoppedTunnel = false;
     tunnel
       .start(port)
       .then((url) => {
@@ -330,6 +363,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/tunnel/restart", adminGuard, (_req, res) => {
+    manuallyStoppedTunnel = false;
     tunnel
       .restart(port)
       .then((url) => {
@@ -344,6 +378,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
+    manuallyStoppedTunnel = true;
     void tunnel.stop().then(() => {
       publicBaseUrl = null;
       persistRuntime();
@@ -537,13 +572,96 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       };
       writeRuntimeState(state);
     };
+    persistRuntimeRef = persistRuntime;
     persistRuntime();
+
+    let manageNamedTunnelBusy = false;
+    const ensureManagedNamedTunnel = async (trigger: "startup" | "watchdog"): Promise<void> => {
+      if (manageNamedTunnelBusy || shutdownSource !== null || manuallyStoppedTunnel) return;
+      manageNamedTunnelBusy = true;
+      try {
+        const tunnelState = readTunnelState(workspace.id);
+        if (!isNamedTunnelReady(tunnelState)) return;
+        const credentials = inspectNamedTunnelCredentials(tunnelState.tunnelId);
+        if (credentials.status !== "ready") return;
+        const current = tunnel.status();
+        if (current.provider !== "cloudflare-named") return;
+        if (current.detail && /category=(?:permanent|binary_missing)/.test(current.detail)) return;
+
+        if (!current.running && current.processRunning === false && current.connected === false) {
+          managedTunnelStarting = true;
+          try {
+            const url = await tunnel.start(port);
+            if (shutdownSource === null && !manuallyStoppedTunnel) {
+              publicBaseUrl = url;
+              persistRuntime();
+            }
+          } finally {
+            managedTunnelStarting = false;
+          }
+          return;
+        }
+
+        if (trigger === "watchdog" && current.running && current.connected && current.url) {
+          const fetchImpl = opts.watchdogFetchImpl ?? fetch;
+          const firstProbe = await probePublicHealth(current.url, fetchImpl);
+          if (firstProbe.publicProbeError !== "cloudflare_tunnel_unavailable") return;
+          if (shutdownSource !== null || manuallyStoppedTunnel) return;
+          const secondProbe = await probePublicHealth(current.url, fetchImpl);
+          if (secondProbe.publicProbeError !== "cloudflare_tunnel_unavailable") return;
+          if (shutdownSource !== null || manuallyStoppedTunnel) return;
+          logger.warn("Named Tunnel watchdog detected persistent Cloudflare 1033; restarting tunnel");
+          managedTunnelStarting = true;
+          try {
+            const url = await tunnel.restart(port);
+            if (shutdownSource === null && !manuallyStoppedTunnel) {
+              publicBaseUrl = url;
+              persistRuntime();
+            }
+          } finally {
+            managedTunnelStarting = false;
+          }
+        }
+      } catch (error) {
+        logger.warn(`Managed Named Tunnel ${trigger} check failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        manageNamedTunnelBusy = false;
+      }
+    };
+
+    if (opts.autoManageNamedTunnel) {
+      const startupDelayMs = opts.namedTunnelStartupDelayMs ?? 5_000;
+      if (startupDelayMs <= 0) {
+        void ensureManagedNamedTunnel("startup");
+      } else {
+        startupTunnelTimer = setTimeout(() => {
+          startupTunnelTimer = null;
+          void ensureManagedNamedTunnel("startup");
+        }, startupDelayMs);
+        startupTunnelTimer.unref?.();
+      }
+      const intervalMs = opts.namedTunnelWatchdogIntervalMs ?? 180_000;
+      if (intervalMs > 0) {
+        watchdogTimer = setInterval(() => {
+          void ensureManagedNamedTunnel("watchdog");
+        }, intervalMs);
+        watchdogTimer.unref?.();
+      }
+    }
 
     const shutdown = (source: BridgeShutdownSource = "admin_shutdown"): Promise<void> => {
       if (shutdownPromise) return shutdownPromise;
       requestShutdown(source);
       const effectiveSource = shutdownSource ?? source;
       shutdownPromise = (async () => {
+        if (startupTunnelTimer) {
+          clearTimeout(startupTunnelTimer);
+          startupTunnelTimer = null;
+        }
+        if (watchdogTimer) {
+          clearInterval(watchdogTimer);
+          watchdogTimer = null;
+        }
         recordShutdownLifecycle(logger, "shutdown_begin", effectiveSource);
         try {
           await supervisor.shutdown();

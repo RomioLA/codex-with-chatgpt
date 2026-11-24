@@ -432,6 +432,7 @@ program
       workspaceRoot: resolveWorkspace(opts.workspace),
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
+      autoManageNamedTunnel: true,
     });
     const shutdown = (source: BridgeShutdownSource): void => {
       void bridge.close(source).then(() => process.exit(0));

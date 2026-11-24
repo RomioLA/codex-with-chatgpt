@@ -303,7 +303,7 @@ describe("autostart transactional registration", () => {
     const runtimeRoot = path.resolve(path.dirname(f.cliPath), "..", "..");
     const commandProcessorPath = path.join(process.env.SystemRoot ?? process.env.WINDIR!, "System32", "cmd.exe");
     const expectTaskContract = (taskXml: string): void => {
-      expect(taskXml).toContain(`<LogonTrigger><Enabled>true</Enabled><UserId>${userSid}</UserId></LogonTrigger>`);
+      expect(taskXml).toContain(`<LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT30M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><UserId>${userSid}</UserId><Delay>PT20S</Delay></LogonTrigger>`);
       expect(taskXml).toContain(`<UserId>${userSid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>`);
       expect(taskXml).toContain("<StartWhenAvailable>true</StartWhenAvailable>");
       expect(taskXml).toMatch(/<RestartOnFailure>\s*<Interval>PT1M<\/Interval>\s*<Count>3<\/Count>\s*<\/RestartOnFailure>/);

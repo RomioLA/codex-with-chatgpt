@@ -26,6 +26,7 @@ export interface RecoveryAdminInfo {
     detail?: string;
     processRunning?: boolean;
     connected?: boolean;
+    managedStarting?: boolean;
   };
   tokenCount: number;
   pairingActive: boolean;
@@ -144,7 +145,15 @@ function notCheckedPublicProbe(): PublicProbeDiagnostics {
   return { publicProbeStatus: "notChecked", checkedAt: null };
 }
 
-export async function probePublicHealth(url: string, fetchImpl: typeof fetch = fetch): Promise<PublicProbeDiagnostics> {
+const TRANSIENT_PUBLIC_PROBE_ERRORS = new Set<NonNullable<PublicProbeDiagnostics["publicProbeError"]>>([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "timeout",
+  "cloudflare_tunnel_unavailable",
+]);
+
+async function probePublicHealthOnce(url: string, fetchImpl: typeof fetch): Promise<PublicProbeDiagnostics> {
   const checkedAt = new Date().toISOString();
   let parsed: URL;
   try {
@@ -198,6 +207,25 @@ export async function probePublicHealth(url: string, fetchImpl: typeof fetch = f
       checkedAt,
     };
   }
+}
+
+export async function probePublicHealth(
+  url: string,
+  fetchImpl: typeof fetch = fetch,
+  retryDelaysMs: readonly number[] = []
+): Promise<PublicProbeDiagnostics> {
+  let result = await probePublicHealthOnce(url, fetchImpl);
+  for (const delayMs of retryDelaysMs) {
+    if (result.publicProbeStatus === "healthy") return result;
+    if (!result.publicProbeError || !TRANSIENT_PUBLIC_PROBE_ERRORS.has(result.publicProbeError)) {
+      return result;
+    }
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    result = await probePublicHealthOnce(url, fetchImpl);
+  }
+  return result;
 }
 
 function namedTunnelUrl(url: string | null | undefined, hostname: string | null | undefined): string | null {
@@ -286,6 +314,7 @@ function readOAuthTokenCount(workspaceId: string): number {
 }
 
 function namedInfoStartable(info: RecoveryAdminInfo): boolean {
+  if (info.tunnel.managedStarting === true) return true;
   return info.tunnel.processRunning === false && info.tunnel.connected === false;
 }
 
@@ -373,7 +402,9 @@ export async function collectRuntimeDiagnostics(
   const activeUrl = preference === "named"
     ? namedUrl
     : info?.tunnel.running ? info.publicUrl ?? info.tunnel.url : null;
-  const publicProbe = activeUrl ? await probePublicHealth(activeUrl, fetchImpl) : notCheckedPublicProbe();
+  const publicProbe = activeUrl
+    ? await probePublicHealth(activeUrl, fetchImpl, opts.fetchImpl ? [] : [1_500, 3_000])
+    : notCheckedPublicProbe();
   const endpointHealthy = publicProbe.publicProbeStatus === "healthy";
   const connectorEndpoint = lastEndpoint?.mcpUrl ?? null;
   const currentMcp = mcpUrlFromPublic(activeUrl);
@@ -549,7 +580,7 @@ export async function restoreWorkspace(
             tunnelAction = "reused";
           }
         }
-      } else if (info.tunnel.processRunning === true) {
+      } else if (info.tunnel.processRunning === true && info.tunnel.managedStarting !== true) {
         reason = "namedRecoveryFailed";
         detail = "Named Tunnel process is present but has not connected.";
       } else if (!namedInfoStartable(info)) {

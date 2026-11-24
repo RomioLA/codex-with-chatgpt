@@ -3,15 +3,27 @@ import readline from "node:readline";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { findBinary } from "./detect.js";
-import { tunnelProtocolArgs } from "./protocol.js";
+import { namedTunnelProtocolArgs, type TunnelProtocol } from "./protocol.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
 
 const CONNECTED_RE = /registered tunnel connection/i;
 const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 const DEFAULT_RETRY_BACKOFF_MS = [2_000, 4_000, 8_000, 16_000, 16_000, 16_000] as const;
+const DEFAULT_RECONNECT_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000] as const;
 const DEFAULT_STARTUP_DEADLINE_MS = 90_000;
 const DEFAULT_STOP_WAIT_MS = 1_000;
 const MAX_START_ATTEMPTS = 7;
+const PROXY_ENV_KEYS = new Set(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]);
+
+function buildTunnelSpawnEnv(stripProxyEnv: boolean): NodeJS.ProcessEnv | undefined {
+  if (!stripProxyEnv || process.env.C2C_TUNNEL_KEEP_PROXY === "1") return undefined;
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (PROXY_ENV_KEYS.has(key.toUpperCase())) continue;
+    env[key] = value;
+  }
+  return env;
+}
 
 type StartupStatus = "retrying" | "exhausted" | "failed" | "cancelled";
 type StartupCategory =
@@ -76,6 +88,16 @@ export interface CloudflaredNamedTunnelOptions {
   maxAttempts?: number;
   /** Bounded wait for a SIGTERM'd process to emit exit or close. */
   stopWaitMs?: number;
+  /** Default transport protocol when C2C_TUNNEL_PROTOCOL is unset. */
+  defaultProtocol?: TunnelProtocol | null;
+  /** Strip inherited proxy variables so cloudflared connects directly to Cloudflare edge. */
+  stripProxyEnv?: boolean;
+  /** Automatically reconnect with bounded backoff when a connected tunnel exits unexpectedly. */
+  autoReconnect?: boolean;
+  /** Delay schedule (ms) used for post-connection unexpected exit recovery. */
+  reconnectBackoffMs?: readonly number[];
+  /** Notified when a connection is established or drops unexpectedly. */
+  onStateChange?: (url: string | null) => void;
 }
 
 function errorCode(error: unknown): string | null {
@@ -141,6 +163,11 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   private readonly retryBackoffMs: readonly number[];
   private readonly maxAttempts: number;
   private readonly stopWaitMs: number;
+  private readonly defaultProtocol: TunnelProtocol | null;
+  private readonly stripProxyEnv: boolean;
+  private readonly autoReconnect: boolean;
+  private readonly reconnectBackoffMs: readonly number[];
+  private readonly onStateChange?: (url: string | null) => void;
   private child: ChildProcess | null = null;
   private childRun: ChildRun | null = null;
   private connected = false;
@@ -149,6 +176,9 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   private startupRun: StartupRun | null = null;
   private pendingStart: Promise<string> | null = null;
   private stopPromise: Promise<void> | null = null;
+  private desiredPort: number | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempt = 0;
 
   constructor(opts: CloudflaredNamedTunnelOptions) {
     const tunnelName = opts.tunnelName.trim();
@@ -195,6 +225,15 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       throw new Error("Named tunnel stop wait must be between 0 and 1000 milliseconds");
     }
     this.stopWaitMs = stopWaitMs;
+    this.defaultProtocol = opts.defaultProtocol ?? null;
+    this.stripProxyEnv = opts.stripProxyEnv ?? false;
+    this.autoReconnect = opts.autoReconnect ?? false;
+    const reconnectBackoffMs = opts.reconnectBackoffMs ?? DEFAULT_RECONNECT_BACKOFF_MS;
+    if (reconnectBackoffMs.length === 0 || reconnectBackoffMs.some((delay) => !Number.isFinite(delay) || delay < 0)) {
+      throw new Error("Named tunnel reconnect delays must be non-empty non-negative numbers");
+    }
+    this.reconnectBackoffMs = [...reconnectBackoffMs];
+    this.onStateChange = opts.onStateChange;
   }
 
   private binary(): string | null {
@@ -291,6 +330,47 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
     return null;
   }
 
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private scheduleReconnect(localPort: number): void {
+    if (!this.autoReconnect || this.desiredPort !== localPort || this.stopPromise || this.reconnectTimer) {
+      return;
+    }
+    const index = Math.min(this.reconnectAttempt, this.reconnectBackoffMs.length - 1);
+    const delayMs = this.reconnectBackoffMs[index] ?? 15_000;
+    this.reconnectAttempt += 1;
+    this.logger.info(`Scheduling Named Tunnel auto-reconnect in ${delayMs}ms (attempt ${this.reconnectAttempt})`);
+    const timer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (
+        !this.autoReconnect ||
+        this.desiredPort !== localPort ||
+        this.stopPromise ||
+        this.pendingStart ||
+        (this.childRun && !this.childRun.terminal)
+      ) {
+        return;
+      }
+      void this.start(localPort).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          /category=(?:permanent|binary_missing|stopped|termination_unconfirmed)/.test(message) ||
+          this.desiredPort !== localPort ||
+          this.stopPromise
+        ) {
+          return;
+        }
+        this.scheduleReconnect(localPort);
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.reconnectTimer = timer;
+  }
+
   start(localPort: number): Promise<string> {
     if (this.pendingStart) return this.pendingStart;
     if (this.stopPromise) {
@@ -302,6 +382,9 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       const detail = this.setDiagnostic("failed", 0, "termination_unconfirmed", globalThis.performance.now());
       return Promise.reject(new Error(detail));
     }
+
+    this.desiredPort = localPort;
+    this.clearReconnectTimer();
 
     const generation = ++this.generation;
     const startedAt = globalThis.performance.now();
@@ -333,7 +416,15 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
           const error = this.successfulConnectionError(run, run.attempts);
           finish();
           if (error) rejectTracked(error);
-          else resolveTracked(url);
+          else {
+            this.reconnectAttempt = 0;
+            try {
+              this.onStateChange?.(url);
+            } catch {
+              // State listener failures must not abort tunnel startup.
+            }
+            resolveTracked(url);
+          }
         },
         (error: unknown) => {
           if (this.startupRun === run) this.startupRun = null;
@@ -422,6 +513,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
     timeoutMs: number
   ): Promise<AttemptResult> {
     let child: ChildProcess;
+    const spawnEnv = buildTunnelSpawnEnv(this.stripProxyEnv);
     try {
       child = spawn(
         bin,
@@ -430,11 +522,13 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
           "--no-autoupdate",
           "--url",
           `http://127.0.0.1:${localPort}`,
-          ...tunnelProtocolArgs(),
+          ...namedTunnelProtocolArgs(process.env, this.defaultProtocol),
           "run",
           this.tunnelName,
         ],
-        { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+        spawnEnv
+          ? { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: spawnEnv }
+          : { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
       );
     } catch (error) {
       return Promise.resolve({ kind: "spawnError", code: errorCode(error) });
@@ -465,6 +559,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
     this.child = child;
     this.childRun = childRun;
     this.connected = false;
+    let everConnected = false;
 
     return new Promise<AttemptResult>((resolve) => {
       let settled = false;
@@ -507,6 +602,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
               return;
             }
             childRun.connected = true;
+            everConnected = true;
             run.connectedChild = childRun;
             this.connected = true;
             this.lastError = null;
@@ -548,9 +644,27 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
         this.logger.warn(`cloudflared named tunnel exited with code ${code}`);
       });
       child.on("close", (code, signal) => {
-        const wasStarting = !childRun.connected;
+        const wasStarting = !everConnected;
         markTerminal(code, signal);
-        if (wasStarting) finish({ kind: "exited", childRun });
+        if (wasStarting) {
+          finish({ kind: "exited", childRun });
+          return;
+        }
+        if (!childRun.stopping && !childRun.timeoutRequested) {
+          try {
+            this.onStateChange?.(null);
+          } catch {
+            // State listener failures must not prevent tunnel recovery.
+          }
+          if (
+            this.autoReconnect &&
+            !childRun.permanent &&
+            this.desiredPort !== null &&
+            !this.stopPromise
+          ) {
+            this.scheduleReconnect(this.desiredPort);
+          }
+        }
       });
     });
   }
@@ -595,6 +709,9 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   }
 
   private async stopInternal(): Promise<void> {
+    this.desiredPort = null;
+    this.reconnectAttempt = 0;
+    this.clearReconnectTimer();
     const run = this.startupRun;
     ++this.generation;
     this.connected = false;
