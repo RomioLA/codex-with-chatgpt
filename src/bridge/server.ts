@@ -121,6 +121,10 @@ function listen(
   return new Promise((resolve, reject) => {
     const tryListen = (port: number, allowFallback: boolean): void => {
       const server = app.listen(port, host);
+      // Exceed cloudflared's 90s default origin idle keep-alive timeout to avoid
+      // EOF/reset races on reused loopback sockets that surface as transient 502s.
+      server.keepAliveTimeout = 120_000;
+      server.headersTimeout = 125_000;
       server.once("listening", () => {
         const address = server.address();
         const actual = typeof address === "object" && address ? address.port : port;

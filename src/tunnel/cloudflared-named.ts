@@ -7,6 +7,7 @@ import { namedTunnelProtocolArgs, type TunnelProtocol } from "./protocol.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
 
 const CONNECTED_RE = /registered tunnel connection/i;
+const RUNTIME_DIAG_RE = /\bERR\b|unable to reach the origin|unregistered tunnel connection|connection with edge closed|failed to serve quic connection|serve tunnel error/i;
 const HOSTNAME_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 const DEFAULT_RETRY_BACKOFF_MS = [2_000, 4_000, 8_000, 16_000, 16_000, 16_000] as const;
 const DEFAULT_RECONNECT_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000] as const;
@@ -590,6 +591,10 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
           childRun.transientNetwork ||= classification.transientNetwork;
           childRun.permanent ||= classification.permanent;
           childRun.unsupportedHttpFailure ||= classification.unsupportedHttpFailure;
+
+          if (childRun.connected && RUNTIME_DIAG_RE.test(line)) {
+            this.logger.warn(`cloudflared runtime diagnostic: ${line.slice(0, 240)}`);
+          }
 
           if (
             CONNECTED_RE.test(line) &&

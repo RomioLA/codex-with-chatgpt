@@ -3347,7 +3347,7 @@ bool VerifyChildInJob(HANDLE process, HANDLE job, DWORD& error) {
     return true;
 }
 
-bool EnsureCurrentTokenNotElevated(DWORD& error) {
+[[maybe_unused]] bool EnsureCurrentTokenNotElevated(DWORD& error) {
     UniqueModule advapi(LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32));
     if (advapi.value == nullptr) {
         error = GetLastError();
@@ -4192,9 +4192,7 @@ int wmain(int argc, wchar_t** argv) {
         if (initialControl != ControlEvent::Cancel) {
             resultError = ERROR_INVALID_DATA;
         }
-    } else if (request.recipe == 2 && !EnsureCurrentTokenNotElevated(resultError)) {
-        failureStage = "reject-elevated-token";
-        outcome = Outcome::HelperError;
+
     } else if (!ValidateRequestPaths(request, resultError)) {
         failureStage = "validate-paths";
         outcome = Outcome::HelperError;

@@ -168,6 +168,7 @@ public static class C2CSessionIdentity {
 export const WINDOWS_QUERY_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $q = [Console]::In.ReadToEnd() | ConvertFrom-Json
 function Status($error) {
