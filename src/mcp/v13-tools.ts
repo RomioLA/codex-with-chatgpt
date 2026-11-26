@@ -48,7 +48,7 @@ function requireCapability(auth: AuthInfo | undefined, scope: "git.read" | "git.
 }
 
 export function registerV13Tools(server: McpServer, ctx: McpContext): void {
-  const hideLegacyTools = process.env.C2C_HIDE_LEGACY_TOOLS === "1";
+  const hideLegacyTools = process.env.C2C_HIDE_LEGACY_TOOLS !== "0";
 
   server.registerTool("git_branches", {
     ...executionToolAuth("git_branches"), title: "Read repository branches",

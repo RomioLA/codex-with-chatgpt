@@ -268,8 +268,13 @@ describe("ExecutionSupervisor", () => {
       expect(stdout.text).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
       expect(stdout.text).toContain("[REDACTED]");
     }
-    expect(supervisor.readOutputForClient(jobId, "execution-test-client", "stderr"))
-      .toEqual({ ok: false, error: "OUTPUT_RESTRICTED" });
+    const stderr = supervisor.readOutputForClient(jobId, "execution-test-client", "stderr");
+    expect(stderr.ok).toBe(true);
+    if (stderr.ok) {
+      expect(stderr.text).toContain("[REDACTED_PRIVATE_KEY]");
+      expect(stderr.text).not.toContain("RSA PRIVATE KEY");
+      expect(stderr.text).not.toContain("secret");
+    }
   });
 
   it("locks scoped Full Access jobs, persists the scope, and releases the lock after completion or cancellation", async () => {

@@ -933,7 +933,10 @@ export class ExecutionSupervisor {
       releaseWriteLock?.();
       throw error;
     }
-    const sanitizers = { stdout: new StreamingSanitizer(), stderr: new StreamingSanitizer() };
+    const sanitizers = {
+      stdout: new StreamingSanitizer({ privateKeyPolicy: "redact" }),
+      stderr: new StreamingSanitizer({ privateKeyPolicy: "redact" }),
+    };
     const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
     let active!: ActiveExecution;
     let tempLease: ExecutionTempLease | undefined;

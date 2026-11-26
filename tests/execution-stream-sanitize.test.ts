@@ -145,4 +145,45 @@ describe("StreamingSanitizer", () => {
     expect(`${safeStdout}${safeStderr}`).toBe(`${prefix}${suffix}`);
     expect(`${safeStdout}${safeStderr}`).toMatch(/ghp_[A-Za-z0-9]{20,}/);
   });
+
+  it("redacts PEM private-key blocks inline in redact mode without blacking out later stdout", () => {
+    const sanitizer = new StreamingSanitizer({ privateKeyPolicy: "redact" });
+    const output =
+      sanitizer.push("before line\n-----BEGIN RSA PRIVATE KEY-----\n") +
+      sanitizer.push("MIIEowIBAAKCAQEA1234567890abcdef\n") +
+      sanitizer.push("YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4\n") +
+      sanitizer.push("-----END RSA PRIVATE KEY-----\nafter line\n") +
+      sanitizer.finish();
+
+    expect(output).toContain("before line\n[REDACTED_PRIVATE_KEY]\n");
+    expect(output).toContain("after line\n");
+    expect(output).not.toContain("MIIEowIBAAKCAQEA");
+    expect(output).not.toContain("BEGIN RSA PRIVATE KEY");
+    expect(sanitizer.restrictedReason).toBeUndefined();
+    expect(sanitizer.truncated).toBe(false);
+  });
+
+  it("preserves subsequent source code lines after a single-line regex mention in redact mode", () => {
+    const sanitizer = new StreamingSanitizer({ privateKeyPolicy: "redact" });
+    const output =
+      sanitizer.push("const RE = /-----BEGIN RSA PRIVATE KEY-----/;\nconst nextLine = 42;\n") +
+      sanitizer.finish();
+
+    expect(output).toContain("const RE = /[REDACTED_PRIVATE_KEY]\n");
+    expect(output).toContain("const nextLine = 42;\n");
+    expect(sanitizer.restrictedReason).toBeUndefined();
+  });
+
+  it("does not over-redact ordinary error codes while still redacting auth_code and pairing codes", () => {
+    const sanitizer = new StreamingSanitizer({ privateKeyPolicy: "redact" });
+    const output =
+      sanitizer.push("errorCode=ERR_ASSERTION code: 1254302 auth_code=secret123 pair=ABCD-EFGH\n") +
+      sanitizer.finish();
+
+    expect(output).toContain("errorCode=ERR_ASSERTION");
+    expect(output).toContain("code: 1254302");
+    expect(output).toContain("auth_code=[REDACTED]");
+    expect(output).not.toContain("secret123");
+    expect(output).not.toContain("ABCD-EFGH");
+  });
 });

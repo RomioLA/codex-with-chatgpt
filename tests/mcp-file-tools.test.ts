@@ -237,23 +237,23 @@ describe("MCP file tools over real Streamable HTTP", () => {
     finally { await noRead.close(); }
   });
 
-  it("rejects missing hashes at the MCP schema boundary", async () => {
+  it("requires expected_hash for delete_file while allowing optional expected_hash on edit/replace", async () => {
     setPermission(bridge.workspace.id, "level2");
     const file = write(root, fresh(), "preserve");
     const external = write(outside, fresh(), "preserve");
-    for (const [name, args] of [
-      ["replace_file", { path: path.basename(file), content: "bad" }],
-      ["edit_file", { path: path.basename(file), old_text: "preserve", new_text: "bad" }],
-      ["delete_file", { path: path.basename(file) }],
-      ["replace_external_file", { path: external, content: "bad" }],
-      ["edit_external_file", { path: external, old_text: "preserve", new_text: "bad" }],
-    ] as [string, Record<string, unknown>][]) {
-      const result = await client.callTool({ name, arguments: args });
-      expect(result.isError).toBe(true);
-      expect((result.content as { text: string }[])[0].text).toContain("expected_hash");
-    }
+    const delResult = await client.callTool({ name: "delete_file", arguments: { path: path.basename(file) } });
+    expect(delResult.isError).toBe(true);
+    expect((delResult.content as { text: string }[])[0].text).toContain("expected_hash");
     expect(fs.readFileSync(file, "utf8")).toBe("preserve");
-    expect(fs.readFileSync(external, "utf8")).toBe("preserve");
+
+    await call("edit_file", { path: path.basename(file), old_text: "preserve", new_text: "edited-no-hash" });
+    expect(fs.readFileSync(file, "utf8")).toBe("edited-no-hash");
+    await call("replace_file", { path: path.basename(file), content: "replaced-no-hash" });
+    expect(fs.readFileSync(file, "utf8")).toBe("replaced-no-hash");
+    await call("edit_external_file", { path: external, old_text: "preserve", new_text: "ext-edited" });
+    expect(fs.readFileSync(external, "utf8")).toBe("ext-edited");
+    await call("replace_external_file", { path: external, content: "ext-replaced" });
+    expect(fs.readFileSync(external, "utf8")).toBe("ext-replaced");
   });
 
   it("rejects stale replace/edit/delete and audits refusals without modifying newer content", async () => {
@@ -389,8 +389,9 @@ describe("MCP file tools over real Streamable HTTP", () => {
     }
     expect(tools.find((tool) => tool.name === "delete_file")?.annotations?.destructiveHint).toBe(true);
     expect(tools.find((tool) => tool.name === "create_file")?.annotations?.destructiveHint).toBe(false);
-    for (const name of ["replace_file", "edit_file", "delete_file", "replace_external_file", "edit_external_file"]) {
-      expect(tools.find((tool) => tool.name === name)?.inputSchema.required).toContain("expected_hash");
+    expect(tools.find((tool) => tool.name === "delete_file")?.inputSchema.required).toContain("expected_hash");
+    for (const name of ["replace_file", "edit_file", "replace_external_file", "edit_external_file"]) {
+      expect(tools.find((tool) => tool.name === name)?.inputSchema.required ?? []).not.toContain("expected_hash");
     }
     for (const name of ["replace_file", "edit_file", "replace_external_file", "edit_external_file"]) {
       const description = tools.find((tool) => tool.name === name)?.description?.toLowerCase() ?? "";

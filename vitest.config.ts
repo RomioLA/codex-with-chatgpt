@@ -7,5 +7,6 @@ export default defineConfig({
     hookTimeout: 30_000,
     pool: "threads",
     maxWorkers: 1,
+    env: { C2C_HIDE_LEGACY_TOOLS: "0" },
   },
 });

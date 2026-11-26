@@ -281,7 +281,19 @@ function readTarget(filePath: string): { bytes: Buffer; stat: fs.BigIntStats } {
 /** Publish a fully flushed same-directory temp file. */
 export function atomicReplace(source: string, destination: string, options: AtomicReplaceOptions = {}): AtomicReplaceResult {
   if (process.platform === "win32" && options.preserveAcl) {
-    return replaceWindowsPreservingAcl(source, destination, options);
+    try {
+      return replaceWindowsPreservingAcl(source, destination, options);
+    } catch (error) {
+      if (!(error instanceof AtomicReplaceError &&
+            error.stage === "final-validation" &&
+            !error.operationApplied &&
+            error.systemCode === "WIN32_1338")) {
+        throw error;
+      }
+      // Fall back to standard atomic rename + hash/identity verification when
+      // the target file carries a Windows security descriptor that the native
+      // helper cannot re-apply (ERROR_INVALID_SECURITY_DESCR / WIN32_1338).
+    }
   }
 
   const validationStarted = performance.now();

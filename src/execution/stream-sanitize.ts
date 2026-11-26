@@ -11,7 +11,16 @@ const PRIVATE_KEY_HEADER = /-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRI
 const PRIVATE_HEADER_WINDOW = 64;
 const TOKEN_WINDOW = 48;
 const MAX_KEY_TAIL = 24;
+const PRIVATE_KEY_END = /-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|-----END PGP PRIVATE KEY BLOCK-----/;
+const PEM_META_LINE = /^(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset):/i;
+const PEM_BODY_LINE = /^[A-Za-z0-9+/=]{4,}$/;
 const REDACTED = "[REDACTED]";
+const REDACTED_PRIVATE_KEY = "[REDACTED_PRIVATE_KEY]";
+
+export interface StreamingSanitizerOptions {
+  /** "restrict" fails closed on private-key markers (default); "redact" redacts PEM blocks inline without blanking the stream. */
+  privateKeyPolicy?: "restrict" | "redact";
+}
 
 type TokenCandidate = {
   start: number;
@@ -65,7 +74,8 @@ const SENSITIVE_KEYS = [
   "api_key",
   "api-key",
   "apikey",
-  "code",
+  "auth_code",
+  "authorization_code",
   "token",
 ];
 
@@ -171,9 +181,16 @@ export class StreamingSanitizer {
   private mode: ValueMode = { kind: "none" };
   private tokenSkip: RegExp | undefined;
   private homeSkip: "unix" | "windows" | undefined;
+  private readonly privateKeyPolicy: "restrict" | "redact";
+  private pemSkip: "none" | "header_line" | "body_lines" = "none";
+  private pemLineBuffer = "";
   private closed = false;
   private _restrictedReason: "private_key" | undefined;
   private _truncated = false;
+
+  constructor(options: StreamingSanitizerOptions = {}) {
+    this.privateKeyPolicy = options.privateKeyPolicy ?? "restrict";
+  }
 
   /** A non-null reason means the caller must treat this entire stream as restricted. */
   get restrictedReason(): "private_key" | undefined {
@@ -188,6 +205,9 @@ export class StreamingSanitizer {
   /** Accept a chunk and return the portion that is safe to release now. */
   push(chunk: string): string {
     if (this.closed || this._restrictedReason) return "";
+    if (this.privateKeyPolicy === "redact") {
+      return this.pushRedactMode(chunk, false);
+    }
     this.privateTail += chunk;
     const privateMatch = PRIVATE_KEY_HEADER.exec(this.privateTail);
     if (privateMatch) {
@@ -213,6 +233,9 @@ export class StreamingSanitizer {
     if (this.closed) return "";
     this.closed = true;
     if (this._restrictedReason) return "";
+    if (this.privateKeyPolicy === "redact") {
+      return this.pushRedactMode("", true);
+    }
 
     const privateMatch = PRIVATE_KEY_HEADER.exec(this.privateTail);
     if (privateMatch) {
@@ -227,6 +250,97 @@ export class StreamingSanitizer {
     let output = this.acceptSafeText(this.privateTail, true);
     this.privateTail = "";
     output += this.finishPending();
+    return output;
+  }
+
+  private pushRedactMode(chunk: string, atEnd: boolean): string {
+    let input = chunk;
+    let output = "";
+    while (input.length > 0 || (atEnd && (this.pemLineBuffer.length > 0 || this.privateTail.length > 0))) {
+      if (this.pemSkip === "header_line") {
+        const nl = input.indexOf("\n");
+        const segment = nl >= 0 ? input.slice(0, nl) : input;
+        const endMatch = PRIVATE_KEY_END.exec(segment);
+        if (endMatch) {
+          input = input.slice(endMatch.index + endMatch[0].length);
+          this.pemSkip = "none";
+          continue;
+        }
+        if (nl >= 0) {
+          output += "\n";
+          input = input.slice(nl + 1);
+          this.pemSkip = "body_lines";
+          this.pemLineBuffer = "";
+          continue;
+        }
+        input = "";
+        if (atEnd) this.pemSkip = "none";
+        break;
+      }
+
+      if (this.pemSkip === "body_lines") {
+        const nl = input.indexOf("\n");
+        if (nl < 0 && !atEnd) {
+          if (this.pemLineBuffer.length < 512) {
+            this.pemLineBuffer += input.slice(0, 512 - this.pemLineBuffer.length);
+          }
+          input = "";
+          break;
+        }
+        const line = nl >= 0 ? this.pemLineBuffer + input.slice(0, nl + 1) : this.pemLineBuffer + input;
+        this.pemLineBuffer = "";
+        input = nl >= 0 ? input.slice(nl + 1) : "";
+        const trimmed = line.trim();
+        const endMatch = PRIVATE_KEY_END.exec(line);
+        if (endMatch) {
+          const afterEnd = line.slice(endMatch.index + endMatch[0].length);
+          this.pemSkip = "none";
+          if (afterEnd) input = afterEnd + input;
+          continue;
+        }
+        if (trimmed === "" || PEM_META_LINE.test(trimmed) || PEM_BODY_LINE.test(trimmed)) {
+          if (atEnd && input.length === 0) this.pemSkip = "none";
+          continue;
+        }
+        // Non-PEM line: exit skip mode and process normally.
+        this.pemSkip = "none";
+        input = line + input;
+        continue;
+      }
+
+      this.privateTail += input;
+      input = "";
+      const privateMatch = PRIVATE_KEY_HEADER.exec(this.privateTail);
+      if (privateMatch) {
+        const safePrefix = this.privateTail.slice(0, privateMatch.index);
+        const remainder = this.privateTail.slice(privateMatch.index + privateMatch[0].length);
+        this.privateTail = "";
+        output += this.acceptSafeText(safePrefix, true);
+        output += this.finishPending();
+        output += REDACTED_PRIVATE_KEY;
+        this.pemSkip = "header_line";
+        input = remainder;
+        continue;
+      }
+
+      if (atEnd) {
+        output += this.acceptSafeText(this.privateTail, true);
+        this.privateTail = "";
+        output += this.finishPending();
+        break;
+      }
+
+      const safeLength = Math.max(0, this.privateTail.length - PRIVATE_HEADER_WINDOW);
+      if (safeLength > 0) {
+        const safeText = this.privateTail.slice(0, safeLength);
+        this.privateTail = this.privateTail.slice(safeLength);
+        output += this.acceptSafeText(safeText);
+      }
+      break;
+    }
+    if (atEnd) {
+      output += this.finishPending();
+    }
     return output;
   }
 

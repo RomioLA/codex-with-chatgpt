@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { z } from "zod";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
@@ -417,7 +418,7 @@ export interface McpContext {
 
 export function createMcpServer(ctx: McpContext): McpServer {
   const { workspace } = ctx;
-  const hideLegacyTools = process.env.C2C_HIDE_LEGACY_TOOLS === "1";
+  const hideLegacyTools = process.env.C2C_HIDE_LEGACY_TOOLS !== "0";
   const snapshotRegistry = ctx.snapshotRegistry ?? new SnapshotRegistry();
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
@@ -878,8 +879,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
         args: z.array(z.string().max(32767)).max(256).optional(),
         command: z.string().min(1).max(32767).optional(),
         cwd: z.string().min(1).max(32767).optional(),
-        timeout_seconds: z.number().int().min(1).max(3600),
-        idempotency_key: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]{16,128}$/),
+        timeout_seconds: z.number().int().min(1).max(3600).default(60),
+        idempotency_key: z.string().min(16).max(128).regex(/^[A-Za-z0-9._:-]{16,128}$/).optional(),
         wait_seconds: z.number().int().min(0).max(30).default(0),
       },
       outputSchema: {
@@ -924,8 +925,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
 
       const started = await ctx.executionSupervisor.startFullAccess({
         ...commandInput,
-        timeoutSeconds: args.timeout_seconds,
-        idempotencyKey: args.idempotency_key,
+        timeoutSeconds: args.timeout_seconds ?? 60,
+        idempotencyKey: args.idempotency_key ?? `auto-${randomUUID()}`,
         oauthClientId: extra.authInfo!.clientId,
         scopes: extra.authInfo!.scopes,
       });
